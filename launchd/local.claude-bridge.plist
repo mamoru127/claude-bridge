@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- install.sh がこのファイルの __PLACEHOLDER__ を実際の値へ置き換えて
+     ~/Library/LaunchAgents/ へ書き出します。手で登録する場合は
+     __PYTHON_BIN__ / __WORKING_DIR__ / __HOME__ を自分の環境の値にしてください。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.claude-bridge</string>
+
+  <!-- 起動コマンド。python は絶対パスで指定し、PATH に依存させない。
+       caffeinate -s は AC 電源のときだけシステムスリープを抑止する。
+       スリープするとブリッジも Codex app-server も止まり、待たずに始めたターンが途中で死ぬ。
+       バッテリー駆動では抑止しないので、外出時に電池を使い切ることはない。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-s</string>
+    <string>__PYTHON_BIN__</string>
+    <string>-m</string>
+    <string>claude_bridge</string>
+    <string>--upstream-base-url</string>
+    <string>https://chatgpt.com/backend-api/codex</string>
+    <!-- Claude CLI に触らせる作業ディレクトリを増やす場合は、ここへ
+         <string>--add-dir</string> と <string>/path/to/dir</string> を追加する。 -->
+  </array>
+
+  <!-- python -m claude_bridge の import 元であり、working-dir オプションの既定値でもある。 -->
+  <key>WorkingDirectory</key>
+  <string>__WORKING_DIR__</string>
+
+  <!-- launchd はログインシェルの環境を引き継がない。claude と codex を見つけられる PATH を明示する。 -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>CLAUDE_BRIDGE_ENABLE_CODEX_MCP</key>
+    <string>1</string>
+    <!-- 追加で有効にする MCP サーバー。リポジトリ外のユーザー設定として置く。 -->
+    <key>CLAUDE_BRIDGE_MCP_CONFIG_FILE</key>
+    <string>__HOME__/.config/claude-bridge/mcp.json</string>
+  </dict>
+
+  <!-- ログイン時に起動し、落ちたら再起動する。 -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- 設定不備で即死したときに再起動を繰り返さないための最小間隔（秒）。 -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <!-- 対話的な応答を返すため、バックグラウンドジョブとしての CPU 制限をかけない。 -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/claude-bridge/bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/claude-bridge/bridge.log</string>
+</dict>
+</plist>
