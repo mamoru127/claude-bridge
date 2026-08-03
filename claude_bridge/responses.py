@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from .config import BridgeConfig
+from .config import TOOL_SEARCH_LIMIT, BridgeConfig
 from .errors import BridgeError
 
 # Codex がモデルごとに読むメタデータ。tools / tool_choice を無視する実装に合わせた値を返す。
@@ -165,7 +165,9 @@ def _passthrough_tools(
         kind = item.get("type")
         if kind == "tool_search_call":
             # 一度投げた検索は繰り返さない。取れなかった場合に投げ続けると会話が進まない。
-            searched = True
+            # 数えるのは自分が投げた検索だけ。Codex や Claude が別の目的で使った検索まで
+            # 数えると、こちらの検索を投げないまま受け渡すツールが会話へ入らなくなる。
+            searched = searched or _search_query_of(item) == search_query
             continue
         if kind not in ("additional_tools", "tool_search_output"):
             continue
@@ -178,12 +180,26 @@ def _passthrough_tools(
     missing = [name for name in allowed if name not in found]
     query = search_query if (missing and searchable and not searched and search_query) else None
     logger.info(
-        "codex tools offered=%s passed=%s search=%s",
+        "codex tools offered=%s passed=%s search=%s searchable=%s searched=%s",
         ",".join(offered),
         ",".join(found),
         query or "-",
+        searchable,
+        searched,
     )
     return tuple(found.values()), query
+
+
+def _search_query_of(item: dict) -> str:
+    """tool_search_call が投げた検索語。arguments は dict でも JSON 文字列でも届く。"""
+
+    arguments = item.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return ""
+    return arguments.get("query", "") if isinstance(arguments, dict) else ""
 
 
 def _is_tool_search(tool: object) -> bool:
@@ -434,6 +450,12 @@ def _codex_model(slug: str, template: dict) -> dict:
         "slug": slug,
         # WebSocket は実装していないため、雛形が要求していても使わせない。
         "prefer_websockets": False,
+        # code mode 専用の宣言を受け継がない。code mode の Codex は、ツールを function tool
+        # として送らず `exec` のコード実行側（`tools.*`）へ寄せる。すると受け渡しの対象も
+        # `tool_search` も会話へ入らず、Claude からは exec / wait / collaboration しか見えない。
+        # 上流の先頭が code mode 専用モデルへ変わると雛形ごと巻き込まれるため、明示的に消す。
+        # null は上流の従来モデル（gpt-5.5 など）と同じ値。
+        "tool_mode": None,
         "display_name": f"Claude CLI ({slug})",
         "description": "claude-bridge 経由の Claude CLI。入力はテキストと画像、出力はテキスト。",
         "visibility": "list",
@@ -555,6 +577,8 @@ class ResponseStream:
         tool_search は function ではなく専用のアイテム型で、実行するのは Codex 自身。
         結果は次のリクエストへ tool_search_output として載り、そこで初めてツール定義が
         会話へ入る。Claude は動かさないので、このターンに本文はない。
+
+        limit を省くと少数で打ち切られ、名前で直接引いても全件は返らない。
         """
 
         item = {
@@ -563,7 +587,7 @@ class ResponseStream:
             "call_id": f"call_{uuid.uuid4().hex}",
             "status": "completed",
             "execution": "client",
-            "arguments": {"query": query},
+            "arguments": {"query": query, "limit": TOOL_SEARCH_LIMIT},
         }
         self._items.append(item)
         return [

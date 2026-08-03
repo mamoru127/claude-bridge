@@ -15,6 +15,7 @@ from claude_bridge.config import (
     PASSTHROUGH_DEFS_ENV,
     PASSTHROUGH_SERVER_NAME,
     PASSTHROUGH_TOKEN_ENV,
+    TOOL_SEARCH_LIMIT,
 )
 from claude_bridge.passthrough_adapter import (
     PassthroughError,
@@ -149,6 +150,34 @@ class ParseToolsTest(unittest.TestCase):
         payload = payload_with(TOOL_SEARCH)
         payload["input"].append(
             {"type": "tool_search_call", "call_id": "call_1", "arguments": {"query": "スレッド"}}
+        )
+
+        request = parse_request(payload, "gpt-5", ["create_thread"], "スレッド")
+
+        self.assertIsNone(request.tool_search_query)
+
+    def test_other_search_does_not_block_our_own(self):
+        """別の用途で使われた検索まで数えると、受け渡すツールが会話へ入らなくなる。"""
+
+        payload = payload_with(TOOL_SEARCH)
+        payload["input"].append(
+            {"type": "tool_search_call", "call_id": "call_1", "arguments": {"query": "別の用事"}}
+        )
+
+        request = parse_request(payload, "gpt-5", ["create_thread"], "スレッド")
+
+        self.assertEqual(request.tool_search_query, "スレッド")
+
+    def test_own_search_is_recognised_from_json_arguments(self):
+        """arguments は JSON 文字列で戻ることもある。それでも自分の検索だと分かる。"""
+
+        payload = payload_with(TOOL_SEARCH)
+        payload["input"].append(
+            {
+                "type": "tool_search_call",
+                "call_id": "call_1",
+                "arguments": json.dumps({"query": "スレッド", "limit": TOOL_SEARCH_LIMIT}),
+            }
         )
 
         request = parse_request(payload, "gpt-5", ["create_thread"], "スレッド")
@@ -451,7 +480,8 @@ class ToolSearchEndpointTest(BridgeHTTPTestCase):
         self.assertEqual(status, 200)
         self.assertEqual([item["type"] for item in payload["output"]], ["tool_search_call"])
         item = payload["output"][0]
-        self.assertEqual(item["arguments"], {"query": "スレッド操作"})
+        # limit を省くと受け渡すツールより少なく打ち切られるため、上限を添える。
+        self.assertEqual(item["arguments"], {"query": "スレッド操作", "limit": TOOL_SEARCH_LIMIT})
         self.assertEqual(item["execution"], "client")
         # 検索だけのターンでは CLI を起動しない。動かすと本文のないターンが 1 回無駄になる。
         self.assertEqual(runner.calls, [])

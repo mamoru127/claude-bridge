@@ -36,6 +36,10 @@
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key>
     <string>__HOME__</string>
+    <!-- app-server の RPC を MCP として Claude へ公開する。受け渡し（create_thread）とは
+         別経路で、アプリ側のツール提供方式が変わっても動く。
+         繋ぎ先は local.codex-app-server が常駐させる共有 app-server。
+         そちらを先に登録しておくこと（launchd/install-app-server.sh）。 -->
     <key>CLAUDE_BRIDGE_ENABLE_CODEX_MCP</key>
     <string>1</string>
     <!-- 追加で有効にする MCP サーバー。リポジトリ外のユーザー設定として置く。 -->

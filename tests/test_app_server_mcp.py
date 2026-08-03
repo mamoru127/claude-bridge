@@ -1,7 +1,7 @@
 """Codex app-server MCP アダプタのテスト。
 
-実際の `codex` も Claude CLI も起動しない。子プロセスはすべて差し替える。
-turn/start は公開しているが、テストでは差し替えた子プロセスが応答するだけで
+実際の `codex` も Claude CLI も起動しない。app-server への接続はすべて差し替える。
+turn/start は公開しているが、テストでは差し替えた接続が応答するだけで
 外部サービスは呼ばない。
 """
 
@@ -10,7 +10,6 @@ import json
 import os
 import queue
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
@@ -21,14 +20,16 @@ from unittest import mock
 
 import claude_bridge
 from claude_bridge import mcp_adapter
-from claude_bridge.app_server import APP_SERVER_ARGS, AppServerClient, AppServerError
+from claude_bridge.app_server import AppServerClient, AppServerError
 from claude_bridge.claude_cli import build_command, build_mcp_servers
 from claude_bridge.config import APP_SERVER_PATH, MCP_SERVER_NAME, BridgeConfig, build_config
 from claude_bridge.server import BridgeServer
 from claude_bridge.sessions import Session
 
-# responder がこれを返すと、子プロセスの stdout が EOF になる（プロセス終了相当）。
+# responder がこれを返すと、接続が閉じたことになる。
 EOF = object()
+# 差し替えた接続では実際には使わないが、繋ぎ先は必ず指定する。
+SOCKET = "/tmp/claude-bridge-test/app-server-control.sock"
 
 
 def make_config(**overrides) -> BridgeConfig:
@@ -36,80 +37,36 @@ def make_config(**overrides) -> BridgeConfig:
     return BridgeConfig(**{**defaults, **overrides})
 
 
-class FakeStdout:
-    """子プロセスの stdout 相当。行が届くまでブロックするイテレータ。"""
+class FakeTransport:
+    """制御ソケット接続の差し替え。送られた要求を responder に渡し、応答を受け取り側へ流す。"""
 
-    def __init__(self):
-        self._lines: queue.Queue = queue.Queue()
-
-    def put(self, line: bytes) -> None:
-        self._lines.put(line)
-
-    def close(self) -> None:
-        self._lines.put(None)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> bytes:
-        line = self._lines.get()
-        if line is None:
-            raise StopIteration
-        return line
-
-
-class FakeStdin:
-    """子プロセスの stdin 相当。書かれた要求を responder に渡し、応答を stdout へ流す。"""
-
-    def __init__(self, responder, stdout: FakeStdout):
-        self.messages = []
+    def __init__(self, responder):
+        self.sent = []
+        self.closed = 0
         self._responder = responder
-        self._stdout = stdout
+        self._incoming: queue.Queue = queue.Queue()
 
-    def write(self, raw: bytes) -> None:
-        message = json.loads(raw)
-        self.messages.append(message)
+    def send(self, text: str) -> None:
+        message = json.loads(text)
+        self.sent.append(message)
         for reply in self._responder(message):
             if reply is EOF:
-                self._stdout.close()
-            elif isinstance(reply, bytes):
-                self._stdout.put(reply)
+                self._incoming.put(None)
+            elif isinstance(reply, str):
+                self._incoming.put(reply)
             else:
-                self._stdout.put((json.dumps(reply) + "\n").encode("utf-8"))
+                self._incoming.put(json.dumps(reply))
 
-    def flush(self) -> None:
-        pass
+    def messages(self):
+        while True:
+            text = self._incoming.get()
+            if text is None:
+                return
+            yield text
 
-
-class FakeProcess:
-    """`codex app-server` 子プロセスの差し替え。
-
-    wait_hangs に指定した回数だけ wait() が TimeoutExpired を投げる。
-    1 なら terminate 後の待機が、2 なら kill 後の待機も時間切れになる。
-    """
-
-    def __init__(self, responder, wait_hangs: int = 0):
-        self.stdout = FakeStdout()
-        self.stdin = FakeStdin(responder, self.stdout)
-        self.terminated = 0
-        self.killed = 0
-        self.waited = []
-        self._wait_hangs = wait_hangs
-
-    def terminate(self) -> None:
-        self.terminated += 1
-        if not self._wait_hangs:
-            self.stdout.close()
-
-    def kill(self) -> None:
-        self.killed += 1
-        self.stdout.close()
-
-    def wait(self, timeout=None) -> int:
-        self.waited.append(timeout)
-        if len(self.waited) <= self._wait_hangs:
-            raise subprocess.TimeoutExpired(cmd=["codex", "app-server"], timeout=timeout)
-        return 0
+    def close(self) -> None:
+        self.closed += 1
+        self._incoming.put(None)
 
 
 def echo_responder(results: dict):
@@ -126,23 +83,22 @@ def echo_responder(results: dict):
     return respond
 
 
-class FakeSpawn:
-    """subprocess.Popen の差し替え。呼び出し引数を記録する。"""
+class FakeConnect:
+    """UdsWebSocket の差し替え。繋ぎ先のソケットパスを記録する。"""
 
-    def __init__(self, responder=None, raises=None, wait_hangs: int = 0):
+    def __init__(self, responder=None, raises=None):
         self.responder = responder or echo_responder({"initialize": {"codexHome": "/tmp"}})
         self.raises = raises
-        self.wait_hangs = wait_hangs
         self.calls = []
-        self.processes = []
+        self.transports = []
 
-    def __call__(self, command, **kwargs):
-        self.calls.append({"command": command, **kwargs})
+    def __call__(self, socket_path):
+        self.calls.append(socket_path)
         if self.raises:
             raise self.raises
-        process = FakeProcess(self.responder, wait_hangs=self.wait_hangs)
-        self.processes.append(process)
-        return process
+        transport = FakeTransport(self.responder)
+        self.transports.append(transport)
+        return transport
 
 
 class FakeClient:
@@ -199,14 +155,14 @@ class McpProtocolTest(unittest.TestCase):
         self.assertEqual(result["capabilities"], {"tools": {}})
         self.assertEqual(result["serverInfo"]["name"], MCP_SERVER_NAME)
 
-    def test_initialize_does_not_start_the_app_server(self):
-        # ハンドシェイクだけでは codex を起動しない。tools/call で初めて起動する。
-        spawn = FakeSpawn()
-        client = AppServerClient(spawn=spawn)
+    def test_initialize_does_not_connect(self):
+        # ハンドシェイクだけでは繋がない。tools/call で初めて接続する。
+        connect = FakeConnect()
+        client = AppServerClient(SOCKET, connect=connect)
 
         mcp_adapter.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize"}, client)
 
-        self.assertEqual(spawn.calls, [])
+        self.assertEqual(connect.calls, [])
 
     def test_notifications_get_no_response(self):
         for method in ("notifications/initialized", "notifications/cancelled"):
@@ -457,31 +413,32 @@ class McpServeLoopTest(unittest.TestCase):
 
 
 class AppServerClientTest(unittest.TestCase):
-    def test_spawns_dedicated_process_with_argument_array(self):
-        spawn = FakeSpawn(echo_responder({"initialize": {}, "thread/list": {"data": []}}))
-        client = AppServerClient(codex_path="/opt/homebrew/bin/codex", spawn=spawn)
+    def test_connects_to_the_configured_control_socket(self):
+        connect = FakeConnect(echo_responder({"initialize": {}, "thread/list": {"data": []}}))
+        client = AppServerClient("/tmp/probe/app-server-control.sock", connect=connect)
 
         client.call("thread/list", {"limit": 1})
 
-        call = spawn.calls[0]
-        # 専用プロセスを自分で起動する。既存 app-server の stdin/stdout は触らない。
-        self.assertEqual(
-            call["command"], ["/opt/homebrew/bin/codex", "app-server", "--listen", "stdio://"]
-        )
-        self.assertIsInstance(call["command"], list)
-        self.assertNotIn("shell", call)
-        self.assertEqual(len(spawn.calls), 1)
+        # 常駐している app-server へ繋ぐだけで、自分では起動しない。
+        self.assertEqual(connect.calls, ["/tmp/probe/app-server-control.sock"])
 
-    def test_listen_flag_keeps_the_process_private(self):
-        self.assertEqual(APP_SERVER_ARGS, ("app-server", "--listen", "stdio://"))
+    def test_socket_is_shared_across_calls(self):
+        connect = FakeConnect(echo_responder({"initialize": {}, "thread/list": {"data": []}}))
+        client = AppServerClient(SOCKET, connect=connect)
+
+        client.call("thread/list", {})
+        client.call("thread/list", {})
+
+        # 繋ぎ直すとアプリ側から見た状態も途切れる。1 本を使い回す。
+        self.assertEqual(len(connect.calls), 1)
 
     def test_handshake_precedes_the_first_call(self):
-        spawn = FakeSpawn(echo_responder({"initialize": {}, "thread/list": {"data": []}}))
-        client = AppServerClient(spawn=spawn)
+        connect = FakeConnect(echo_responder({"initialize": {}, "thread/list": {"data": []}}))
+        client = AppServerClient(SOCKET, connect=connect)
 
         client.call("thread/list", {})
 
-        sent = spawn.processes[0].stdin.messages
+        sent = connect.transports[0].sent
         self.assertEqual(
             [message["method"] for message in sent],
             ["initialize", "initialized", "thread/list"],
@@ -494,26 +451,26 @@ class AppServerClientTest(unittest.TestCase):
         self.assertEqual(sent[2]["params"], {})
 
     def test_process_is_reused_across_calls(self):
-        spawn = FakeSpawn(
+        connect = FakeConnect(
             echo_responder({"initialize": {}, "thread/list": {"data": []}, "thread/read": {}})
         )
-        client = AppServerClient(spawn=spawn)
+        client = AppServerClient(SOCKET, connect=connect)
 
         client.call("thread/list", {})
         client.call("thread/read", {"threadId": "th_1"})
 
-        self.assertEqual(len(spawn.calls), 1)
-        methods = [message["method"] for message in spawn.processes[0].stdin.messages]
+        self.assertEqual(len(connect.calls), 1)
+        methods = [message["method"] for message in connect.transports[0].sent]
         self.assertEqual(methods, ["initialize", "initialized", "thread/list", "thread/read"])
 
     def test_request_ids_are_unique_and_matched(self):
-        spawn = FakeSpawn(echo_responder({"initialize": {}, "thread/list": {"data": []}}))
-        client = AppServerClient(spawn=spawn)
+        connect = FakeConnect(echo_responder({"initialize": {}, "thread/list": {"data": []}}))
+        client = AppServerClient(SOCKET, connect=connect)
 
         client.call("thread/list", {})
         client.call("thread/list", {})
 
-        ids = [message["id"] for message in spawn.processes[0].stdin.messages if "id" in message]
+        ids = [message["id"] for message in connect.transports[0].sent if "id" in message]
         self.assertEqual(ids, [1, 2, 3])
 
     def test_notifications_and_server_requests_are_skipped(self):
@@ -528,7 +485,7 @@ class AppServerClientTest(unittest.TestCase):
                 {"id": message["id"], "result": {"data": ["ok"]}},
             ]
 
-        client = AppServerClient(spawn=FakeSpawn(responder))
+        client = AppServerClient(SOCKET, connect=FakeConnect(responder))
 
         self.assertEqual(client.call("thread/list", {}), {"data": ["ok"]})
 
@@ -556,7 +513,7 @@ class AppServerClientTest(unittest.TestCase):
                 },
             ]
 
-        client = AppServerClient(spawn=FakeSpawn(responder))
+        client = AppServerClient(SOCKET, connect=FakeConnect(responder))
 
         result = client.run_turn({"threadId": "th_1", "input": []})
 
@@ -574,7 +531,7 @@ class AppServerClientTest(unittest.TestCase):
                 return [{"id": message["id"], "result": {}}]
             return [{"id": message["id"], "result": {"turn": {"id": "tu_1", "status": "inProgress"}}}]
 
-        client = AppServerClient(spawn=FakeSpawn(responder))
+        client = AppServerClient(SOCKET, connect=FakeConnect(responder))
 
         result = client.start_turn({"threadId": "th_1", "input": []})
 
@@ -591,7 +548,7 @@ class AppServerClientTest(unittest.TestCase):
                 return [{"id": message["id"], "result": {"turn": {"id": "tu_1"}}}]
             return [{"id": message["id"], "result": {"data": ["ok"]}}]
 
-        client = AppServerClient(spawn=FakeSpawn(responder), turn_timeout_seconds=5.0)
+        client = AppServerClient(SOCKET, connect=FakeConnect(responder), turn_timeout_seconds=5.0)
         turn = run_in_thread(lambda: client.run_turn({"threadId": "th_1", "input": []}))
 
         # ターンは待機したまま。ロックを握っていれば、ここで turn 側の時間切れまで止まる。
@@ -614,7 +571,7 @@ class AppServerClientTest(unittest.TestCase):
                 ]
             return [{"id": message["id"], "result": {"data": ["ok"]}}]
 
-        client = AppServerClient(spawn=FakeSpawn(responder))
+        client = AppServerClient(SOCKET, connect=FakeConnect(responder))
 
         client.start_turn({"threadId": "th_1", "input": []})
         # 捨てた通知が次の応答に混ざらないことを、続く呼び出しで確かめる。
@@ -628,13 +585,13 @@ class AppServerClientTest(unittest.TestCase):
                 return [{"id": message["id"], "result": {"turn": {"id": "tu_1"}}}]
             return [{"id": message["id"], "result": {}}]
 
-        spawn = FakeSpawn(responder)
-        client = AppServerClient(spawn=spawn, turn_timeout_seconds=5.0)
+        connect = FakeConnect(responder)
+        client = AppServerClient(SOCKET, connect=connect, turn_timeout_seconds=5.0)
         run_in_thread(lambda: client.run_turn({"threadId": "th_1", "input": []}))
         # 受け口は turn/start を送る前に用意されるので、送信が見えた時点で待機中。
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            sent = [m["method"] for m in spawn.processes[0].stdin.messages] if spawn.processes else []
+            sent = [m["method"] for m in connect.transports[0].sent] if connect.transports else []
             if "turn/start" in sent:
                 break
 
@@ -670,7 +627,7 @@ class AppServerClientTest(unittest.TestCase):
                 },
             ]
 
-        client = AppServerClient(spawn=FakeSpawn(responder))
+        client = AppServerClient(SOCKET, connect=FakeConnect(responder))
 
         result = client.run_turn({"threadId": "th_2", "input": []})
 
@@ -689,23 +646,23 @@ class AppServerClientTest(unittest.TestCase):
                 {"method": "turn/failed", "params": {"threadId": "th_1", "turn": {"id": "tu_1"}}},
             ]
 
-        client = AppServerClient(spawn=FakeSpawn(responder))
+        client = AppServerClient(SOCKET, connect=FakeConnect(responder))
 
         self.assertTrue(client.run_turn({"threadId": "th_1", "input": []})["failed"])
 
     def test_run_turn_rejects_an_error_response(self):
-        spawn = FakeSpawn(echo_responder({"initialize": {}}))
-        client = AppServerClient(spawn=spawn)
+        connect = FakeConnect(echo_responder({"initialize": {}}))
+        client = AppServerClient(SOCKET, connect=connect)
 
         with self.assertRaises(AppServerError) as raised:
             client.run_turn({"threadId": "th_1", "input": []})
 
         self.assertIn("turn/start", str(raised.exception))
-        # 受理されなかったのはこのターンだけ。子プロセスと他のターンは残す。
-        self.assertEqual(spawn.processes[0].terminated, 0)
+        # 受理されなかったのはこのターンだけ。接続と他のターンは残す。
+        self.assertEqual(connect.transports[0].closed, 0)
 
     def test_run_turn_uses_the_turn_timeout(self):
-        # 完了通知を送らない子プロセス。turn 用の待ち時間で切れる。
+        # 完了通知を送らない app-server。turn 用の待ち時間で切れる。
         def responder(message):
             if "id" not in message:
                 return []
@@ -714,7 +671,7 @@ class AppServerClientTest(unittest.TestCase):
             return [{"id": message["id"], "result": {"turn": {}}}]
 
         client = AppServerClient(
-            spawn=FakeSpawn(responder), timeout_seconds=30.0, turn_timeout_seconds=0.2
+            SOCKET, connect=FakeConnect(responder), timeout_seconds=30.0, turn_timeout_seconds=0.2
         )
 
         with self.assertRaises(AppServerError) as raised:
@@ -723,117 +680,93 @@ class AppServerClientTest(unittest.TestCase):
         self.assertIn("0.2", str(raised.exception))
 
     def test_rpc_error_becomes_app_server_error(self):
-        spawn = FakeSpawn(echo_responder({"initialize": {}}))
-        client = AppServerClient(spawn=spawn)
+        connect = FakeConnect(echo_responder({"initialize": {}}))
+        client = AppServerClient(SOCKET, connect=connect)
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/read", {"threadId": "missing"})
 
         self.assertIn("thread/read", str(raised.exception))
 
-    def test_process_exit_before_response_is_reported(self):
-        # initialize には答えるが、次の要求では応答せず終了する子プロセス。
+    def test_disconnect_before_response_is_reported(self):
+        # initialize には答えるが、次の要求では応答せず切れる app-server。
         def responder(message):
             if message.get("method") == "initialize":
                 return [{"id": message["id"], "result": {}}]
             return [EOF]
 
-        client = AppServerClient(spawn=FakeSpawn(responder), timeout_seconds=5.0)
+        client = AppServerClient(SOCKET, connect=FakeConnect(responder), timeout_seconds=5.0)
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/list", {})
 
-        self.assertIn("終了", str(raised.exception))
+        self.assertIn("接続が切れました", str(raised.exception))
 
     def test_timeout_is_reported(self):
-        # initialize にも答えない子プロセス。最初の呼び出しでタイムアウトする。
-        client = AppServerClient(spawn=FakeSpawn(lambda message: []), timeout_seconds=0.2)
+        # initialize にも答えない app-server。最初の呼び出しでタイムアウトする。
+        client = AppServerClient(SOCKET, connect=FakeConnect(lambda message: []), timeout_seconds=0.2)
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/list", {})
 
         self.assertIn("応答しません", str(raised.exception))
 
-    def test_launch_failure_is_reported(self):
-        spawn = FakeSpawn(raises=FileNotFoundError())
-        client = AppServerClient(codex_path="/no/such/codex", spawn=spawn)
+    def test_connect_failure_is_reported(self):
+        # app-server が常駐していなければソケットが無い。繋げないことを隠さず伝える。
+        connect = FakeConnect(raises=FileNotFoundError())
+        client = AppServerClient("/no/such/app-server.sock", connect=connect)
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/list", {})
 
-        self.assertIn("/no/such/codex", str(raised.exception))
+        self.assertIn("/no/such/app-server.sock", str(raised.exception))
 
     def test_non_json_output_is_reported(self):
-        # JSON でない行を吐く子プロセス（bytes はそのまま stdout へ流れる）。
-        client = AppServerClient(spawn=FakeSpawn(lambda message: [b"not json\n"]))
+        # JSON でないテキストを送ってくる app-server（文字列はそのまま受け取り側へ流れる）。
+        client = AppServerClient(SOCKET, connect=FakeConnect(lambda message: ["not json"]))
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/list", {})
 
         self.assertIn("JSON", str(raised.exception))
 
-    def test_close_terminates_the_process(self):
-        spawn = FakeSpawn(echo_responder({"initialize": {}, "thread/list": {}}))
-        client = AppServerClient(spawn=spawn)
+    def test_close_disconnects_without_stopping_the_app_server(self):
+        connect = FakeConnect(echo_responder({"initialize": {}, "thread/list": {}}))
+        client = AppServerClient(SOCKET, connect=connect)
         client.call("thread/list", {})
 
         client.close()
 
-        self.assertEqual(spawn.processes[0].terminated, 1)
-        self.assertEqual(spawn.processes[0].waited, [5.0])
+        # 閉じるのは自分の接続だけ。app-server は常駐したままにする。
+        self.assertEqual(connect.transports[0].closed, 1)
 
     def test_close_before_start_is_a_no_op(self):
-        spawn = FakeSpawn()
-        AppServerClient(spawn=spawn).close()
+        connect = FakeConnect()
+        AppServerClient(SOCKET, connect=connect).close()
 
-        self.assertEqual(spawn.calls, [])
+        self.assertEqual(connect.calls, [])
 
     def test_close_is_idempotent(self):
-        spawn = FakeSpawn(echo_responder({"initialize": {}, "thread/list": {}}))
-        client = AppServerClient(spawn=spawn)
+        connect = FakeConnect(echo_responder({"initialize": {}, "thread/list": {}}))
+        client = AppServerClient(SOCKET, connect=connect)
         client.call("thread/list", {})
 
         client.close()
         client.close()
 
-        self.assertEqual(spawn.processes[0].terminated, 1)
+        self.assertEqual(connect.transports[0].closed, 1)
 
-    def test_close_kills_the_process_when_terminate_times_out(self):
-        spawn = FakeSpawn(echo_responder({"initialize": {}, "thread/list": {}}), wait_hangs=1)
-        client = AppServerClient(spawn=spawn)
-        client.call("thread/list", {})
-
-        client.close()
-
-        process = spawn.processes[0]
-        self.assertEqual((process.terminated, process.killed), (1, 1))
-        self.assertEqual(process.waited, [5.0, 5.0])
-
-    def test_close_does_not_raise_when_kill_also_times_out(self):
-        # 終了処理の例外を上位へ流すと MCP アダプタの finally が壊れる。
-        spawn = FakeSpawn(echo_responder({"initialize": {}, "thread/list": {}}), wait_hangs=2)
-        client = AppServerClient(spawn=spawn)
-        client.call("thread/list", {})
-
-        client.close()
-
-        process = spawn.processes[0]
-        self.assertEqual((process.terminated, process.killed), (1, 1))
-        # 状態はリセットされているので、2 回目の close は何もしない。
-        client.close()
-        self.assertEqual(process.terminated, 1)
-
-    def test_mcp_adapter_close_survives_a_hung_process(self):
-        # mcp_adapter.main の finally 相当。終了処理で例外が出ると後始末が壊れる。
-        spawn = FakeSpawn(echo_responder({"initialize": {}, "thread/list": {}}), wait_hangs=2)
-        client = AppServerClient(spawn=spawn)
+    def test_mcp_adapter_close_disconnects_after_serving(self):
+        # mcp_adapter.main の finally 相当。後始末で接続を残さない。
+        connect = FakeConnect(echo_responder({"initialize": {}, "thread/list": {}}))
+        client = AppServerClient(SOCKET, connect=connect)
         raw = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"thread_list"}}\n'
         try:
             mcp_adapter.serve(io.BytesIO(raw), io.BytesIO(), client)
         finally:
             client.close()
 
-        self.assertEqual(spawn.processes[0].killed, 1)
+        self.assertEqual(connect.transports[0].closed, 1)
 
     def test_failed_handshake_is_not_reused_and_restarts_next_call(self):
         attempts = []
@@ -849,57 +782,57 @@ class AppServerClientTest(unittest.TestCase):
                 return [{"id": message["id"], "result": {}}]
             return [{"id": message["id"], "result": {"data": []}}]
 
-        spawn = FakeSpawn(responder)
-        client = AppServerClient(spawn=spawn)
+        connect = FakeConnect(responder)
+        client = AppServerClient(SOCKET, connect=connect)
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/list", {})
         self.assertIn("initialize", str(raised.exception))
-        # 壊れたプロセスは残さない。
-        self.assertEqual(spawn.processes[0].terminated, 1)
+        # 壊れた接続は残さない。
+        self.assertEqual(connect.transports[0].closed, 1)
 
-        # 次の call は新しいプロセスを起こして成功する。前のプロセスの EOF も持ち込まない。
+        # 次の call は繋ぎ直して成功する。前の接続の切断も持ち込まない。
         self.assertEqual(client.call("thread/list", {}), {"data": []})
-        self.assertEqual(len(spawn.calls), 2)
-        methods = [message["method"] for message in spawn.processes[1].stdin.messages]
+        self.assertEqual(len(connect.calls), 2)
+        methods = [message["method"] for message in connect.transports[1].sent]
         self.assertEqual(methods, ["initialize", "initialized", "thread/list"])
 
     def test_handshake_timeout_leaves_the_client_restartable(self):
-        # initialize に一切答えないプロセス。タイムアウト後も状態は未起動へ戻る。
-        spawn = FakeSpawn(lambda message: [])
-        client = AppServerClient(spawn=spawn, timeout_seconds=0.2)
+        # initialize に一切答えない app-server。タイムアウト後も状態は未接続へ戻る。
+        connect = FakeConnect(lambda message: [])
+        client = AppServerClient(SOCKET, connect=connect, timeout_seconds=0.2)
 
         with self.assertRaises(AppServerError):
             client.call("thread/list", {})
 
-        self.assertEqual(spawn.processes[0].terminated, 1)
+        self.assertEqual(connect.transports[0].closed, 1)
         with self.assertRaises(AppServerError):
             client.call("thread/list", {})
-        self.assertEqual(len(spawn.calls), 2)
+        self.assertEqual(len(connect.calls), 2)
 
-    def test_handshake_eof_closes_the_process(self):
-        # initialize の途中で死ぬプロセス。
-        spawn = FakeSpawn(lambda message: [EOF])
-        client = AppServerClient(spawn=spawn)
+    def test_handshake_disconnect_closes_the_connection(self):
+        # initialize の途中で切れる接続。
+        connect = FakeConnect(lambda message: [EOF])
+        client = AppServerClient(SOCKET, connect=connect)
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/list", {})
 
-        self.assertIn("終了", str(raised.exception))
-        self.assertEqual(spawn.processes[0].terminated, 1)
+        self.assertIn("接続が切れました", str(raised.exception))
+        self.assertEqual(connect.transports[0].closed, 1)
 
-    def test_successful_calls_keep_the_process_alive(self):
-        spawn = FakeSpawn(echo_responder({"initialize": {}, "thread/list": {"data": []}}))
-        client = AppServerClient(spawn=spawn)
+    def test_successful_calls_keep_the_connection_alive(self):
+        connect = FakeConnect(echo_responder({"initialize": {}, "thread/list": {"data": []}}))
+        client = AppServerClient(SOCKET, connect=connect)
 
         client.call("thread/list", {})
         client.call("thread/list", {})
 
-        self.assertEqual((spawn.processes[0].terminated, spawn.processes[0].killed), (0, 0))
+        self.assertEqual(connect.transports[0].closed, 0)
 
     def test_rpc_error_keeps_the_process_running(self):
         # RPC のエラー応答は通信の失敗ではない。進捗確認の 1 回の失敗で
-        # 走っているターンを落とさないよう、子プロセスは残す。
+        # 走っているターンを落とさないよう、接続は残す。
         def responder(message):
             if "id" not in message:
                 return []
@@ -909,20 +842,20 @@ class AppServerClientTest(unittest.TestCase):
                 return [{"id": message["id"], "error": {"code": -32600, "message": "boom"}}]
             return [{"id": message["id"], "result": {"data": []}}]
 
-        spawn = FakeSpawn(responder)
-        client = AppServerClient(spawn=spawn)
+        connect = FakeConnect(responder)
+        client = AppServerClient(SOCKET, connect=connect)
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/turns/list", {"threadId": "th_1"})
         self.assertIn("thread/turns/list", str(raised.exception))
-        self.assertEqual((spawn.processes[0].terminated, spawn.processes[0].killed), (0, 0))
+        self.assertEqual(connect.transports[0].closed, 0)
 
-        # 同じプロセスをそのまま使い続ける。ハンドシェイクもやり直さない。
+        # 同じ接続をそのまま使い続ける。ハンドシェイクもやり直さない。
         self.assertEqual(client.call("thread/list", {}), {"data": []})
-        self.assertEqual(len(spawn.calls), 1)
+        self.assertEqual(len(connect.calls), 1)
 
     def test_request_timeout_keeps_the_process_running(self):
-        # 1 件の時間切れで子プロセスを落とすと、走っているターンが道連れになる。
+        # 1 件の時間切れで接続を切ると、走っているターンが道連れになる。
         def responder(message):
             if "id" not in message:
                 return []
@@ -932,17 +865,17 @@ class AppServerClientTest(unittest.TestCase):
                 return []
             return [{"id": message["id"], "result": {"data": []}}]
 
-        spawn = FakeSpawn(responder)
-        client = AppServerClient(spawn=spawn, timeout_seconds=0.2)
+        connect = FakeConnect(responder)
+        client = AppServerClient(SOCKET, connect=connect, timeout_seconds=0.2)
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/search", {"searchTerm": "x"})
 
         self.assertIn("応答しません", str(raised.exception))
-        self.assertEqual((spawn.processes[0].terminated, spawn.processes[0].killed), (0, 0))
+        self.assertEqual(connect.transports[0].closed, 0)
         # 時間切れした要求の応答が後から来ても、次の呼び出しに混ざらない。
         self.assertEqual(client.call("thread/list", {}), {"data": []})
-        self.assertEqual(len(spawn.calls), 1)
+        self.assertEqual(len(connect.calls), 1)
 
     def test_a_timed_out_request_stops_being_tracked(self):
         # 待つのをやめた要求を接続に残すと、応答しない相手ほど溜まっていく。
@@ -953,7 +886,7 @@ class AppServerClientTest(unittest.TestCase):
                 return [{"id": message["id"], "result": {}}]
             return []
 
-        client = AppServerClient(spawn=FakeSpawn(responder), timeout_seconds=0.1)
+        client = AppServerClient(SOCKET, connect=FakeConnect(responder), timeout_seconds=0.1)
 
         for _ in range(3):
             with self.assertRaises(AppServerError):
@@ -981,8 +914,8 @@ class AppServerClientTest(unittest.TestCase):
                 {"method": "turn/completed", "params": {"threadId": "th_1", "turn": {}}},
             ]
 
-        spawn = FakeSpawn(responder)
-        client = AppServerClient(spawn=spawn, turn_timeout_seconds=5.0)
+        connect = FakeConnect(responder)
+        client = AppServerClient(SOCKET, connect=connect, turn_timeout_seconds=5.0)
         turn = run_in_thread(lambda: client.run_turn({"threadId": "th_1", "input": []}))
 
         with self.assertRaises(AppServerError):
@@ -993,7 +926,7 @@ class AppServerClientTest(unittest.TestCase):
         self.assertIsInstance(result, dict, msg=f"ターンが中断された: {result}")
         self.assertEqual(result["agentMessage"], "完了")
 
-    def test_request_eof_closes_the_process_and_restarts_next_call(self):
+    def test_request_disconnect_reconnects_on_next_call(self):
         handshakes = []
 
         def responder(message):
@@ -1006,19 +939,19 @@ class AppServerClientTest(unittest.TestCase):
                 return [EOF]
             return [{"id": message["id"], "result": {"data": []}}]
 
-        spawn = FakeSpawn(responder)
-        client = AppServerClient(spawn=spawn, timeout_seconds=5.0)
+        connect = FakeConnect(responder)
+        client = AppServerClient(SOCKET, connect=connect, timeout_seconds=5.0)
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/list", {})
-        self.assertIn("終了", str(raised.exception))
-        self.assertEqual(spawn.processes[0].terminated, 1)
+        self.assertIn("接続が切れました", str(raised.exception))
+        self.assertEqual(connect.transports[0].closed, 1)
 
-        # 死んだプロセスの EOF を次のプロセスへ持ち込まない。
+        # 切れた接続を次の接続へ持ち込まない。
         self.assertEqual(client.call("thread/list", {}), {"data": []})
-        self.assertEqual(len(spawn.calls), 2)
+        self.assertEqual(len(connect.calls), 2)
 
-    def test_broken_json_closes_the_process_and_restarts_next_call(self):
+    def test_broken_json_reconnects_on_next_call(self):
         handshakes = []
 
         def responder(message):
@@ -1028,22 +961,22 @@ class AppServerClientTest(unittest.TestCase):
                 handshakes.append(message["method"])
                 return [{"id": message["id"], "result": {}}]
             if len(handshakes) == 1:
-                return [b"not json\n"]
+                return ["not json"]
             return [{"id": message["id"], "result": {"data": []}}]
 
-        spawn = FakeSpawn(responder)
-        client = AppServerClient(spawn=spawn)
+        connect = FakeConnect(responder)
+        client = AppServerClient(SOCKET, connect=connect)
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/list", {})
         self.assertIn("JSON", str(raised.exception))
-        self.assertEqual(spawn.processes[0].terminated, 1)
+        self.assertEqual(connect.transports[0].closed, 1)
 
         self.assertEqual(client.call("thread/list", {}), {"data": []})
-        self.assertEqual(len(spawn.calls), 2)
+        self.assertEqual(len(connect.calls), 2)
 
-    def test_close_failure_does_not_mask_the_request_error(self):
-        # 終了処理が手間取っても、呼び出し元へは元の失敗理由を返す。
+    def test_disconnect_during_a_call_reports_the_reason(self):
+        # 応答を待っている間に接続が切れたら、切れたことを理由として返す。
         def responder(message):
             if "id" not in message:
                 return []
@@ -1051,28 +984,27 @@ class AppServerClientTest(unittest.TestCase):
                 return [{"id": message["id"], "result": {}}]
             return [EOF]
 
-        spawn = FakeSpawn(responder, wait_hangs=2)
-        client = AppServerClient(spawn=spawn, timeout_seconds=5.0)
+        connect = FakeConnect(responder)
+        client = AppServerClient(SOCKET, connect=connect, timeout_seconds=5.0)
 
         with self.assertRaises(AppServerError) as raised:
             client.call("thread/read", {"threadId": "th_1"})
 
-        self.assertIn("終了", str(raised.exception))
-        process = spawn.processes[0]
-        self.assertEqual((process.terminated, process.killed), (1, 1))
+        self.assertIn("接続が切れました", str(raised.exception))
+        self.assertEqual(connect.transports[0].closed, 1)
 
-    def test_launch_failure_leaves_nothing_to_close(self):
-        # 起動自体が失敗した経路では子プロセスが無く、close も走らない。
-        spawn = FakeSpawn(raises=FileNotFoundError())
-        client = AppServerClient(spawn=spawn)
+    def test_connect_failure_leaves_nothing_to_close(self):
+        # 接続自体が失敗した経路では掴んだものが無く、close も走らない。
+        connect = FakeConnect(raises=FileNotFoundError())
+        client = AppServerClient(SOCKET, connect=connect)
 
         with self.assertRaises(AppServerError):
             client.call("thread/list", {})
 
-        self.assertEqual(spawn.processes, [])
+        self.assertEqual(connect.transports, [])
         with self.assertRaises(AppServerError):
             client.call("thread/list", {})
-        self.assertEqual(len(spawn.calls), 2)
+        self.assertEqual(len(connect.calls), 2)
 
     def test_tool_error_after_a_broken_request_recovers_on_the_next_call(self):
         # MCP 経路でも、1 回目の失敗が 2 回目の tools/call を壊さない。
@@ -1088,7 +1020,7 @@ class AppServerClientTest(unittest.TestCase):
                 return [EOF]
             return [{"id": message["id"], "result": {"data": []}}]
 
-        client = AppServerClient(spawn=FakeSpawn(responder), timeout_seconds=5.0)
+        client = AppServerClient(SOCKET, connect=FakeConnect(responder), timeout_seconds=5.0)
 
         first = call_tool(client, "thread_list", {})
         second = call_tool(client, "thread_list", {})
@@ -1401,7 +1333,9 @@ class CodexMcpConfigTest(unittest.TestCase):
         config = build_config([], env={})
 
         self.assertFalse(config.codex_mcp)
-        self.assertEqual(config.codex_path, "codex")
+        self.assertTrue(
+            config.app_server_socket.endswith("app-server-control/app-server-control.sock")
+        )
 
     def test_enabled_by_flag(self):
         self.assertTrue(build_config(["--enable-codex-mcp"], env={}).codex_mcp)
@@ -1418,11 +1352,20 @@ class CodexMcpConfigTest(unittest.TestCase):
                 config = build_config([], env={"CLAUDE_BRIDGE_ENABLE_CODEX_MCP": value})
                 self.assertFalse(config.codex_mcp)
 
-    def test_codex_path_from_env_and_flag(self):
-        env = {"CLAUDE_BRIDGE_CODEX_PATH": "/opt/homebrew/bin/codex"}
-        self.assertEqual(build_config([], env=env).codex_path, "/opt/homebrew/bin/codex")
-        overridden = build_config(["--codex-path", "/usr/bin/codex"], env=env)
-        self.assertEqual(overridden.codex_path, "/usr/bin/codex")
+    def test_app_server_socket_from_env_and_flag(self):
+        env = {"CLAUDE_BRIDGE_APP_SERVER_SOCKET": "/tmp/from-env.sock"}
+        self.assertEqual(build_config([], env=env).app_server_socket, "/tmp/from-env.sock")
+        overridden = build_config(["--app-server-socket", "/tmp/from-flag.sock"], env=env)
+        self.assertEqual(overridden.app_server_socket, "/tmp/from-flag.sock")
+
+    def test_app_server_socket_follows_codex_home(self):
+        # CODEX_HOME を変えたら、Codex アプリが繋ぐ先と同じ場所を指す。
+        config = build_config([], env={"CODEX_HOME": "/tmp/codex-home"})
+
+        self.assertEqual(
+            config.app_server_socket,
+            "/tmp/codex-home/app-server-control/app-server-control.sock",
+        )
 
 
 class ExtraMcpConfigFileTest(unittest.TestCase):

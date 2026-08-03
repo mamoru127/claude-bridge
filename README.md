@@ -18,15 +18,19 @@ claude-bridge/
 │   ├── claude_cli.py     Claude CLI の非対話実行と stream-json 出力の逐次解釈
 │   ├── upstream.py       Claude が受け持たないモデルの上流への中継
 │   ├── mcp_adapter.py    Codex app-server の RPC を MCP tool として公開する stdio MCP サーバー
-│   ├── app_server.py     専用の `codex app-server` 子プロセスと話す JSON-RPC クライアント
-│   │                     （子プロセスを持つのはブリッジ本体。アダプタは HTTP で頼むだけ）
+│   ├── app_server.py     常駐 `codex app-server` と話す JSON-RPC クライアント
+│   │                     （接続を持つのはブリッジ本体。アダプタは HTTP で頼むだけ）
+│   ├── uds_websocket.py  制御ソケット（UNIX ソケット上の WebSocket）クライアント
 │   └── errors.py         OpenAI error 形式に変換できる共通エラー型
 ├── launchd/
-│   ├── local.claude-bridge.plist  ログイン時に常駐させる launchd ユーザーエージェント
-│   └── install.sh                 plist のパスを埋めて登録し、起動を確認するスクリプト
+│   ├── local.claude-bridge.plist     ブリッジを常駐させる launchd ユーザーエージェント
+│   ├── local.codex-app-server.plist  共有 app-server を常駐させるユーザーエージェント
+│   ├── install.sh                    ブリッジの plist のパスを埋めて登録し、起動を確認する
+│   └── install-app-server.sh         app-server の plist のパスを埋めて登録し、応答を確認する
 └── tests/
     ├── test_bridge.py           HTTP・Responses API・Claude CLI 実行
-    └── test_app_server_mcp.py   MCP アダプタ・app-server クライアント・CLI 引数
+    ├── test_app_server_mcp.py   MCP アダプタ・app-server クライアント・CLI 引数
+    └── test_uds_websocket.py    制御ソケットのハンドシェイクとフレーム処理
 ```
 
 ## 前提条件
@@ -50,10 +54,14 @@ python -m claude_bridge
 | メソッド・パス | 認証 | 内容 |
 | --- | --- | --- |
 | `GET /health` | 不要 | `{"status": "ok"}` を返すヘルスチェック |
-| `GET /v1/models` | 必要 | `--claude-models`（既定は `claude-opus-5`）で指定した名前を並べたモデル一覧 |
+| `GET /v1/models` | 必要 | `--claude-models`（既定は `claude-opus-5` と `claude-fable-5`）で指定した名前を並べたモデル一覧 |
 | `POST /v1/responses` | 必要 | Responses API 本体。`stream` の真偽で JSON と SSE を切り替える |
+| `POST /v1/images/generations` | 必要 | 画像生成リクエストを上流へ素通しする（`--upstream-base-url` 必須） |
+| `POST /v1/images/edits` | 必要 | 画像編集リクエストを上流へ素通しする（`--upstream-base-url` 必須） |
 
-（「認証」は `CLAUDE_BRIDGE_API_KEY` を設定した場合のみ必要という意味です。上記以外のパスは 404 を返します。）
+（「認証」は `CLAUDE_BRIDGE_API_KEY` を設定した場合のみ必要という意味です。画像 API の
+中継時は、Codex から受け取った `Authorization` を上流へそのまま渡します。上記以外のパスは
+404 を返します。）
 
 ルーティングはクエリ文字列を除いたパスで判定します。Codex は `GET /v1/models?client_version=0.144.5` の
 ようにクエリを付けて送りますが、クエリの内容は読まずに無視します。
@@ -64,7 +72,7 @@ python -m claude_bridge
 
 | リクエストの `model` | 行き先 |
 | --- | --- |
-| `--claude-models` にある名前（既定は `claude-opus-5` のみ） | ローカルの Claude CLI が処理する |
+| `--claude-models` にある名前（既定は `claude-opus-5` と `claude-fable-5`） | ローカルの Claude CLI が処理する |
 | それ以外（`gpt-5.4` などの gpt 系すべて） | 受信ヘッダと本文のまま上流へ素通しする |
 
 素通しの場合、ブリッジは本文を解釈せず、`Authorization` を含む受信ヘッダを転送して上流の応答を
@@ -72,6 +80,11 @@ python -m claude_bridge
 （`Connection` や `Transfer-Encoding` など）と、接続を張り直す際に付け替わる `Host` / `Content-Length`
 だけです。**ブリッジ自身は上流の資格情報を持ちません。** 受信パスの `/v1` は中継先 URL のパスへ
 置き換わるため、`POST /v1/responses` は `https://chatgpt.com/backend-api/codex/responses` へ届きます。
+
+画像 API はモデル名による振り分けを行わず、`/v1/images/generations` と `/v1/images/edits` を常に
+上流へ素通しします。生成の JSON 本文だけでなく、編集で使う `multipart/form-data` も解釈せず転送し、
+上流のステータス・ヘッダ・本文をそのまま返します。`--upstream-base-url` がない場合は
+`upstream_not_configured` を返します。
 
 `GET /v1/models` も同じ考え方で、上流の一覧を先に並べ、`--claude-models` の名前を後ろへ足して返します。
 Codex アプリのモデル選択に GPT と Claude が並ぶのはこのためです。
@@ -86,15 +99,15 @@ Codex アプリのモデル選択に GPT と Claude が並ぶのはこのため�
 | `--host` | `CLAUDE_BRIDGE_HOST` | `127.0.0.1` | bind するアドレス |
 | `--port` | `CLAUDE_BRIDGE_PORT` | `8787` | bind するポート |
 | `--claude-path` | `CLAUDE_BRIDGE_CLAUDE_PATH` | `claude` | Claude CLI の実行ファイルパス |
-| `--model` | `CLAUDE_BRIDGE_MODEL` | `opus` | CLI に渡すモデル名 |
+| `--model` | `CLAUDE_BRIDGE_MODEL` | `opus` | `--claude-models` にない名前で来たときに CLI へ渡すモデル名 |
 | `--timeout` | `CLAUDE_BRIDGE_TIMEOUT_SECONDS` | `3600` | CLI 実行のタイムアウト秒。CLI の暴走に対する唯一の歯止め |
 | `--max-request-bytes` | `CLAUDE_BRIDGE_MAX_REQUEST_BYTES` | `33554432` | リクエストボディの上限バイト数。画像は data URL で送られてくるため大きめ |
 | `--working-dir` | `CLAUDE_BRIDGE_WORKING_DIR` | カレントディレクトリ | CLI を実行する作業ディレクトリ |
 | `--add-dir` | `CLAUDE_BRIDGE_ADD_DIRS` | なし | 作業ディレクトリの外で CLI にツール操作を許可する追加ディレクトリ。引数は繰り返し指定、環境変数は `:`（`os.pathsep`）区切り。存在しないパスは起動時に失敗する |
-| `--claude-models` | `CLAUDE_BRIDGE_CLAUDE_MODELS` | `claude-opus-5` | API で受け付けるモデル名のカンマ区切り。`GET /v1/models` が返す一覧そのもの |
+| `--claude-models` | `CLAUDE_BRIDGE_CLAUDE_MODELS` | `claude-opus-5,claude-fable-5` | API で受け付けるモデル名のカンマ区切り。`GET /v1/models` が返す一覧そのもので、CLI の `--model` へ渡す名前でもある |
 | `--upstream-base-url` | `CLAUDE_BRIDGE_UPSTREAM_BASE_URL` | なし（中継しない） | `--claude-models` 以外のモデルを中継する上流。Codex の既定は `https://chatgpt.com/backend-api/codex` |
 | `--enable-codex-mcp` | `CLAUDE_BRIDGE_ENABLE_CODEX_MCP` | 無効 | Codex app-server の MCP アダプタを Claude CLI へ渡す（後述） |
-| `--codex-path` | `CLAUDE_BRIDGE_CODEX_PATH` | `codex` | ブリッジが app-server として起動する Codex CLI の実行ファイルパス |
+| `--app-server-socket` | `CLAUDE_BRIDGE_APP_SERVER_SOCKET` | `$CODEX_HOME/app-server-control/app-server-control.sock` | 繋ぎ先の app-server 制御ソケット。Codex アプリが繋ぐ場所と同じ |
 | `--mcp-config-file` | `CLAUDE_BRIDGE_MCP_CONFIG_FILE` | なし | 追加で有効にする MCP サーバーを書いた JSON ファイル（`mcpServers` 形式、後述）。起動時に読み込み、読めなければ起動しない |
 | （なし） | `CLAUDE_BRIDGE_API_KEY` | なし | 設定すると `Authorization: Bearer` を必須にする共有シークレット |
 
@@ -139,9 +152,9 @@ launchd/install.sh
 `KeepAlive` を有効にしているため、**`kill` で止めても launchd が起動し直します。**
 止めたいときは `bootout` を使ってください。再起動は `kickstart -k` が確実です。
 
-**`install.sh` と `kickstart -k` はブリッジを作り直します。** そのとき Codex app-server の
-子プロセスと、ブリッジが起動した Claude CLI も一緒に終わります。`turn_start_async` で走らせている
-ターンがあるなら、終わってから実行してください。
+**`install.sh` と `kickstart -k` はブリッジを作り直します。** そのときブリッジが起動した
+Claude CLI も一緒に終わります。app-server は別サービスなので巻き込まれず、`turn_start_async` で
+走らせているターンは続きます。
 
 plist で明示している点:
 
@@ -197,10 +210,10 @@ model_provider = "claude_bridge"
 ```
 
 アプリのモデル選択を `claude-opus-5` にしておくと、その名前でブリッジにリクエストが届きます。
-ブリッジは `GET /v1/models` でこの名前を公開して受け付けますが、**実行するのは起動時の
-`--model`（既定は `opus` = Claude Opus）で固定**です。リクエストの `model` は
-レスポンスの `model` にそのまま返すだけで、Claude CLI の `--model` には渡しません。
-つまり応答を生成しているのは常に Claude で、OpenAI のモデルは一切呼び出されません。
+ブリッジは `GET /v1/models` でこの名前を公開して受け付け、**そのまま Claude CLI の `--model`
+へ渡します。** 既定では `claude-opus-5`（Claude Opus）と `claude-fable-5`（Claude Fable）を
+公開しているので、アプリのモデル選択がそのまま実行モデルの切り替えになります。
+どちらを選んでも応答を生成するのは Claude で、OpenAI のモデルは一切呼び出されません。
 
 **この名前は上流に実在しないものを選んでください。** 中継が有効なとき、ブリッジは上流の
 モデル一覧から同じ名前を取り除いて自分の項目に置き換えます。上流に実在する名前
@@ -213,15 +226,33 @@ model_provider = "claude_bridge"
 Codex アプリのモデルを Claude へ流している状態でも、**Claude 側から Codex app-server の
 RPC を呼べるようにする**ための仕組みです。**既定では無効**で、明示的に有効化したときだけ動きます。
 
+ここで作ったスレッドのターンは、**ブリッジと Codex アプリが共有する 1 つの app-server** で
+走ります。スレッドの状態は、それを走らせているプロセスのメモリにしかありません
+（`~/.codex/state_5.sqlite` にもセッションファイルにも実行中を示す列はない）。
+別プロセスを立てるとアプリからは `notLoaded` に見えるため、共有するのが条件になります。
+
+この仕組みは、Codex 自身が実行する `--passthrough-tools` の `create_thread` とは別経路です。
+受け渡しはアプリの選択モデルが code mode でないことが前提で、そちらが使えなくなったときも
+app-server の RPC は動きます。
+
+> 2026-07-31 に上流のモデル一覧の先頭が `gpt-5.6-sol`（`tool_mode: "code_mode_only"`）へ入れ替わり、
+> Claude 用エントリが雛形ごとその宣言を受け継いだ結果、受け渡しが一度止まりました。code mode の
+> Codex はツールを function tool として送らず `exec` のコード実行側（`tools.*`）へ寄せるため、
+> `additional_tools` が `exec` / `wait` / `request_user_input` / `collaboration` だけになり、
+> `tool_search` も遅延読み込みの `create_thread` も会話へ入りません。`_codex_model` で
+> `tool_mode` を `null` に打ち消して直してあります。`model_info.supports_search_tool` は
+> 雛形から引き継いだ `true` のままで、原因ではありませんでした。
+
 ```
 Codex アプリ ──HTTP──> claude-bridge ──> claude --print --mcp-config ...
-                          │  ▲                  │
-                          │  └── HTTP ──── mcp_adapter <── MCP ──┘
-                          │   /app-server/rpc
-                          └─ JSON-RPC ──> codex app-server（専用の子プロセス）
+                 │        │  ▲                  │
+                 │        │  └── HTTP ──── mcp_adapter <── MCP ──┘
+                 │        │   /app-server/rpc
+                 │        └─ JSON-RPC ─┐
+                 └─ JSON-RPC ──────────┴─> codex app-server（共有・制御ソケット）
 ```
 
-**app-server の子プロセスを持つのはブリッジ本体です。** アダプタは Claude CLI の起動ごとに
+**app-server への接続を持つのはブリッジ本体です。** アダプタは Claude CLI の起動ごとに
 生まれて消えるため、アダプタが持つと再起動のたびに実行中のターンが道連れになります。
 常駐するブリッジ側へ寄せることで、`turn_start_async` で始めたターンはアダプタの寿命と無関係に
 走り続けます。
@@ -235,7 +266,7 @@ CLAUDE_BRIDGE_ENABLE_CODEX_MCP=1 python -m claude_bridge
 または
 
 ```bash
-python -m claude_bridge --enable-codex-mcp --codex-path /opt/homebrew/bin/codex
+python -m claude_bridge --enable-codex-mcp --app-server-socket ~/.codex/app-server-control/app-server-control.sock
 ```
 
 有効化すると、Claude CLI の起動引数に次の 2 つが加わります（無効時は一切付きません）。
@@ -319,8 +350,9 @@ Claude から見えるツール名は `mcp__codex_app_server__thread_list` の�
 
 ### スレッドを別々に走らせて後から様子を見る
 
-`turn_start_async` は、Codex アプリ（スマホを含む）で個別に進捗を追える独立したスレッドを
-作るための道具です。手順は次のとおりです。
+`turn_start_async` は、独立したスレッドを作って待たずに走らせるための道具です。
+アプリを共有 app-server へ繋がせていれば実行中の表示が出ます。繋がせていない場合は
+`notLoaded` のままなので、進捗は次の手順で自分で読み取ります。
 
 1. `thread_start` でスレッドを作る（`cwd` に作業ディレクトリ、必要なら `modelProvider`）。
 2. `turn_start_async` で最初のターンを投げる。ここで戻り値は即座に返る。
@@ -331,33 +363,39 @@ Claude から見えるツール名は `mcp__codex_app_server__thread_list` の�
 （`~/.codex/sessions/...jsonl`）が作られるのは最初のターンを開始したときなので、
 一覧に並べたいならターンの投入までを 1 セットで行ってください。
 
-止まる条件は 2 つだけです。**ブリッジ本体を止める**か、**Mac がスリープする**か。
-前者は launchd の再読み込みや `install.sh` の再実行でも起きるため、走らせている間は避けてください
-（ブリッジが起動した Claude CLI も同時に落ちます）。後者は plist の `caffeinate -s` で、
-AC 電源のときだけ抑止しています。
+止まる条件は 2 つだけです。**共有 app-server を止める**か、**Mac がスリープする**か。
+ブリッジ本体を止めてもターンは止まりません（app-server が別サービスとして常駐しているため）。
+スリープは plist の `caffeinate -s` で、AC 電源のときだけ抑止しています。
 
-### 専用の app-server 子プロセス
+### 共有 app-server
 
-**ブリッジ本体**が最初の RPC を受けたときに `codex app-server --listen stdio://` を自分の
-子プロセスとして起動し、その子プロセスの stdin/stdout とだけやり取りします。
-MCP アダプタは `POST /app-server/rpc` でブリッジへ頼むだけで、自分では起動しません。
+`codex app-server --listen unix://` を launchd で常駐させ、ブリッジはその制御ソケット
+（`$CODEX_HOME/app-server-control/app-server-control.sock`）へ繋ぎます。ブリッジは
+app-server を起動しません。ソケットが無ければ繋げず、その旨を返します。
 
-- **デスクトップアプリが動かしている app-server には一切触れません。** 別プロセスです。
-  アプリ側のプロセスの stdin/stdout に割り込むことはありません。
-- そのため**アプリで開いているスレッドの「中の状態」は共有しません。** 見えるのはディスクに
-  永続化された内容（`~/.codex/sessions` 由来のスレッド一覧・履歴）です。
-  アプリ側で編集中のまだ書き出されていない状態は見えません。
-- ツールが一度も呼ばれなければ `codex` プロセスは起動しません。
-- **Claude CLI が終了しても子プロセスは残ります。** 終了するのはブリッジ本体を止めたときです。
+```bash
+launchd/install-app-server.sh   # 共有 app-server を登録し、応答を確認する
+launchd/install.sh              # そのあとブリッジを登録する
+```
+
+- **同じ app-server に Codex アプリも繋がせると、実行中の表示がアプリに出ます。**
+  アプリは `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` が与えられ、かつこのソケットが在るときだけ
+  自前の子プロセスを立てずにここへ繋ぎます（アプリの再起動が必要）。
+- 制御ソケットは生の JSON ではなく、**UNIX ソケット上の WebSocket** です。`app-server proxy --sock`
+  は生バイトを中継するだけなので、その先で WebSocket を話す必要があります（`uds_websocket.py`）。
+- 実行ファイルは Codex アプリ内蔵のものを使います。アプリはソケット越しに得た app-server の
+  バージョンで接続可否を決めるため、**アプリを更新したらこのサービスも再起動**してください。
+- ツールが一度も呼ばれなければ、ブリッジはソケットへ繋ぎません。
+- **Claude CLI もブリッジ本体も、終了して app-server を巻き込みません。**
   これが `turn_start_async` で始めたターンを走り切らせるための条件です。
-- 子プロセスの stdio は 1 本しかないため、**読み取りは専用スレッド 1 本だけ**が行い、
+- 接続は 1 本しかないため、**受け取りは専用スレッド 1 本だけ**が行い、
   `id` で応答を、`threadId` で通知を待ち手へ振り分けます。送信だけをロックで直列化するので、
   `turn_start` が完了を待っている間も `thread_read` などの呼び出しは通ります。
   待ち手のいない通知（＝待たずに始めたターンの経過）はその場で捨てるため、溜まりません。
-- **RPC のエラー応答と 1 件の時間切れでは子プロセスを落としません。** 通信の失敗ではないためです。
-  ここで落とすと、進捗確認が 1 回失敗しただけで、走っている全部のターンが `interrupted` になります。
-  落とすのは、stdout が閉じた／JSON として読めない／書き込めない、というつなぎ目の failure のときだけです。
-- 子プロセスの stderr は捨てます（app-server が常時ログを吐くため、読まずに溜めると詰まる）。
+- **RPC のエラー応答と 1 件の時間切れでは接続を切りません。** 通信の失敗ではないためです。
+  ここで切ると、進捗確認が 1 回失敗しただけで、走っている全部のターンが `interrupted` になります。
+  切るのは、接続が閉じた／JSON として読めない／書き込めない、というつなぎ目の failure のときだけです。
+- app-server のログは launchd 側（`~/Library/Logs/codex-app-server/app-server.log`）に出ます。
 
 ### `POST /app-server/rpc`
 
@@ -540,6 +578,7 @@ data: {"type":"response.failed","sequence_number":3,"response":{"id":"resp_...",
 | `claude_cli_not_found` / `claude_cli_launch_failed` | 500 | CLI の実行ファイルが見つからない、または起動できない |
 | `claude_cli_failed` / `claude_cli_error_result` | 502 | CLI が異常終了、またはエラー結果を返した |
 | `claude_cli_invalid_output` | 502 | CLI の出力を JSON として解釈できない、または `result` が届かない |
+| `upstream_not_configured` | 503 | 画像 API の中継先が設定されていない |
 | `upstream_unreachable` | 502 | 中継先へ接続できない（`--upstream-base-url` 指定時） |
 | `upstream_models_failed` / `upstream_models_invalid` | 502 | 上流のモデル一覧を取得・解釈できない |
 
@@ -592,10 +631,12 @@ data: {"type":"response.failed","sequence_number":3,"response":{"id":"resp_...",
   `CLAUDE_BRIDGE_MAX_REQUEST_BYTES` は 32MB にしてあります。超えると 413 で拒否します。
 - `temperature` / `top_p` / `max_output_tokens` などのサンプリングパラメータは
   Claude CLI に対応する引数がないため**黙って無視されます**。
-- リクエストの `model` はレスポンスにそのまま反映しますが、**CLI に渡すモデルはサーバー起動時の
-  `--model` 固定**です。クライアントから任意のモデル文字列を CLI に流さないための意図的な設計です。
-  `GET /v1/models` に載る `claude-opus-5`（既定）も**API で受け付ける名前にすぎません。**
-  この名前で来たリクエストも Claude Opus（起動時の `--model`）が応答します。
+- リクエストの `model` はレスポンスにそのまま反映し、**`--claude-models` に載せた名前のときだけ
+  CLI の `--model` へ渡します。** 一覧にない名前は起動時の `--model` で実行します。
+  クライアントから任意のモデル文字列を CLI に流さないための意図的な設計で、CLI へ届くのは
+  起動時に許可した名前だけです。`model` を省略したリクエストは一覧の先頭を選んだ扱いになります。
+- `reasoning.effort` は読まずに捨てます。CLI には `--effort` がありますが、ブリッジは値を渡さない
+  ため、実行時の effort は CLI の既定（または `CLAUDE_CODE_EFFORT_LEVEL`）のままです。
 - **CLI 出力の総量に上限はありません。** 標準出力は 1 行ずつ読んで捨てるため総量はメモリに
   影響せず、実測では 8 割超をツール結果の行が占めます。ファイルを何十個も読むような作業では
   本文の長さと無関係に総量が伸びるため、総量での打ち切りは正常な長い作業だけを落とします。

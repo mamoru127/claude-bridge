@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
         config.model,
         config.working_dir,
         "bearer" if config.api_key else "none",
-        config.codex_path if config.codex_mcp else "disabled",
+        config.app_server_socket if config.codex_mcp else "disabled",
     )
     try:
         server.serve_forever()

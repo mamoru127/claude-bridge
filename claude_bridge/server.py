@@ -6,6 +6,7 @@ import logging
 import subprocess
 import threading
 import time
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -14,6 +15,7 @@ from .claude_cli import run_claude, stream_claude
 from .config import (
     APP_SERVER_PATH,
     HEALTH_PATH,
+    IMAGE_PATHS,
     MODELS_PATH,
     PASSTHROUGH_PATH,
     RESPONSES_PATH,
@@ -144,9 +146,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if path == PASSTHROUGH_PATH:
                 self._send_json(200, {"result": self._pending_call(config)})
                 return
+            if path in IMAGE_PATHS:
+                if not config.upstream_base_url:
+                    raise BridgeError(
+                        "画像 API の中継先が設定されていません",
+                        status=503,
+                        error_type="api_error",
+                        code="upstream_not_configured",
+                    )
+                self._relay(config, self._read_body(config))
+                return
             if path != RESPONSES_PATH:
                 raise self._not_found(path)
-            body = self._read_body(config)
+            body = self._read_json_body(config)
             payload = self._decode_json(body)
             # model 省略時の既定。config.model は CLI へ渡す実行モデル名なので使わない。
             default_model = config.claude_models[0]
@@ -159,6 +171,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 config.passthrough_tools,
                 config.tool_search_query,
             )
+            # アプリが選んだモデルで実行する。CLI へ届くのは一覧に載せた名前だけ。
+            config = replace(config, model=config.cli_model(request.model))
         except BridgeError as error:
             self._send_error(error)
             return
@@ -185,7 +199,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         このプロセスの子で走り続けるため、アダプタが再起動しても実行は止まらない。
         """
 
-        payload = self._decode_json(self._read_body(config))
+        payload = self._decode_json(self._read_json_body(config))
         if not isinstance(payload, dict):
             raise self._invalid_rpc("リクエストはオブジェクトで指定してください")
         method = payload.get("method")
@@ -213,7 +227,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         実行はしない。ターンの終わりに function_call として Codex へ渡し、Codex が実行する。
         """
 
-        payload = self._decode_json(self._read_body(config))
+        payload = self._decode_json(self._read_json_body(config))
         if not isinstance(payload, dict):
             raise self._invalid_rpc("リクエストはオブジェクトで指定してください")
         name = payload.get("name")
@@ -382,7 +396,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             )
 
     def _read_body(self, config: BridgeConfig) -> bytes:
-        """中継でもそのまま送れるよう、本文を生のバイト列で読む。"""
+        """中継でそのまま送れるよう、本文を生のバイト列で読む。"""
+
+        return self.rfile.read(self._content_length(config))
+
+    def _read_json_body(self, config: BridgeConfig) -> bytes:
+        """Responses API と内部 RPC 用の JSON 本文を読む。"""
 
         content_type = self.headers.get("Content-Type", "")
         if not content_type.startswith("application/json"):
@@ -392,7 +411,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 error_type="invalid_request_error",
                 code="unsupported_media_type",
             )
-        return self.rfile.read(self._content_length(config))
+        return self._read_body(config)
 
     def _decode_json(self, body: bytes) -> object:
         try:
@@ -502,7 +521,7 @@ class BridgeServer(ThreadingHTTPServer):
         # 受け渡しアダプタは別プロセスなので、預かった呼び出しはサーバー側で保持する。
         self.pending = PendingCalls()
         # app-server はここで持つ。実行中のターンをアダプタの再起動から切り離すための要。
-        self.app_server = AppServerClient(codex_path=config.codex_path)
+        self.app_server = AppServerClient(socket_path=config.app_server_socket)
 
     def server_close(self) -> None:
         self.app_server.close()

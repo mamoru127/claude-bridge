@@ -17,7 +17,10 @@ DEFAULT_TIMEOUT_SECONDS = 3600.0
 # 実測では全画面スクリーンショット 1 枚で約 5MB あり、会話履歴として毎回送り直される。
 # 32MB は Claude API 側のリクエスト上限でもあるので、これ以上受け取っても CLI 実行で失敗する。
 DEFAULT_MAX_REQUEST_BYTES = 32 * 1024 * 1024
-DEFAULT_CODEX_PATH = "codex"
+# 常駐 app-server の制御ソケット。`codex app-server --listen unix://` が作る既定の場所で、
+# Codex アプリも同じ場所へ繋ぐ。両者が 1 つの app-server を共有すると、
+# ブリッジが始めたターンの実行中表示がアプリ側にも出る。
+APP_SERVER_SOCKET_RELATIVE_PATH = "app-server-control/app-server-control.sock"
 # MCP アダプタが接続するブリッジ本体。アダプタは別プロセスなので URL で指す。
 DEFAULT_BRIDGE_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
 
@@ -25,9 +28,10 @@ DEFAULT_BRIDGE_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
 DEFAULT_UPSTREAM_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 # API で受け付けるモデル名。GET /v1/models に載り、中継が有効ならこれ以外は上流へ中継する。
-# CLI に渡す実行モデルは常に --model 固定なので、名前を増やしても実体は変わらない。
+# ここに載せた名前はそのまま CLI の --model へ渡すため、Claude CLI が解釈できる名前
+# （`opus` などの別名、または `claude-opus-5` のような正式名）だけを並べる。
 # 上流に実在するモデル名を選ぶと、その名前が上流一覧から除かれてアプリで選べなくなる。
-DEFAULT_CLAUDE_MODELS = ("claude-opus-5",)
+DEFAULT_CLAUDE_MODELS = ("claude-opus-5", "claude-fable-5")
 
 # --mcp-config で登録する MCP サーバー名。ツール名は mcp__<この名前>__<tool> になる。
 MCP_SERVER_NAME = "codex_app_server"
@@ -52,11 +56,19 @@ DEFAULT_PASSTHROUGH_TOOLS = (
 # スレッド操作は deferLoading 付きで登録されており、tool_search を通すまでリクエストへ載らない。
 # tool_search はブリッジが自分で 1 回投げる。Claude へ見せても、結果が次のターンになる分だけ
 # 往復が伸びるだけで、探す語は毎回同じだからである。
-DEFAULT_TOOL_SEARCH_QUERY = "create thread fork thread list threads codex task management"
+# キーワードで探すと順位の上位しか返らず、DEFAULT_PASSTHROUGH_TOOLS に書いても届かないものが
+# 出る。select: は名前で直接引くため、語順に左右されない。
+DEFAULT_TOOL_SEARCH_QUERY = "select:" + ",".join(DEFAULT_PASSTHROUGH_TOOLS)
+
+# 検索が返す件数の上限。既定のままだと DEFAULT_PASSTHROUGH_TOOLS より少なく打ち切られる。
+TOOL_SEARCH_LIMIT = 20
 
 API_PREFIX = "/v1"
 RESPONSES_PATH = "/v1/responses"
 MODELS_PATH = "/v1/models"
+IMAGE_GENERATIONS_PATH = "/v1/images/generations"
+IMAGE_EDITS_PATH = "/v1/images/edits"
+IMAGE_PATHS = frozenset({IMAGE_GENERATIONS_PATH, IMAGE_EDITS_PATH})
 HEALTH_PATH = "/health"
 # MCP アダプタが Codex app-server の RPC を投げる先。常駐するブリッジ本体が中継する。
 APP_SERVER_PATH = "/app-server/rpc"
@@ -66,6 +78,14 @@ PASSTHROUGH_PATH = "/codex-tool/call"
 # 定義はリクエストごとに変わるため、起動時の設定（CLAUDE_BRIDGE_PASSTHROUGH_TOOLS）とは別名にする。
 PASSTHROUGH_DEFS_ENV = "CLAUDE_BRIDGE_PASSTHROUGH_DEFS"
 PASSTHROUGH_TOKEN_ENV = "CLAUDE_BRIDGE_PASSTHROUGH_TOKEN"
+
+
+def default_app_server_socket(env=None) -> str:
+    """常駐 app-server の制御ソケットの既定の場所。CODEX_HOME に従う。"""
+
+    env = os.environ if env is None else env
+    codex_home = env.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    return os.path.join(codex_home, APP_SERVER_SOCKET_RELATIVE_PATH)
 
 
 @dataclass(frozen=True)
@@ -84,7 +104,7 @@ class BridgeConfig:
     add_dirs: tuple[str, ...] = ()
     # 明示的に有効化したときだけ、Codex app-server の MCP アダプタを Claude CLI へ渡す。
     codex_mcp: bool = False
-    codex_path: str = DEFAULT_CODEX_PATH
+    app_server_socket: str = field(default_factory=default_app_server_socket)
     # --mcp-config-file を起動時に読んだ結果。Claude CLI へ追加で渡すサーバー定義。
     extra_mcp_servers: dict = field(default_factory=dict)
     # 空文字なら中継しない（全モデルを Claude CLI で処理する）。
@@ -117,6 +137,15 @@ class BridgeConfig:
         """このモデルを Claude CLI で処理するか。中継が無効なら全モデルが対象。"""
 
         return not self.upstream_base_url or model in self.claude_models
+
+    def cli_model(self, model: str) -> str:
+        """リクエストのモデル名に対して CLI の --model へ渡す実行モデル名を返す。
+
+        渡してよいのは起動時に `--claude-models` で許可した名前だけ。中継が無効なときは
+        一覧にない名前でも Claude CLI へ回るため、そこは起動時の `--model` で実行する。
+        """
+
+        return model if model in self.claude_models else self.model
 
 
 def _env_str(env: dict, name: str, default: str) -> str:
@@ -233,8 +262,11 @@ def build_config(argv: list[str] | None = None, env: dict | None = None) -> Brid
         help="Codex app-server の MCP アダプタを Claude CLI へ渡す（既定は無効）",
     )
     parser.add_argument(
-        "--codex-path",
-        default=_env_str(env, "CLAUDE_BRIDGE_CODEX_PATH", DEFAULT_CODEX_PATH),
+        "--app-server-socket",
+        default=_env_str(
+            env, "CLAUDE_BRIDGE_APP_SERVER_SOCKET", default_app_server_socket(env)
+        ),
+        help="繋ぎ先の codex app-server 制御ソケット（`--listen unix://` で作られる）",
     )
     parser.add_argument(
         "--mcp-config-file",
@@ -275,7 +307,7 @@ def build_config(argv: list[str] | None = None, env: dict | None = None) -> Brid
         working_dir=_abs_path(args.working_dir),
         add_dirs=tuple(_abs_path(path) for path in add_dirs),
         codex_mcp=args.enable_codex_mcp,
-        codex_path=args.codex_path,
+        app_server_socket=args.app_server_socket,
         extra_mcp_servers=_load_mcp_servers(args.mcp_config_file),
         upstream_base_url=args.upstream_base_url.rstrip("/"),
         claude_models=tuple(_split(args.claude_models, ",")),

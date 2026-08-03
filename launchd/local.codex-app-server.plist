@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- install-app-server.sh がこのファイルの __HOME__ を実際の値へ置き換えて
+     ~/Library/LaunchAgents/ へ書き出します。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.codex-app-server</string>
+
+  <!-- ブリッジと Codex アプリが共有する app-server。`unix://` は CODEX_HOME 配下の
+       app-server-control/app-server-control.sock を作る。アプリはこのソケットが在り、
+       かつ CODEX_APP_SERVER_USE_LOCAL_DAEMON=1 のときだけ、自前の子プロセスを立てずに
+       ここへ繋ぐ。両者が同じプロセスを使うと、ブリッジが始めたターンの実行中表示が
+       アプリ側にも出る。スレッドの状態はそれを走らせているプロセスのメモリにしかない。
+
+       実行ファイルは Codex アプリ内蔵のものを使う。アプリはソケット越しに得た
+       app-server のバージョンを見て接続可否を決めるため、アプリと揃える。
+       アプリを更新したらこのサービスも再起動する。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/ChatGPT.app/Contents/Resources/codex</string>
+    <string>app-server</string>
+    <string>--listen</string>
+    <string>unix://</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/codex-app-server/app-server.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/codex-app-server/app-server.log</string>
+</dict>
+</plist>

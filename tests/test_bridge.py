@@ -262,6 +262,21 @@ class BridgeHTTPTestCase(unittest.TestCase):
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.headers["Content-Type"], parse_sse(response.read())
 
+    def post_bytes(self, base_url: str, path: str, body: bytes, content_type: str, headers=None):
+        """任意の Content-Type と生バイト列を POST し、応答も生のまま返す。"""
+
+        request = urllib.request.Request(
+            base_url + path,
+            data=body,
+            headers={"Content-Type": content_type, **(headers or {})},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.headers, error.read()
+
     def get_json(self, base_url: str, path: str, headers=None):
         request = urllib.request.Request(base_url + path, headers=headers or {}, method="GET")
         try:
@@ -324,18 +339,30 @@ class ResponsesEndpointTest(BridgeHTTPTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["model"], "claude-opus-5")
 
-    def test_compat_alias_model_does_not_reach_the_cli(self):
-        # Codex app が送る claude-opus-5 は CLI の --model に渡さず、起動時の固定値で実行する。
+    def test_listed_model_selects_the_cli_model(self):
+        # 一覧に載せた名前はアプリの選択がそのまま実行モデルになる。
         runner = FakeRunner()
         base_url = self.start_server(make_config(model="opus"), runner)
 
-        status, payload = self.post(base_url, {"model": "claude-opus-5", "input": "やあ"})
+        status, payload = self.post(base_url, {"model": "claude-fable-5", "input": "やあ"})
 
         self.assertEqual(status, 200)
-        self.assertEqual(payload["model"], "claude-opus-5")
+        self.assertEqual(payload["model"], "claude-fable-5")
+        command = runner.calls[0]["command"]
+        self.assertEqual(command[command.index("--model") + 1], "claude-fable-5")
+
+    def test_unlisted_model_does_not_reach_the_cli(self):
+        # 中継が無効だと一覧外の名前も届く。任意の文字列を CLI へ流さず起動時の固定値で実行する。
+        runner = FakeRunner()
+        base_url = self.start_server(make_config(model="opus"), runner)
+
+        status, payload = self.post(base_url, {"model": "gpt-5.4", "input": "やあ"})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["model"], "gpt-5.4")
         command = runner.calls[0]["command"]
         self.assertEqual(command[command.index("--model") + 1], "opus")
-        self.assertNotIn("claude-opus-5", " ".join(command))
+        self.assertNotIn("gpt-5.4", " ".join(command))
 
     def test_invokes_claude_cli_without_shell(self):
         runner = FakeRunner()
@@ -375,7 +402,8 @@ class ResponsesEndpointTest(BridgeHTTPTestCase):
                 "summarized",
                 "--strict-mcp-config",
                 "--model",
-                "opus",
+                # model 省略時は一覧の先頭が選ばれ、その名前で実行する。
+                "claude-opus-5",
             ],
         )
         system_prompt = call["command"].index("--append-system-prompt")
@@ -958,6 +986,18 @@ class ModelsEndpointTest(BridgeHTTPTestCase):
         # reasoning summary はリクエストの要求と無関係に送るので、要求させない値になっている。
         self.assertFalse(entry["supports_reasoning_summary_parameter"])
 
+    def test_code_mode_declaration_is_not_inherited_from_the_template(self):
+        # 雛形が code mode 専用だと、Codex はツールを exec のコード実行側へ寄せ、
+        # 受け渡しの対象も tool_search も function tool として送らなくなる。
+        upstream = {
+            "data": [{"id": "gpt-5.6-sol"}],
+            "models": [{"slug": "gpt-5.6-sol", "tool_mode": "code_mode_only"}],
+        }
+        payload = build_models(make_config(), upstream)
+
+        entry = next(item for item in payload["models"] if item["slug"] == "claude-opus-5")
+        self.assertIsNone(entry["tool_mode"])
+
     def test_custom_model_is_added_to_the_list(self):
         payload = build_models(make_config(claude_models=("claude-opus-4-5",)))
 
@@ -969,6 +1009,13 @@ class ModelsEndpointTest(BridgeHTTPTestCase):
 
         self.assertIn("claude-opus-5", [item["id"] for item in payload["data"]])
         self.assertIn("claude-opus-5", [item["slug"] for item in payload["models"]])
+
+    def test_fable_is_listed_by_default(self):
+        # アプリのモデル選択から Fable を選べるようにする。名前は CLI の --model にも渡る。
+        payload = build_models(make_config())
+
+        self.assertIn("claude-fable-5", [item["id"] for item in payload["data"]])
+        self.assertIn("claude-fable-5", [item["slug"] for item in payload["models"]])
 
     def test_duplicate_claude_models_are_listed_once(self):
         config = make_config(claude_models=("claude-opus-5", "claude-opus-5"))
@@ -1629,7 +1676,7 @@ class ConfigTest(unittest.TestCase):
     def test_default_claude_model_does_not_collide_with_upstream_names(self):
         # 上流に実在する名前を使うと、その名前が上流一覧から除かれてアプリで選べなくなる。
         config = build_config([], env={})
-        self.assertEqual(config.claude_models, ("claude-opus-5",))
+        self.assertEqual(config.claude_models, ("claude-opus-5", "claude-fable-5"))
 
     def test_empty_claude_models_is_rejected(self):
         # model 省略時の既定に先頭を使うため、1 件以上あることを起動時に保証する。
@@ -1728,6 +1775,123 @@ class UpstreamRoutingTest(BridgeHTTPTestCase):
         self.assertEqual(payload["output_text"], "こんにちは")
         self.assertEqual(payload["model"], "claude-opus-5")
         self.assertEqual(received, [])
+
+
+class ImagePassthroughTest(BridgeHTTPTestCase):
+    """画像 API はモデル判定せず、本文と認証を上流へそのまま中継する。"""
+
+    def start_upstream(self, status=200, response_body=b'{"data":[]}'):
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self) -> None:
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                received.append(
+                    {
+                        "path": self.path,
+                        "body": body,
+                        "content_type": self.headers["Content-Type"],
+                        "authorization": self.headers["Authorization"],
+                    }
+                )
+                self.send_response(status)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+
+            def log_message(self, format: str, *args) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        host, port = server.server_address[:2]
+        return f"http://{host}:{port}/backend-api/codex", received
+
+    def test_generations_json_is_relayed_with_query_and_authorization(self):
+        upstream_url, received = self.start_upstream(response_body=b"generated")
+        base_url = self.start_server(make_config(upstream_base_url=upstream_url), FakeRunner())
+        body = b'{"model":"gpt-image-2","prompt":"orange banner"}'
+
+        status, headers, response = self.post_bytes(
+            base_url,
+            "/v1/images/generations?client_version=0.146.0",
+            body,
+            "application/json",
+            headers={"Authorization": "Bearer chatgpt-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "application/octet-stream")
+        self.assertEqual(response, b"generated")
+        self.assertEqual(
+            received,
+            [
+                {
+                    "path": "/backend-api/codex/images/generations?client_version=0.146.0",
+                    "body": body,
+                    "content_type": "application/json",
+                    "authorization": "Bearer chatgpt-token",
+                }
+            ],
+        )
+
+    def test_edits_multipart_is_relayed_without_decoding(self):
+        upstream_url, received = self.start_upstream(response_body=b"edited")
+        base_url = self.start_server(make_config(upstream_base_url=upstream_url), FakeRunner())
+        boundary = "image-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="prompt"\r\n\r\n'
+            "make it orange\r\n"
+            f"--{boundary}--\r\n"
+        ).encode()
+        content_type = f"multipart/form-data; boundary={boundary}"
+
+        status, _, response = self.post_bytes(
+            base_url,
+            "/v1/images/edits",
+            body,
+            content_type,
+            headers={"Authorization": "Bearer chatgpt-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response, b"edited")
+        self.assertEqual(received[0]["path"], "/backend-api/codex/images/edits")
+        self.assertEqual(received[0]["body"], body)
+        self.assertEqual(received[0]["content_type"], content_type)
+        self.assertEqual(received[0]["authorization"], "Bearer chatgpt-token")
+
+    def test_upstream_error_status_and_body_are_preserved(self):
+        upstream_url, _ = self.start_upstream(status=400, response_body=b"upstream error")
+        base_url = self.start_server(make_config(upstream_base_url=upstream_url), FakeRunner())
+
+        status, headers, response = self.post_bytes(
+            base_url,
+            "/v1/images/generations",
+            b"{}",
+            "application/json",
+            headers={"Authorization": "Bearer chatgpt-token"},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(headers["Content-Type"], "application/octet-stream")
+        self.assertEqual(response, b"upstream error")
+
+    def test_image_endpoint_requires_upstream(self):
+        base_url = self.start_server(make_config(), FakeRunner())
+
+        status, _, response = self.post_bytes(
+            base_url, "/v1/images/generations", b"{}", "application/json"
+        )
+
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(response)["error"]["code"], "upstream_not_configured")
 
 
 class AddDirTest(unittest.TestCase):
