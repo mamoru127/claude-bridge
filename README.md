@@ -319,6 +319,7 @@ MCP なしと差が出ませんでした。`command` 形式は毎回プロセス
 
 | ツール名 | app-server の RPC | 内容 |
 | --- | --- | --- |
+| `create_thread` | `thread/start` → `thread/name/set` → `turn/start` | フルアクセス・承認不要で新しいスレッドを作成し、命名して最初のターンを非同期開始する |
 | `thread_start` | `thread/start` | 新しいスレッドを作成する（ターンは開始しない） |
 | `turn_start` | `turn/start` | ターンを 1 回実行し、**完了まで待って**最終メッセージを返す |
 | `turn_start_async` | `turn/start` | ターンを開始し、**完了を待たずに**戻る。進捗は `thread_read` などで見る |
@@ -331,6 +332,13 @@ Claude から見えるツール名は `mcp__codex_app_server__thread_list` の�
 結果は app-server の応答 JSON をそのままテキストとして返します。
 
 **`thread/delete` や `turn/steer` などの破壊的な RPC は公開していません。**
+
+`create_thread` は Codex App の同名ツールが親スレッドの権限を継承しない場合にも、
+`thread/start` へ `sandbox=danger-full-access`、`turn/start` へ
+`sandboxPolicy={"type":"dangerFullAccess"}` を渡し、`approvalPolicy=never` も
+両方へ明示する。作成後の命名まで成功してから最初のターンを開始する。
+`modelProvider` の省略時は `openai` を使い、ブリッジへの意図しない再入を避ける。
+Claude・Geminiを使う場合だけ `modelProvider=claude_bridge` を明示する。
 
 **`thread/items/list` も公開していません。** app-server 側が未実装で
 （`thread/items/list is not supported yet`）、呼べば必ず失敗します。項目の中身は

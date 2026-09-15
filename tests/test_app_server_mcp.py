@@ -179,6 +179,7 @@ class McpProtocolTest(unittest.TestCase):
         self.assertEqual(
             [tool["name"] for tool in tools],
             [
+                "create_thread",
                 "thread_start",
                 "turn_start",
                 "turn_start_async",
@@ -203,6 +204,7 @@ class McpProtocolTest(unittest.TestCase):
         self.assertEqual(schemas["thread_read"]["required"], ["threadId"])
         self.assertEqual(schemas["thread_turns_list"]["required"], ["threadId"])
         self.assertEqual(schemas["thread_search"]["required"], ["searchTerm"])
+        self.assertEqual(schemas["create_thread"]["required"], ["cwd", "title", "prompt"])
         # thread/start は必須引数なしで呼べる。
         self.assertEqual(schemas["thread_start"]["required"], [])
         self.assertEqual(schemas["turn_start"]["required"], ["threadId", "text"])
@@ -232,6 +234,104 @@ class McpProtocolTest(unittest.TestCase):
 
 
 class McpToolCallTest(unittest.TestCase):
+    def test_create_thread_sets_full_access_before_starting_turn(self):
+        class CreateThreadClient:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params, wait=None):
+                self.calls.append((method, params, wait))
+                if method == "thread/start":
+                    return {"thread": {"id": "th_new"}}
+                if method == "turn/start":
+                    return {"turn": {"id": "tn_1", "status": "inProgress"}}
+                return {}
+
+        client = CreateThreadClient()
+
+        response = call_tool(
+            client,
+            "create_thread",
+            {
+                "cwd": "/tmp/project",
+                "title": "実装タスク",
+                "prompt": "実装して",
+                "model": "gpt-5.6-sol",
+            },
+        )
+
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "thread/start",
+                    {
+                        "cwd": "/tmp/project",
+                        "model": "gpt-5.6-sol",
+                        "modelProvider": "openai",
+                        "sandbox": "danger-full-access",
+                        "approvalPolicy": "never",
+                    },
+                    None,
+                ),
+                ("thread/name/set", {"threadId": "th_new", "name": "実装タスク"}, None),
+                (
+                    "turn/start",
+                    {
+                        "threadId": "th_new",
+                        "input": [{"type": "text", "text": "実装して"}],
+                        "sandboxPolicy": {"type": "dangerFullAccess"},
+                        "approvalPolicy": "never",
+                    },
+                    False,
+                ),
+            ],
+        )
+        self.assertEqual(
+            json.loads(response["result"]["content"][0]["text"]),
+            {"threadId": "th_new", "turn": {"id": "tn_1", "status": "inProgress"}},
+        )
+        self.assertFalse(response["result"]["isError"])
+
+    def test_create_thread_preserves_explicit_bridge_provider(self):
+        class CreateThreadClient:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params, wait=None):
+                self.calls.append((method, params, wait))
+                if method == "thread/start":
+                    return {"thread": {"id": "th_new"}}
+                return {"turn": {"id": "tn_1"}}
+
+        client = CreateThreadClient()
+
+        call_tool(
+            client,
+            "create_thread",
+            {
+                "cwd": "/tmp/project",
+                "title": "Claude実装",
+                "prompt": "実装して",
+                "model": "claude-opus-5",
+                "modelProvider": "claude_bridge",
+            },
+        )
+
+        self.assertEqual(client.calls[0][1]["modelProvider"], "claude_bridge")
+
+    def test_create_thread_stops_when_thread_id_is_missing(self):
+        client = FakeClient(result={"thread": {}})
+
+        response = call_tool(
+            client,
+            "create_thread",
+            {"cwd": "/tmp/project", "title": "実装タスク", "prompt": "実装して"},
+        )
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(len(client.calls), 1)
+
     def test_tool_call_forwards_method_and_arguments(self):
         client = FakeClient(result={"data": [{"id": "th_1"}]})
 

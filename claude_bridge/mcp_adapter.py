@@ -26,6 +26,10 @@ _LIMIT = {"type": "integer", "description": "取得件数の上限"}
 _CURSOR = {"type": "string", "description": "前回の応答が返したページングカーソル"}
 _SORT_DIRECTION = {"type": "string", "enum": ["asc", "desc"], "description": "並び順"}
 _THREAD_ID = {"type": "string", "description": "スレッド ID"}
+_FULL_ACCESS_SANDBOX = "danger-full-access"
+_FULL_ACCESS_SANDBOX_POLICY = {"type": "dangerFullAccess"}
+_NO_APPROVAL_POLICY = "never"
+_DEFAULT_MODEL_PROVIDER = "openai"
 
 # 公開する RPC。読み取り系に加えて、スレッド作成とターン実行を公開する。
 # app-server 経由で作ったスレッドは Codex アプリの一覧に載る（codex exec のセッションは載らない）。
@@ -33,6 +37,22 @@ _THREAD_ID = {"type": "string", "description": "スレッド ID"}
 # thread/items/list は app-server 側が未実装（is not supported yet）なので公開しない。
 # 項目の中身は thread_read の includeTurns で読む。
 TOOLS = (
+    {
+        "name": "create_thread",
+        "method": None,
+        "description": (
+            "Codex app-server にフルアクセス・承認不要の新しいスレッドを作成し、"
+            "名前を設定して最初のターンを非同期で開始する。"
+        ),
+        "required": ["cwd", "title", "prompt"],
+        "properties": {
+            "cwd": {"type": "string", "description": "スレッドの作業ディレクトリ"},
+            "title": {"type": "string", "description": "スレッド名"},
+            "prompt": {"type": "string", "description": "最初のユーザーメッセージ"},
+            "model": {"type": "string", "description": "使用するモデル名"},
+            "modelProvider": {"type": "string", "description": "使用するモデルプロバイダ名"},
+        },
+    },
     {
         "name": "thread_start",
         "method": "thread/start",
@@ -227,7 +247,9 @@ def _call_tool(request_id: object, params: object, client: BridgeRpcClient) -> d
         return _result(request_id, _content("arguments はオブジェクトで指定してください", True))
 
     try:
-        if tool.get("turn"):
+        if tool["name"] == "create_thread":
+            result = _create_thread(client, arguments)
+        elif tool.get("turn"):
             result = client.call(tool["method"], _turn_params(arguments), wait=tool["wait"])
         else:
             result = client.call(tool["method"], arguments)
@@ -235,6 +257,38 @@ def _call_tool(request_id: object, params: object, client: BridgeRpcClient) -> d
         # ツール実行の失敗は JSON-RPC エラーではなく isError で返すのが MCP の作法。
         return _result(request_id, _content(str(error), True))
     return _result(request_id, _content(json.dumps(result, ensure_ascii=False, indent=2)))
+
+
+def _create_thread(client: BridgeRpcClient, arguments: dict) -> dict:
+    """権限を明示してスレッド作成、命名、最初のターン開始を直列実行する。"""
+
+    start_params = {
+        "cwd": arguments.get("cwd"),
+        "sandbox": _FULL_ACCESS_SANDBOX,
+        "approvalPolicy": _NO_APPROVAL_POLICY,
+    }
+    if arguments.get("model") is not None:
+        start_params["model"] = arguments["model"]
+    start_params["modelProvider"] = arguments.get("modelProvider") or _DEFAULT_MODEL_PROVIDER
+
+    started = client.call("thread/start", start_params)
+    thread = started.get("thread") if isinstance(started, dict) else None
+    thread_id = thread.get("id") if isinstance(thread, dict) else None
+    if not thread_id:
+        raise AppServerError("thread/start の応答に thread.id がありません")
+
+    client.call("thread/name/set", {"threadId": thread_id, "name": arguments.get("title")})
+    turn = client.call(
+        "turn/start",
+        {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": arguments.get("prompt")}],
+            "sandboxPolicy": _FULL_ACCESS_SANDBOX_POLICY,
+            "approvalPolicy": _NO_APPROVAL_POLICY,
+        },
+        wait=False,
+    )
+    return {"threadId": thread_id, "turn": turn.get("turn") if isinstance(turn, dict) else turn}
 
 
 def _turn_params(arguments: dict) -> dict:
