@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 DEFAULT_CLAUDE_PATH = "claude"
-DEFAULT_MODEL = "claude-opus-5-5"
+DEFAULT_MODEL = "opus"
 # ツールを何度も使う長い作業では 10 分では足りない。Codex 側の待機上限（60 分）に合わせる。
 DEFAULT_TIMEOUT_SECONDS = 3600.0
 # CLI へ 1 回で渡す入力の上限。32MB は Claude API 側のリクエスト上限で、これを超える分を
@@ -37,13 +37,20 @@ DEFAULT_UPSTREAM_BASE_URL = "https://chatgpt.com/backend-api/codex"
 # ここに載せた名前はそのまま CLI の --model へ渡すため、Claude CLI が解釈できる名前
 # （`opus` などの別名、または `claude-opus-5-5` のような正式名）だけを並べる。
 # 上流に実在するモデル名を選ぶと、その名前が上流一覧から除かれてアプリで選べなくなる。
-DEFAULT_CLAUDE_MODELS = ("claude-opus-5-5", "claude-fable-5-1")
+DEFAULT_CLAUDE_MODELS = ("opus", "fable")
 
 # Antigravity CLI（`agy`）の実行ファイル。未インストールなら該当モデルの実行時だけ失敗する。
 DEFAULT_ANTIGRAVITY_PATH = "agy"
-# Antigravity CLI が受け付けるモデル名。思考の強さは名前の high / medium で決まるため、
-# ブリッジ側で effort を渡し分けることはしない。ここに載せた名前をそのまま --model へ渡す。
-DEFAULT_ANTIGRAVITY_MODELS = ("gemini-3.8-flash-high", "gemini-3.8-flash-medium")
+# 公開名は固定し、実行時に `agy models` から最新の Flash を選ぶ。
+DEFAULT_ANTIGRAVITY_MODELS = ("gemini-flash-high", "gemini-flash-medium")
+
+# 旧版の設定を使うクライアントが上流へ誤転送されないよう、以前の公開名も受け付ける。
+LEGACY_MODEL_ALIASES = {
+    "claude-opus-5-5": "opus",
+    "claude-fable-5-1": "fable",
+    "gemini-3.8-flash-high": "gemini-flash-high",
+    "gemini-3.8-flash-medium": "gemini-flash-medium",
+}
 
 # モデル名から決まる実行先。空文字は「ローカルの CLI では処理せず上流へ中継する」を表す。
 CLAUDE_BACKEND = "claude"
@@ -157,7 +164,12 @@ class BridgeConfig:
 
         if model in self.antigravity_models:
             return ANTIGRAVITY_BACKEND
-        if model in self.claude_models or not self.upstream_base_url:
+        if model in self.claude_models:
+            return CLAUDE_BACKEND
+        alias = LEGACY_MODEL_ALIASES.get(model)
+        if alias in self.antigravity_models:
+            return ANTIGRAVITY_BACKEND
+        if alias in self.claude_models or not self.upstream_base_url:
             return CLAUDE_BACKEND
         return UPSTREAM_BACKEND
 
@@ -168,7 +180,10 @@ class BridgeConfig:
         Claude CLI へ回るため、そこは起動時の `--model` で実行する。
         """
 
-        return model if model in self.cli_models else self.model
+        if model in self.cli_models:
+            return model
+        alias = LEGACY_MODEL_ALIASES.get(model)
+        return alias if alias in self.cli_models else self.model
 
 
 def _env_str(env: dict, name: str, default: str) -> str:

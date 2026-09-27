@@ -19,9 +19,9 @@
     <string>--upstream-base-url</string>
     <string>https://chatgpt.com/backend-api/codex</string>
     <string>--claude-models</string>
-    <string>claude-opus-5-5,claude-fable-5-1</string>
+    <string>opus</string>
     <string>--antigravity-models</string>
-    <string>gemini-3.8-flash-high</string>
+    <string>gemini-flash-high</string>
     <!-- create_thread は Codex が遅延読み込みにしているため additional_tools に載らない。
          名前を明示すると未取得と判定され、下の検索語で先回りして引き出せる。
          * だけだと未取得の一覧が常に空になり、検索語を書いても発火しない。 -->

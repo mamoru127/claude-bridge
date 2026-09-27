@@ -9,12 +9,15 @@ import json
 import subprocess
 import time
 import unittest
+from unittest import mock
 
 from claude_bridge.antigravity_cli import (
     BILLING_ENV_KEYS,
     MAX_PROMPT_ARGUMENT_BYTES,
+    _latest_flash_model,
     agy_env,
     build_command,
+    resolve_model,
     stream_antigravity,
 )
 from claude_bridge.claude_cli import transcript_id
@@ -922,12 +925,65 @@ class AntigravityModelsTest(BridgeHTTPTestCase):
         self.assertEqual(config.backend("claude-opus-5-5"), CLAUDE_BACKEND)
 
 
+class AntigravityModelAliasTest(BridgeHTTPTestCase):
+    def setUp(self):
+        _latest_flash_model.cache_clear()
+
+    @mock.patch("claude_bridge.antigravity_cli.subprocess.run")
+    def test_alias_selects_newest_matching_model(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            ["agy", "models"], 0,
+            "gemini-3.9-flash-medium\tMedium\n"
+            "gemini-3.8-flash-high\tHigh\n"
+            "gemini-3.10-flash-high\tNew high\n"
+            "gemini-3.9-pro-high\tPro\n",
+            "",
+        )
+
+        self.assertEqual(resolve_model("agy", "gemini-flash-high"), "gemini-3.10-flash-high")
+        self.assertEqual(resolve_model("agy", "gemini-flash-medium"), "gemini-3.9-flash-medium")
+        self.assertEqual(resolve_model("agy", "gemini-flash-high"), "gemini-3.10-flash-high")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args.args[0], ["agy", "models"])
+        self.assertNotIn("GEMINI_API_KEY", run.call_args.kwargs["env"])
+
+    @mock.patch("claude_bridge.antigravity_cli.subprocess.run")
+    def test_explicit_model_does_not_fetch_catalog(self, run):
+        self.assertEqual(resolve_model("agy", HIGH), HIGH)
+        run.assert_not_called()
+
+    @mock.patch("claude_bridge.antigravity_cli.subprocess.run")
+    def test_missing_matching_model_is_an_error(self, run):
+        run.return_value = subprocess.CompletedProcess(["agy", "models"], 0, "other\tOther\n", "")
+        with self.assertRaises(BridgeError) as raised:
+            resolve_model("agy", "gemini-flash-high")
+        self.assertEqual(raised.exception.code, "antigravity_cli_model_not_found")
+
+    @mock.patch("claude_bridge.antigravity_cli.subprocess.run")
+    def test_public_alias_runs_the_resolved_model(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            ["agy", "models"], 0, "gemini-4.0-flash-high\tHigh\n", ""
+        )
+        runner = SequenceRunner([agy_output()])
+        base_url = self.start_server(
+            make_config(antigravity_models=("gemini-flash-high",)), runner
+        )
+
+        status, payload = self.post(base_url, {"model": "gemini-flash-high", "input": "やあ"})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["model"], "gemini-flash-high")
+        command = runner.command()
+        self.assertEqual(command[command.index("--model") + 1], "gemini-4.0-flash-high")
+
+
 class AntigravityConfigTest(unittest.TestCase):
     def test_defaults(self):
         config = build_config([], env={})
 
         self.assertEqual(config.antigravity_path, "agy")
         self.assertEqual(config.antigravity_models, DEFAULT_ANTIGRAVITY_MODELS)
+        self.assertEqual(config.antigravity_models, ("gemini-flash-high", "gemini-flash-medium"))
 
     def test_env_overrides(self):
         config = build_config(

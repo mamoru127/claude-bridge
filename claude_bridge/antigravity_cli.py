@@ -22,8 +22,11 @@ API キー課金の経路になる環境変数を agy へ渡さない（BILLING_
 import json
 import math
 import os
+import re
 import subprocess
+import time
 from collections.abc import Iterator, Mapping
+from functools import lru_cache
 
 from .cli_process import STDERR_SNIPPET_BYTES, CliKind, launch, read_lines, snippet
 from .config import BridgeConfig
@@ -55,6 +58,35 @@ def agy_env(env: Mapping[str, str] | None = None) -> dict:
     return {name: value for name, value in env.items() if name not in BILLING_ENV_KEYS}
 
 
+def resolve_model(path: str, model: str) -> str:
+    """固定の公開名を、agy が現在提供する最新の Flash モデルへ解決する。"""
+
+    if model not in ("gemini-flash-high", "gemini-flash-medium"):
+        return model
+    return _latest_flash_model(path, model.rsplit("-", 1)[1], int(time.monotonic() // 600))
+
+
+@lru_cache(maxsize=16)
+def _latest_flash_model(path: str, effort: str, refresh_bucket: int) -> str:
+    try:
+        result = subprocess.run(
+            [path, "models"], capture_output=True, text=True, timeout=20, env=agy_env()
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ANTIGRAVITY.error(f"のモデル一覧を取得できません: {error}", "models_failed") from error
+    if result.returncode:
+        raise ANTIGRAVITY.error("のモデル一覧を取得できません", "models_failed")
+    candidates = []
+    for line in result.stdout.splitlines():
+        name = line.split("\t", 1)[0]
+        match = re.fullmatch(rf"gemini-(\d+(?:\.\d+)*)-flash-{effort}", name)
+        if match:
+            candidates.append((tuple(int(part) for part in match.group(1).split(".")), name))
+    if not candidates:
+        raise ANTIGRAVITY.error(f"に Flash ({effort}) のモデルがありません", "model_not_found")
+    return max(candidates)[1]
+
+
 def validate_prompt_argument(prompt: str) -> None:
     if len(prompt.encode("utf-8")) > MAX_PROMPT_ARGUMENT_BYTES:
         raise ANTIGRAVITY.error(
@@ -79,7 +111,7 @@ def build_command(config: BridgeConfig, prompt: str, session) -> list[str]:
         "-p",
         prompt,
         "--model",
-        config.model,
+        resolve_model(config.antigravity_path, config.model),
         "--output-format",
         "stream-json",
         # bridge 経由では対話承認に答えられないため、Claude と同様にツール実行を止めない。

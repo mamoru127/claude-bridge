@@ -244,7 +244,11 @@ def parse_sse(raw: bytes) -> list[tuple[str, object]]:
 
 
 def make_config(**overrides) -> BridgeConfig:
-    defaults = {"host": "127.0.0.1", "port": 0, "model": "opus", "working_dir": "."}
+    defaults = {
+        "host": "127.0.0.1", "port": 0, "model": "opus", "working_dir": ".",
+        "claude_models": ("claude-opus-5-5", "claude-fable-5-1"),
+        "antigravity_models": ("gemini-3.8-flash-high", "gemini-3.8-flash-medium"),
+    }
     return BridgeConfig(**{**defaults, **overrides})
 
 
@@ -1896,14 +1900,21 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.host, "127.0.0.1")
         self.assertEqual(config.port, 8787)
 
-    def test_default_claude_model_does_not_collide_with_upstream_names(self):
+    def test_default_claude_model_uses_cli_aliases(self):
         # 上流に実在する名前を使うと、その名前が上流一覧から除かれてアプリで選べなくなる。
         config = build_config([], env={})
-        self.assertEqual(config.model, "claude-opus-5-5")
+        self.assertEqual(config.model, "opus")
         self.assertEqual(
             config.claude_models,
-            ("claude-opus-5-5", "claude-fable-5-1"),
+            ("opus", "fable"),
         )
+
+    def test_previous_model_names_stay_local_after_upgrade(self):
+        config = build_config(["--upstream-base-url", "https://upstream.example"], env={})
+        self.assertEqual(config.backend("claude-opus-5-5"), CLAUDE_BACKEND)
+        self.assertEqual(config.cli_model("claude-opus-5-5"), "opus")
+        self.assertEqual(config.backend("gemini-3.8-flash-high"), ANTIGRAVITY_BACKEND)
+        self.assertEqual(config.cli_model("gemini-3.8-flash-high"), "gemini-flash-high")
 
     def test_empty_claude_models_is_rejected(self):
         # model 省略時の既定に先頭を使うため、1 件以上あることを起動時に保証する。

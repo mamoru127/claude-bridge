@@ -44,14 +44,14 @@ wire_api = "responses"
 
 [profiles.claude]
 model_provider = "claude_bridge"
-model = "claude-opus-5-5"
+model = "opus"
 ```
 
 CLI では `codex --profile claude` で使えます。Codex デスクトップアプリで既定の接続先にする場合は、同じファイルの先頭（`[` で始まる設定より前）に次を追加し、アプリを再起動します。
 
 ```toml
 model_provider = "claude_bridge"
-model = "claude-opus-5-5"
+model = "opus"
 ```
 
 Codex のモデル一覧に Claude と GPT を一緒に表示する場合は、ブリッジの起動時に `--upstream-base-url https://chatgpt.com/backend-api/codex` を指定します。Claude / Gemini 以外のモデルは上流へ中継され、Codex から受け取った認証ヘッダーもそのまま転送されます。ブリッジに上流用の API キーを設定する必要はありません。
@@ -60,8 +60,8 @@ Codex のモデル一覧に Claude と GPT を一緒に表示する場合は、�
 
 | モデル名 | 実行先 |
 | --- | --- |
-| `claude-opus-5-5`, `claude-fable-5-1` | Claude CLI |
-| `gemini-3.8-flash-high`, `gemini-3.8-flash-medium` | Antigravity CLI |
+| `opus`, `fable` | Claude CLI の同名別名（最新版） |
+| `gemini-flash-high`, `gemini-flash-medium` | `agy models` にある最新の Gemini Flash |
 | その他 | `--upstream-base-url` 指定時は上流。未指定時は Claude CLI |
 
 | 引数 | 用途 |
@@ -74,6 +74,8 @@ Codex のモデル一覧に Claude と GPT を一緒に表示する場合は、�
 | `--upstream-base-url URL` | それ以外のモデルの中継先 |
 | `--enable-codex-mcp` | Claude から共有 Codex app-server のツールを使う（macOS のみ） |
 | `--mcp-config-file PATH` | Claude に追加する MCP サーバーの設定 |
+
+Gemini の公開名は固定です。実行時に `agy models` を参照して対応する最新バージョンへ変換し、結果は最大 10 分保持します。特定バージョンに固定したい場合は `--antigravity-models` に実際のモデル名を指定できます。
 
 その他の引数は `python3 -m claude_bridge --help`（Windows は `py -3 -m claude_bridge --help`）で確認できます。
 
