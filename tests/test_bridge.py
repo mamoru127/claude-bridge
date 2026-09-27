@@ -13,20 +13,30 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
-from claude_bridge.claude_cli import build_command, run_claude, stream_claude
-from claude_bridge.config import BridgeConfig, build_config
+from claude_bridge.claude_cli import build_command, stream_claude, transcript_id
+from claude_bridge import cli_process
+from claude_bridge.cli_process import final_text
+from claude_bridge.config import (
+    ANTIGRAVITY_BACKEND,
+    CLAUDE_BACKEND,
+    BridgeConfig,
+    build_config,
+)
 from claude_bridge.errors import BridgeError
 from claude_bridge import server as server_module
 from claude_bridge.responses import (
     KEEPALIVE_EVENT,
     Message,
+    ResponseStream,
     build_content,
     build_models,
     parse_request,
 )
 from claude_bridge.server import BridgeServer, Keepalive
 from claude_bridge.sessions import Session, SessionRegistry
+from claude_bridge.upstream import models_request_path, responses_body
 
 
 # Claude CLI を直接呼ぶテストで使う、テキストだけの content。
@@ -169,6 +179,16 @@ class FakeRunner:
         )
 
 
+class WindowsCliLaunchTest(unittest.TestCase):
+    def test_npm_command_is_resolved_before_launch(self):
+        runner = FakeRunner()
+        with mock.patch.object(cli_process.os, "name", "nt"), mock.patch.object(
+            cli_process.shutil, "which", return_value=r"C:\Tools\claude.cmd"
+        ):
+            cli_process.launch(cli_process.CliKind("Claude CLI", "claude_cli"), ["claude", "--print"],
+                               r"C:\work", runner)
+        self.assertEqual(runner.calls[0]["command"], [r"C:\Tools\claude.cmd", "--print"])
+
 class HangingRunner(FakeRunner):
     """kill されるまで終わらないプロセスを返すランナー。"""
 
@@ -188,6 +208,12 @@ class BlockingRunner(FakeRunner):
         self.entered.set()
         self.release.wait(10)
         return super().__call__(command, **kwargs)
+
+
+def run_claude_stream(*args, **kwargs) -> str:
+    """stream_claude を最後まで読み、確定した最終テキストだけを返す。"""
+
+    return final_text(stream_claude(*args, **kwargs))
 
 
 class LogWaiter(logging.Handler):
@@ -249,6 +275,19 @@ class BridgeHTTPTestCase(unittest.TestCase):
                 return response.status, json.loads(response.read())
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
+
+    def post_and_disconnect(self, base_url: str, payload) -> None:
+        """応答を待たずに接続を切る。相手の消えた実行を作るために使う。"""
+
+        url = urllib.parse.urlsplit(base_url)
+        body = json.dumps(payload).encode("utf-8")
+        sock = socket.create_connection((url.hostname, url.port))
+        sock.sendall(
+            f"POST /v1/responses HTTP/1.1\r\nHost: {url.netloc}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+        )
+        sock.close()
 
     def post_stream(self, base_url: str, payload, headers=None):
         """stream=true を送り、Content-Type と SSE イベント列を返す。"""
@@ -337,19 +376,19 @@ class ResponsesEndpointTest(BridgeHTTPTestCase):
         status, payload = self.post(base_url, {"input": "やあ"})
 
         self.assertEqual(status, 200)
-        self.assertEqual(payload["model"], "claude-opus-5")
+        self.assertEqual(payload["model"], "claude-opus-5-5")
 
     def test_listed_model_selects_the_cli_model(self):
         # 一覧に載せた名前はアプリの選択がそのまま実行モデルになる。
         runner = FakeRunner()
         base_url = self.start_server(make_config(model="opus"), runner)
 
-        status, payload = self.post(base_url, {"model": "claude-fable-5", "input": "やあ"})
+        status, payload = self.post(base_url, {"model": "claude-fable-5-1", "input": "やあ"})
 
         self.assertEqual(status, 200)
-        self.assertEqual(payload["model"], "claude-fable-5")
+        self.assertEqual(payload["model"], "claude-fable-5-1")
         command = runner.calls[0]["command"]
-        self.assertEqual(command[command.index("--model") + 1], "claude-fable-5")
+        self.assertEqual(command[command.index("--model") + 1], "claude-fable-5-1")
 
     def test_unlisted_model_does_not_reach_the_cli(self):
         # 中継が無効だと一覧外の名前も届く。任意の文字列を CLI へ流さず起動時の固定値で実行する。
@@ -389,7 +428,7 @@ class ResponsesEndpointTest(BridgeHTTPTestCase):
 
         call = runner.calls[0]
         self.assertEqual(
-            call["command"][:12],
+            call["command"][:14],
             [
                 "claude",
                 "--print",
@@ -401,15 +440,21 @@ class ResponsesEndpointTest(BridgeHTTPTestCase):
                 "--thinking-display",
                 "summarized",
                 "--strict-mcp-config",
+                "--permission-mode",
+                "bypassPermissions",
                 "--model",
                 # model 省略時は一覧の先頭が選ばれ、その名前で実行する。
-                "claude-opus-5",
+                "claude-opus-5-5",
             ],
         )
         system_prompt = call["command"].index("--append-system-prompt")
         self.assertEqual(call["command"][system_prompt + 1], "あなたは校正者です\n\n日本語で答える")
         self.assertNotIn("--dangerously-skip-permissions", call["command"])
         self.assertNotIn("--allow-dangerously-skip-permissions", call["command"])
+        self.assertEqual(
+            call["command"][call["command"].index("--permission-mode") + 1],
+            "bypassPermissions",
+        )
         # シェル経由での実行をしていないこと（shell=True を渡していない）。
         self.assertNotIn("shell", call)
         self.assertIsInstance(call["command"], list)
@@ -956,22 +1001,36 @@ class StreamingEndpointTest(BridgeHTTPTestCase):
 
 class ModelsEndpointTest(BridgeHTTPTestCase):
     def test_lists_claude_models(self):
-        base_url = self.start_server(make_config(claude_models=("claude-opus-5",)), FakeRunner())
+        base_url = self.start_server(make_config(claude_models=("claude-opus-5-5",)), FakeRunner())
 
         status, payload = self.get_json(base_url, "/v1/models")
 
         self.assertEqual(status, 200)
         self.assertEqual(payload["object"], "list")
-        entry = next(item for item in payload["data"] if item["id"] == "claude-opus-5")
+        entry = next(item for item in payload["data"] if item["id"] == "claude-opus-5-5")
         self.assertEqual(entry["object"], "model")
         self.assertEqual(entry["owned_by"], "anthropic")
         self.assertIsInstance(entry["created"], int)
 
+    def test_model_list_request_adds_client_version(self):
+        self.assertEqual(
+            models_request_path("/v1/models"),
+            "/v1/models?client_version=0.147.0",
+        )
+
+    def test_model_list_request_keeps_client_version(self):
+        self.assertEqual(
+            models_request_path("/v1/models?client_version=0.144.5"),
+            "/v1/models?client_version=0.144.5",
+        )
+
     def test_claude_models_are_listed_in_order_without_duplicates(self):
-        payload = build_models(make_config(claude_models=("claude-opus-5", "sonnet")))
+        payload = build_models(
+            make_config(claude_models=("claude-opus-5-5", "sonnet"), antigravity_models=())
+        )
         ids = [item["id"] for item in payload["data"]]
 
-        self.assertEqual(ids, ["claude-opus-5", "sonnet"])
+        self.assertEqual(ids, ["claude-opus-5-5", "sonnet"])
 
     def test_codex_metadata_is_returned_alongside_data(self):
         # Codex は data ではなく models を読むため、同じ別名を両方へ載せる。
@@ -995,7 +1054,7 @@ class ModelsEndpointTest(BridgeHTTPTestCase):
         }
         payload = build_models(make_config(), upstream)
 
-        entry = next(item for item in payload["models"] if item["slug"] == "claude-opus-5")
+        entry = next(item for item in payload["models"] if item["slug"] == "claude-opus-5-5")
         self.assertIsNone(entry["tool_mode"])
 
     def test_custom_model_is_added_to_the_list(self):
@@ -1003,43 +1062,48 @@ class ModelsEndpointTest(BridgeHTTPTestCase):
 
         self.assertIn("claude-opus-4-5", [item["id"] for item in payload["data"]])
 
-    def test_codex_app_compat_alias_is_listed_by_default(self):
-        # Codex app は選択中の claude-opus-5 をそのまま送るため、既定の一覧に載せて受け付ける。
+    def test_default_models_replace_opus_5(self):
         payload = build_models(make_config())
 
-        self.assertIn("claude-opus-5", [item["id"] for item in payload["data"]])
-        self.assertIn("claude-opus-5", [item["slug"] for item in payload["models"]])
+        self.assertIn("claude-opus-5-5", [item["id"] for item in payload["data"]])
+        self.assertIn("claude-opus-5-5", [item["slug"] for item in payload["models"]])
+        self.assertNotIn("claude-opus-5", [item["id"] for item in payload["data"]])
+        self.assertNotIn("claude-opus-5", [item["slug"] for item in payload["models"]])
 
     def test_fable_is_listed_by_default(self):
         # アプリのモデル選択から Fable を選べるようにする。名前は CLI の --model にも渡る。
         payload = build_models(make_config())
 
-        self.assertIn("claude-fable-5", [item["id"] for item in payload["data"]])
-        self.assertIn("claude-fable-5", [item["slug"] for item in payload["models"]])
+        self.assertIn("claude-fable-5-1", [item["id"] for item in payload["data"]])
+        self.assertIn("claude-fable-5-1", [item["slug"] for item in payload["models"]])
 
     def test_duplicate_claude_models_are_listed_once(self):
-        config = make_config(claude_models=("claude-opus-5", "claude-opus-5"))
+        config = make_config(
+            claude_models=("claude-opus-5-5", "claude-opus-5-5"), antigravity_models=()
+        )
         ids = [item["id"] for item in build_models(config)["data"]]
 
-        self.assertEqual(ids, ["claude-opus-5"])
+        self.assertEqual(ids, ["claude-opus-5-5"])
 
     def test_cli_model_is_not_listed_when_not_a_claude_model(self):
         # --model は CLI に渡す実行モデルであって、API で受け付ける名前ではない。
-        payload = build_models(make_config(model="opus", claude_models=("claude-opus-5",)))
+        payload = build_models(make_config(model="opus", claude_models=("claude-opus-5-5",)))
 
         self.assertNotIn("opus", [item["id"] for item in payload["data"]])
         self.assertNotIn("opus", [item["slug"] for item in payload["models"]])
 
-    def test_every_listed_model_routes_to_claude(self):
+    def test_every_listed_model_runs_on_a_local_cli(self):
         # 一覧に載る名前をアプリが選んだとき、上流へ中継されて失敗しないこと。
         config = make_config(
             model="opus",
-            claude_models=("claude-opus-5", "sonnet"),
+            claude_models=("claude-opus-5-5", "sonnet"),
             upstream_base_url="https://upstream.example",
         )
 
         for item in build_models(config)["data"]:
-            self.assertTrue(config.routes_to_claude(item["id"]))
+            self.assertIn(
+                config.backend(item["id"]), (CLAUDE_BACKEND, ANTIGRAVITY_BACKEND)
+            )
 
     def test_requires_authorization(self):
         base_url = self.start_server(make_config(api_key="secret-token"), FakeRunner())
@@ -1061,7 +1125,7 @@ class ModelsEndpointTest(BridgeHTTPTestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(payload["object"], "list")
-        self.assertEqual(payload["data"][0]["id"], "claude-opus-5")
+        self.assertEqual(payload["data"][0]["id"], "claude-opus-5-5")
 
     def test_query_string_does_not_bypass_authorization(self):
         base_url = self.start_server(make_config(api_key="secret-token"), FakeRunner())
@@ -1196,6 +1260,194 @@ class RequestValidationTest(BridgeHTTPTestCase):
         self.assertEqual(status, 413)
         self.assertEqual(body["error"]["code"], "request_too_large")
 
+    def test_accumulated_history_images_do_not_block_the_next_turn(self):
+        # Codex は毎ターン履歴を丸ごと送り直す。上限を履歴ぶんに掛けると、画像を渡すたびに
+        # 会話が上限へ近づき、いずれそのスレッドの全ターンが 413 になる。CLI へ渡すのは
+        # 未送信の発言だけなので、渡す分で判定すれば画像が積み上がっても実行できる。
+        runner = FakeRunner()
+        # 画像 1 枚は通り、2 枚ぶんは通らない上限。
+        server_url = self.start_server(make_config(max_request_bytes=12000), runner)
+
+        def image(fill: str) -> dict:
+            return {
+                "type": "input_image",
+                "image_url": "data:image/png;base64," + fill * 8192,
+            }
+
+        self.post(server_url, {"input": "1問目", "prompt_cache_key": "thread-1"})
+        first_history = [
+            {"role": "user", "content": [{"type": "input_text", "text": "1問目"}]},
+            {"role": "assistant", "content": "回答"},
+        ]
+        status, _ = self.post(
+            server_url,
+            {
+                "input": [
+                    *first_history,
+                    {
+                        "role": "user",
+                        "content": [image("A"), {"type": "input_text", "text": "1枚目"}],
+                    },
+                ],
+                "prompt_cache_key": "thread-1",
+            },
+        )
+        self.assertEqual(status, 200)
+
+        status, _ = self.post(
+            server_url,
+            {
+                "input": [
+                    *first_history,
+                    {
+                        "role": "user",
+                        "content": [image("A"), {"type": "input_text", "text": "1枚目"}],
+                    },
+                    {"role": "assistant", "content": "見ました"},
+                    {
+                        "role": "user",
+                        "content": [image("B"), {"type": "input_text", "text": "2枚目"}],
+                    },
+                ],
+                "prompt_cache_key": "thread-1",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        # 渡したのは新しい 1 枚だけ。1 枚目は転記済みなので数えない。
+        self.assertEqual(runner.prompt(2), "2枚目")
+        self.assertEqual(
+            [block["type"] for block in runner.content(2)], ["image", "text"]
+        )
+
+    def test_tool_result_images_are_not_counted_toward_the_limit(self):
+        # ツール結果の画像は Claude へ渡さずテキストへ置き換えるため、上限にも数えない。
+        runner = FakeRunner()
+        server_url = self.start_server(make_config(max_request_bytes=1024), runner)
+
+        status, _ = self.post(
+            server_url,
+            {
+                "input": [
+                    {"role": "user", "content": "この画像を見て"},
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": [
+                            {
+                                "type": "input_image",
+                                "image_url": "data:image/png;base64," + "A" * 4096,
+                            },
+                            {"type": "input_text", "text": "生成しました"},
+                        ],
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn("生成しました", runner.prompt(0))
+        self.assertNotIn("A" * 4096, runner.prompt(0))
+
+    def test_the_limit_is_measured_on_the_assembled_cli_input(self):
+        # 判定するのは CLI へ渡す stream-json の 1 行そのもの。本文だけを別に見積もると、
+        # JSON の枠のぶん実際より小さく数えてしまい、上限際のリクエストが素通りする。
+        runner = FakeRunner()
+        server_url = self.start_server(make_config(max_request_bytes=100), runner)
+
+        status, body = self.post(server_url, {"input": "あ" * 30})
+
+        self.assertEqual(status, 413)
+        self.assertEqual(body["error"]["code"], "request_too_large")
+        self.assertEqual(runner.calls, [])
+
+    def test_system_prompt_is_counted_toward_the_limit(self):
+        # system プロンプトは --append-system-prompt として毎ターン CLI へ渡し直すため、
+        # 発言と同じく Claude API のリクエスト上限に効く。数えないと上限を素通りして、
+        # 413 ではなく CLI の起動失敗になる。
+        runner = FakeRunner()
+        server_url = self.start_server(make_config(max_request_bytes=1024), runner)
+
+        status, body = self.post(
+            server_url,
+            {"instructions": "い" * 2048, "input": "やあ"},
+        )
+
+        self.assertEqual(status, 413)
+        self.assertEqual(body["error"]["code"], "request_too_large")
+        self.assertEqual(runner.calls, [])
+
+    def test_oversized_input_does_not_cancel_the_running_turn(self):
+        # 同じ会話の次のリクエストは、会話を借りる時点で相手の消えた実行を落とす。実行できない
+        # 入力でそこまで進むと、中断済みのターンを弾くためだけに落としてしまう。
+        # 続き具合によらず超えると分かる入力は、会話へ触る前に弾く。
+        runner = HangingRunner()
+        server_url = self.start_server(make_config(max_request_bytes=1024), runner)
+
+        # 引き継ぎの対象になる実行、つまり相手の消えた実行を先に作る。
+        self.post_and_disconnect(
+            server_url, {"input": "1問目", "prompt_cache_key": "thread-1"}
+        )
+        for _ in range(500):
+            if runner.processes:
+                break
+            time.sleep(0.01)
+        process = runner.processes[0]
+
+        status, body = self.post(
+            server_url, {"input": "あ" * 2048, "prompt_cache_key": "thread-1"}
+        )
+
+        self.assertEqual(status, 413)
+        self.assertEqual(body["error"]["code"], "request_too_large")
+        self.assertEqual(process.killed, 0)
+        self.assertEqual(len(runner.processes), 1)
+        # 先行ターンを終わらせてからテストを閉じる。
+        process.kill()
+
+    def test_parallel_turn_on_the_same_thread_runs_alongside_the_running_one(self):
+        # 同じスレッドから並行して届くリクエスト（/side など）で、動いているターンを落とさない。
+        # 落とすと先に走っていた側が exit=-9 の 502 を受け取る。
+        runner = HangingRunner()
+        server_url = self.start_server(make_config(), runner)
+
+        for index, text in enumerate(("1問目", "2問目"), start=1):
+            thread = threading.Thread(
+                target=self.post,
+                args=(server_url, {"input": text, "prompt_cache_key": "thread-1"}),
+                daemon=True,
+            )
+            thread.start()
+            self.addCleanup(thread.join, 5)
+            for _ in range(500):
+                if len(runner.processes) == index:
+                    break
+                time.sleep(0.01)
+
+        # 2 本目は待たずに走り出し、1 本目は生きたまま。
+        self.assertEqual(len(runner.processes), 2)
+        self.assertEqual(runner.processes[0].killed, 0)
+
+        # 両方を閉じてからテストを抜ける。
+        for process in runner.processes:
+            process.kill()
+
+    def test_oversized_local_model_body_is_rejected_when_upstream_is_enabled(self):
+        server_url = self.start_server(
+            make_config(
+                max_request_bytes=64,
+                max_upstream_request_bytes=1024,
+                upstream_base_url="http://127.0.0.1:1",
+            ),
+            FakeRunner(),
+        )
+        status, body = self.post(
+            server_url,
+            {"model": "claude-opus-5-5", "input": "x" * 200},
+        )
+        self.assertEqual(status, 413)
+        self.assertEqual(body["error"]["code"], "request_too_large")
+
 
 class AuthorizationTest(BridgeHTTPTestCase):
     def setUp(self):
@@ -1312,9 +1564,10 @@ class ClaudeCliFailureTest(BridgeHTTPTestCase):
 
 class ClaudeCliUnitTest(unittest.TestCase):
     def test_build_command_omits_system_prompt_when_empty(self):
-        session = Session()
         self.assertEqual(
-            build_command(make_config(claude_path="/opt/homebrew/bin/claude"), None, session),
+            build_command(
+                make_config(claude_path="/opt/homebrew/bin/claude"), None, Session(), "sid-1"
+            ),
             [
                 "/opt/homebrew/bin/claude",
                 "--print",
@@ -1328,24 +1581,28 @@ class ClaudeCliUnitTest(unittest.TestCase):
                 "--thinking-display",
                 "summarized",
                 "--strict-mcp-config",
+                "--permission-mode",
+                "bypassPermissions",
                 "--model",
                 "opus",
                 # 新規の会話は ID を固定して開始し、次のリクエストから続きを書き足せるようにする。
                 "--session-id",
-                session.session_id,
+                "sid-1",
             ],
         )
 
     def test_build_command_uses_configured_claude_path_verbatim(self):
         # パス文字列は引数配列にそのまま入り、シェル解釈されない。
         config = make_config(claude_path="/opt/my tools/claude; rm -rf /")
-        self.assertEqual(build_command(config, None, Session())[0], "/opt/my tools/claude; rm -rf /")
+        self.assertEqual(
+            build_command(config, None, Session(), "sid-1")[0], "/opt/my tools/claude; rm -rf /"
+        )
 
     def test_run_claude_uses_configured_working_dir(self):
         runner = FakeRunner()
         config = make_config(working_dir="/tmp")
 
-        run_claude(config, TEXT_CONTENT, None, Session(), runner)
+        run_claude_stream(config, TEXT_CONTENT, None, Session(), runner)
 
         call = runner.calls[0]
         self.assertEqual(call["cwd"], "/tmp")
@@ -1357,7 +1614,7 @@ class ClaudeCliUnitTest(unittest.TestCase):
     def test_stderr_snippet_is_truncated(self):
         runner = FakeRunner(stdout=b"", returncode=1, stderr=b"x" * 50000)
         with self.assertRaises(BridgeError) as raised:
-            run_claude(make_config(), TEXT_CONTENT, None, Session(), runner)
+            run_claude_stream(make_config(), TEXT_CONTENT, None, Session(), runner)
         self.assertLess(len(raised.exception.message), 3000)
 
     def test_stream_claude_reports_thinking_and_tool_use_then_text(self):
@@ -1477,17 +1734,17 @@ class ClaudeCliUnitTest(unittest.TestCase):
     def test_result_requires_string_result(self):
         runner = FakeRunner(cli_lines({"type": "result", "is_error": False, "result": None}))
         with self.assertRaises(BridgeError) as raised:
-            run_claude(make_config(), TEXT_CONTENT, None, Session(), runner)
+            run_claude_stream(make_config(), TEXT_CONTENT, None, Session(), runner)
         self.assertEqual(raised.exception.status, 502)
 
     def test_run_claude_returns_text(self):
         runner = FakeRunner()
-        self.assertEqual(run_claude(make_config(), TEXT_CONTENT, None, Session(), runner), "こんにちは")
+        self.assertEqual(run_claude_stream(make_config(), TEXT_CONTENT, None, Session(), runner), "こんにちは")
 
     def test_invalid_json_line_terminates_the_cli_process(self):
         runner = FakeRunner(b"{\n")
         with self.assertRaises(BridgeError):
-            run_claude(make_config(), TEXT_CONTENT, None, Session(), runner)
+            run_claude_stream(make_config(), TEXT_CONTENT, None, Session(), runner)
         self.assert_terminated(runner.processes[0])
 
     def test_closing_the_stream_terminates_the_cli_process(self):
@@ -1504,7 +1761,7 @@ class ClaudeCliUnitTest(unittest.TestCase):
     def test_normal_completion_does_not_kill_the_cli_process(self):
         runner = FakeRunner()
 
-        run_claude(make_config(), TEXT_CONTENT, None, Session(), runner)
+        run_claude_stream(make_config(), TEXT_CONTENT, None, Session(), runner)
 
         process = runner.processes[0]
         self.assertEqual(process.killed, 0)
@@ -1519,13 +1776,58 @@ class ClaudeCliUnitTest(unittest.TestCase):
     def test_launch_os_error_becomes_bridge_error(self):
         runner = FakeRunner(raises=PermissionError(errno.EACCES, "Permission denied"))
         with self.assertRaises(BridgeError) as raised:
-            run_claude(make_config(claude_path="/opt/claude"), TEXT_CONTENT, None, Session(), runner)
+            run_claude_stream(make_config(claude_path="/opt/claude"), TEXT_CONTENT, None, Session(), runner)
         self.assertEqual(raised.exception.status, 500)
         self.assertEqual(raised.exception.code, "claude_cli_launch_failed")
         self.assertIn("/opt/claude", raised.exception.message)
 
 
 class ParseRequestUnitTest(unittest.TestCase):
+    def test_agent_task_and_followup_reach_cli_session(self):
+        task = {
+            "type": "agent_message",
+            "author": "/root",
+            "recipient": "/root/editor",
+            "content": [{"type": "input_text", "text": "この文章を添削してください。"}],
+        }
+        for backend in (CLAUDE_BACKEND, ANTIGRAVITY_BACKEND):
+            with self.subTest(backend=backend):
+                session = Session()
+                initial = parse_request({"input": [task]}, "test-model")
+                sent = session.prepare(initial.messages, backend)
+                self.assertIn("この文章を添削", build_content(sent)[0]["text"])
+                self.assertIn("author=/root recipient=/root/editor", build_content(sent)[0]["text"])
+                session.confirm("test-session")
+                followup = {**task, "content": [{"type": "input_text", "text": "もっと短く。"}]}
+                parsed = parse_request({"input": [task, {
+                    "role": "assistant", "content": "添削しました。",
+                }, followup]}, "test-model")
+                sent = session.prepare(parsed.messages, backend)
+                self.assertTrue(session.resume)
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(build_content(sent)[0]["text"],
+                                 "[Codex agent message] author=/root recipient=/root/editor\nもっと短く。")
+
+    def test_agent_report_preserves_author_and_text_order(self):
+        parsed = parse_request({"input": [{
+            "type": "agent_message", "author": "/root/editor", "recipient": "/root",
+            "content": [{"type": "input_text", "text": "報告："},
+                        {"type": "input_text", "text": "添削完了。"}],
+        }]}, "test-model")
+        self.assertEqual(build_content(parsed.messages)[0]["text"],
+                         "[Codex agent message] author=/root/editor recipient=/root\n報告：\n添削完了。")
+
+    def test_invalid_agent_message_is_rejected_not_silently_dropped(self):
+        task = {"type": "agent_message", "author": "/root", "recipient": "/root/editor",
+                "content": [{"type": "input_text", "text": "依頼"}]}
+        for change in ({"author": None}, {"recipient": ""}, {"content": []},
+                       {"content": [{"type": "encrypted_content", "encrypted_content": "opaque"}]},
+                       {"content": [image_part()]}):
+            with self.subTest(change=change), self.assertRaises(BridgeError) as raised:
+                parse_request({"input": [{"role": "user", "content": "環境"},
+                                         {**task, **change}]}, "test-model")
+            self.assertEqual(raised.exception.status, 400)
+
     def test_string_input_becomes_prompt(self):
         parsed = parse_request({"input": "やあ"}, "opus")
         self.assertEqual(build_content(parsed.messages), ({"type": "text", "text": "やあ"},))
@@ -1676,7 +1978,11 @@ class ConfigTest(unittest.TestCase):
     def test_default_claude_model_does_not_collide_with_upstream_names(self):
         # 上流に実在する名前を使うと、その名前が上流一覧から除かれてアプリで選べなくなる。
         config = build_config([], env={})
-        self.assertEqual(config.claude_models, ("claude-opus-5", "claude-fable-5"))
+        self.assertEqual(config.model, "claude-opus-5-5")
+        self.assertEqual(
+            config.claude_models,
+            ("claude-opus-5-5", "claude-fable-5-1"),
+        )
 
     def test_empty_claude_models_is_rejected(self):
         # model 省略時の既定に先頭を使うため、1 件以上あることを起動時に保証する。
@@ -1691,12 +1997,14 @@ class ConfigTest(unittest.TestCase):
                 "CLAUDE_BRIDGE_MODEL": "sonnet",
                 "CLAUDE_BRIDGE_API_KEY": "secret",
                 "CLAUDE_BRIDGE_TIMEOUT_SECONDS": "30",
+                "CLAUDE_BRIDGE_MAX_UPSTREAM_REQUEST_BYTES": "123456",
             },
         )
         self.assertEqual(config.port, 9000)
         self.assertEqual(config.model, "sonnet")
         self.assertEqual(config.api_key, "secret")
         self.assertEqual(config.timeout_seconds, 30.0)
+        self.assertEqual(config.max_upstream_request_bytes, 123456)
 
     def test_non_loopback_bind_requires_api_key(self):
         with self.assertRaises(ValueError):
@@ -1751,12 +2059,88 @@ class UpstreamRoutingTest(BridgeHTTPTestCase):
         # 上流へ流すリクエストでは Claude CLI を起動しない。
         self.assertEqual(runner.calls, [])
 
+    def test_model_switch_preserves_messages_and_tools_without_local_item_ids(self):
+        upstream_url, received = self.start_upstream()
+        runner = FakeRunner()
+        base_url = self.start_server(make_config(upstream_base_url=upstream_url), runner)
+        stream = ResponseStream("claude-opus-5-5")
+        progress = stream.reasoning("作業中")[0][1]["item"]
+        legacy = {**progress, "id": "rs_1df8e19e9e87435197014a32736fece7"}
+        message = stream.message("修正しました")[-1][1]["item"]
+        call = stream.function_calls([
+            {"call_id": "call_test", "name": "exec_command", "arguments": {"cmd": "pwd"}},
+        ])[0][1]["item"]
+        search = stream.tool_search_call("feedback")[0][1]["item"]
+        result = {"type": "function_call_output", "call_id": "call_test", "output": "/workspace"}
+        search_result = {"type": "tool_search_output", "call_id": search["call_id"], "tools": []}
+        native = {"type": "reasoning", "id": "rs_openai", "encrypted_content": "opaque", "summary": []}
+        # ID が旧形式と一致しても、暗号化された正規の推論状態は加工しない。
+        native_uuid = {**native, "id": legacy["id"]}
+        native_reference = {"type": "item_reference", "id": "rs_openai"}
+        user = {"role": "user", "content": "続きを実行"}
+        payload = {
+            "model": "gpt-5.6-sol", "store": False,
+            "input": [progress, legacy,
+                      message, call, result, search, search_result, native, native_uuid, native_reference, user],
+        }
+
+        status, _ = self.post(base_url, payload)
+
+        self.assertEqual(status, 200)
+        expected = [
+            {k: v for k, v in message.items() if k != "id"},
+            {k: v for k, v in call.items() if k != "id"}, result,
+            {k: v for k, v in search.items() if k != "id"}, search_result,
+            native, native_uuid, native_reference, user,
+        ]
+        self.assertEqual(received[0]["body"], {**payload, "input": expected})
+        self.assertEqual(len(payload["input"]), 11)
+        self.assertIn("id", message)
+        self.assertEqual(runner.calls, [])
+
+    def test_native_history_is_relayed_byte_for_byte(self):
+        for payload in (
+            {"model": "gpt-5.6-sol", "input": "hello", "store": False},
+            {"model": "gpt-5.6-sol", "input": [
+                {"type": "reasoning", "id": "rs_native", "summary": []},
+                {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
+                {"type": "item_reference", "id": "rs_native"},
+                {"type": "item_reference", "id": "rs_1df8e19e9e87435197014a32736fece7"},
+                {"type": "message", "id": "msg_native", "role": "assistant", "content": []},
+            ]},
+            {"input": [None, "invalid", {"id": 1}, {"type": "unknown", "id": "rs_1df8e19e9e87435197014a32736fece7"}]},
+            [],
+        ):
+            with self.subTest(payload=payload):
+                original = json.dumps(payload, indent=2).encode()
+                self.assertIs(responses_body(payload, original), original)
+
+    def test_gpt_body_can_exceed_local_cli_limit(self):
+        upstream_url, received = self.start_upstream()
+        base_url = self.start_server(
+            make_config(
+                upstream_base_url=upstream_url,
+                max_request_bytes=64,
+                max_upstream_request_bytes=1024,
+            ),
+            FakeRunner(),
+        )
+
+        status, payload = self.post(
+            base_url,
+            {"model": "gpt-5.4", "input": "x" * 200},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["output_text"], "上流の応答")
+        self.assertEqual(received[0]["body"]["input"], "x" * 200)
+
     def test_claude_model_is_handled_by_the_cli(self):
         upstream_url, received = self.start_upstream()
         runner = FakeRunner()
         base_url = self.start_server(make_config(upstream_base_url=upstream_url), runner)
 
-        status, payload = self.post(base_url, {"model": "claude-opus-5", "input": "やあ"})
+        status, payload = self.post(base_url, {"model": "claude-opus-5-5", "input": "やあ"})
 
         self.assertEqual(status, 200)
         self.assertEqual(payload["output_text"], "こんにちは")
@@ -1773,7 +2157,7 @@ class UpstreamRoutingTest(BridgeHTTPTestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(payload["output_text"], "こんにちは")
-        self.assertEqual(payload["model"], "claude-opus-5")
+        self.assertEqual(payload["model"], "claude-opus-5-5")
         self.assertEqual(received, [])
 
 
@@ -1867,6 +2251,30 @@ class ImagePassthroughTest(BridgeHTTPTestCase):
         self.assertEqual(received[0]["content_type"], content_type)
         self.assertEqual(received[0]["authorization"], "Bearer chatgpt-token")
 
+    def test_image_body_can_exceed_local_cli_limit(self):
+        upstream_url, received = self.start_upstream(response_body=b"generated")
+        base_url = self.start_server(
+            make_config(
+                upstream_base_url=upstream_url,
+                max_request_bytes=64,
+                max_upstream_request_bytes=1024,
+            ),
+            FakeRunner(),
+        )
+        body = b'{"model":"gpt-image-2","prompt":"' + (b"x" * 200) + b'"}'
+
+        status, _, response = self.post_bytes(
+            base_url,
+            "/v1/images/generations",
+            body,
+            "application/json",
+            headers={"Authorization": "Bearer chatgpt-token"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response, b"generated")
+        self.assertEqual(received[0]["body"], body)
+
     def test_upstream_error_status_and_body_are_preserved(self):
         upstream_url, _ = self.start_upstream(status=400, response_body=b"upstream error")
         base_url = self.start_server(make_config(upstream_base_url=upstream_url), FakeRunner())
@@ -1896,11 +2304,13 @@ class ImagePassthroughTest(BridgeHTTPTestCase):
 
 class AddDirTest(unittest.TestCase):
     def test_add_dir_is_absent_by_default(self):
-        self.assertNotIn("--add-dir", build_command(make_config(), None, Session()))
+        self.assertNotIn(
+            "--add-dir", build_command(make_config(), None, Session(), "sid-1")
+        )
 
     def test_add_dirs_reach_the_cli_as_one_flag(self):
         # --add-dir は可変長引数なので、ディレクトリを続けて並べる。
-        command = build_command(make_config(add_dirs=("/tmp", "/var")), None, Session())
+        command = build_command(make_config(add_dirs=("/tmp", "/var")), None, Session(), "sid-1")
         index = command.index("--add-dir")
 
         self.assertEqual(command[index + 1 : index + 3], ["/tmp", "/var"])
@@ -1926,14 +2336,20 @@ def conversation(*pairs: tuple[str, str]) -> tuple[Message, ...]:
 
 
 class SessionTest(unittest.TestCase):
-    """会話の続き具合に応じて、Claude へ渡す発言を絞り込む。"""
+    """会話の続き具合に応じて、CLI へ渡す発言を絞り込む。"""
 
-    def run_turn(self, session: Session, messages: tuple[Message, ...]) -> tuple[dict, ...]:
+    def run_turn(
+        self,
+        session: Session,
+        messages: tuple[Message, ...],
+        backend: str = CLAUDE_BACKEND,
+    ) -> tuple[dict, ...]:
         """prepare から CLI 起動までを進めた 1 ターン。"""
 
-        content = session.prepare(messages)
+        unseen = session.prepare(messages, backend)
         session.start(FakeProcess(b""))
-        return content
+        session.confirm(transcript_id(session))
+        return build_content(unseen)
 
     def test_first_turn_sends_whole_history_without_resume(self):
         session = Session()
@@ -1945,7 +2361,7 @@ class SessionTest(unittest.TestCase):
     def test_second_turn_resumes_with_only_the_new_message(self):
         session = Session()
         self.run_turn(session, conversation(("user", "1問目")))
-        session_id = session.session_id
+        session_id = session.handle
 
         content = self.run_turn(
             session, conversation(("user", "1問目"), ("assistant", "回答"), ("user", "2問目"))
@@ -1954,18 +2370,18 @@ class SessionTest(unittest.TestCase):
         self.assertTrue(session.resume)
         # 転記に残る自分の発言は送り返さない。同じ ID の会話へ書き足す。
         self.assertEqual(content, ({"type": "text", "text": "2問目"},))
-        self.assertEqual(session.session_id, session_id)
+        self.assertEqual(session.handle, session_id)
 
     def test_rewritten_history_starts_a_new_session(self):
         session = Session()
         self.run_turn(session, conversation(("user", "1問目")))
-        session_id = session.session_id
+        session_id = session.handle
 
         # Codex 側の圧縮などで先頭が置き換わった会話。続きにできないので開始し直す。
         content = self.run_turn(session, conversation(("user", "これまでの要約"), ("user", "2問目")))
 
         self.assertFalse(session.resume)
-        self.assertNotEqual(session.session_id, session_id)
+        self.assertNotEqual(session.handle, session_id)
         self.assertEqual(
             content, ({"type": "text", "text": "[user]\nこれまでの要約\n\n[user]\n2問目"},)
         )
@@ -1983,13 +2399,18 @@ class SessionTest(unittest.TestCase):
 
     def test_failed_launch_keeps_the_session_unstarted(self):
         session = Session()
-        session.prepare(conversation(("user", "1問目")))
+        session.prepare(conversation(("user", "1問目")), CLAUDE_BACKEND)
 
         # CLI が起動しなければ転記も作られないため、次回は --resume を使わない。
-        content = session.prepare(conversation(("user", "1問目"), ("user", "2問目")))
+        unseen = session.prepare(
+            conversation(("user", "1問目"), ("user", "2問目")), CLAUDE_BACKEND
+        )
 
         self.assertFalse(session.resume)
-        self.assertEqual(content, ({"type": "text", "text": "[user]\n1問目\n\n[user]\n2問目"},))
+        self.assertEqual(
+            build_content(unseen),
+            ({"type": "text", "text": "[user]\n1問目\n\n[user]\n2問目"},),
+        )
 
 
 class SessionRegistryTest(unittest.TestCase):
@@ -2011,7 +2432,7 @@ class SessionRegistryTest(unittest.TestCase):
         second = registry.acquire(None)
         registry.release(second)
 
-        self.assertNotEqual(second.session_id, first.session_id)
+        self.assertIsNot(second, first)
 
     def test_oldest_conversation_is_dropped(self):
         registry = SessionRegistry(max_sessions=2)
@@ -2033,6 +2454,23 @@ class SessionRegistryTest(unittest.TestCase):
         registry.release(running)
 
         self.assertIs(registry.acquire("thread-1"), running)
+
+    def test_reserved_handover_survives_release_and_eviction(self):
+        registry = SessionRegistry(max_sessions=1)
+        running = registry.acquire("thread-1")
+        self.assertTrue(running.take_over())
+        registry.release(running)
+
+        # 先行ハンドラの解放後も、予約した会話を別の要求や容量整理へ渡さない。
+        parallel = registry.acquire("thread-1")
+        self.assertIsNot(parallel, running)
+        registry.release(parallel)
+        registry.release(registry.acquire("thread-2"))
+        self.assertIs(registry._sessions["thread-1"], running)
+
+        running.lock.acquire()
+        running.attach(None)
+        registry.release(running)
 
     def test_new_request_cancels_the_running_one(self):
         registry = SessionRegistry()
@@ -2060,6 +2498,124 @@ class SessionRegistryTest(unittest.TestCase):
         registry.release(running)
         thread.join(5)
         self.assertTrue(taken.is_set())
+
+    def test_holding_a_conversation_registers_the_client_at_once(self):
+        # 借りてから相手を登録するまでを分けると、その間に届いたリクエストが「相手のいない
+        # 実行」と誤って判定し、その場限りのセッションへ逃げずに引き継ぎ待ちへ入る。
+        session = Session()
+        client, peer = socket.socketpair()
+        self.addCleanup(client.close)
+        self.addCleanup(peer.close)
+
+        self.assertTrue(session.try_hold(client))
+
+        # 借りた直後から、相手のいる実行として見える。
+        self.assertFalse(session.take_over())
+
+    def test_parallel_request_gets_its_own_session(self):
+        # Codex の /side のように、同じ prompt_cache_key で並行してリクエストが届く。相手が
+        # 残っている実行を落とすと、その結果を待っている相手が中身のないエラーを受け取る。
+        # 空くまで待たせると、長いターンの裏で無音のまま相手の待機上限を超える。どちらも
+        # 取らず、その場限りのセッションで並行して実行する。
+        registry = SessionRegistry()
+        client, peer = socket.socketpair()
+        self.addCleanup(client.close)
+        self.addCleanup(peer.close)
+        running = registry.acquire("thread-1", client)
+        process = FakeProcess(b"")
+        running.start(process)
+
+        side = registry.acquire("thread-1")
+
+        self.assertEqual(process.killed, 0)
+        self.assertIsNot(side, running)
+        registry.release(side)
+        registry.release(running)
+        # その場限りのセッションは会話へ残らない。次のリクエストは元の会話を続ける。
+        self.assertIs(registry.acquire("thread-1"), running)
+
+    def test_running_request_is_cancelled_once_its_client_is_gone(self):
+        # 中断や切断後の再送では、先行する実行の相手がもういない。待っても誰も受け取らない
+        # ので、その CLI を落として引き継ぐ。
+        registry = SessionRegistry()
+        client, peer = socket.socketpair()
+        self.addCleanup(client.close)
+        running = registry.acquire("thread-1", client)
+        process = FakeProcess(b"")
+        running.start(process)
+        peer.close()
+
+        thread = threading.Thread(
+            target=lambda: registry.release(registry.acquire("thread-1"))
+        )
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        for _ in range(500):
+            if process.killed:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(process.killed, 1)
+        registry.release(running)
+        thread.join(5)
+
+    def test_only_one_request_takes_over_a_dropped_run(self):
+        # 落とした実行はもう引き継ぎの対象ではない。2 人目まで引き継ぎ待ちに入ると、
+        # 引き継いだ側のターンが終わるまで無音で待たされる。
+        registry = SessionRegistry()
+        client, peer = socket.socketpair()
+        self.addCleanup(client.close)
+        running = registry.acquire("thread-1", client)
+        process = FakeProcess(b"")
+        running.start(process)
+        peer.close()
+
+        taken = []
+        thread = threading.Thread(
+            target=lambda: taken.append(registry.acquire("thread-1"))
+        )
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        for _ in range(500):
+            if process.killed:
+                break
+            time.sleep(0.01)
+
+        # 落としたのは 1 人目だけ。2 人目はその場限りのセッションで並行して走る。
+        second = registry.acquire("thread-1")
+        self.assertEqual(process.killed, 1)
+        self.assertIsNot(second, running)
+        registry.release(second)
+
+        registry.release(running)
+        thread.join(5)
+        self.assertEqual(taken, [running])
+        registry.release(running)
+
+    def test_takeover_waits_for_a_run_that_has_not_started_its_cli(self):
+        # CLI が動き出す前のターンでも、相手が消えていれば引き継ぐ。落とすものはないが、
+        # ロックが空くのを待てば会話を続けられる。諦めて並行させると、本来は続きにできる
+        # 再送が別の会話として枝分かれする。
+        registry = SessionRegistry()
+        client, peer = socket.socketpair()
+        self.addCleanup(client.close)
+        running = registry.acquire("thread-1", client)
+        peer.close()
+
+        taken = []
+        thread = threading.Thread(
+            target=lambda: taken.append(registry.acquire("thread-1"))
+        )
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        time.sleep(0.1)
+
+        # 会話が空くまで待つ。その場限りのセッションへは逃げない。
+        self.assertEqual(taken, [])
+        registry.release(running)
+        thread.join(5)
+        self.assertEqual(taken, [running])
+        registry.release(running)
 
     def test_finished_request_is_not_cancelled(self):
         registry = SessionRegistry()
@@ -2157,9 +2713,9 @@ class KeepaliveTest(unittest.TestCase):
     def test_does_not_write_while_the_caller_keeps_writing(self):
         written = []
 
-        with Keepalive(written.append, "PING", 0.05) as alive:
+        with Keepalive(written.append, "PING", 1.0) as alive:
             for _ in range(6):
-                time.sleep(0.02)
+                time.sleep(0.01)
                 alive.write("本文")
 
         self.assertEqual(written, ["本文"] * 6)

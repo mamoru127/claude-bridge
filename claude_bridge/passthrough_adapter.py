@@ -46,7 +46,13 @@ class PendingCallClient:
         self._timeout_seconds = timeout_seconds
         self._opener = opener
 
-    def enqueue(self, name: str, arguments: dict, namespace: str | None = None) -> str:
+    def enqueue(
+        self,
+        name: str,
+        arguments: dict,
+        namespace: str | None = None,
+        passthrough_type: str | None = None,
+    ) -> str:
         """呼び出しを預け、Codex と対応づける call_id を受け取る。"""
 
         headers = {"Content-Type": "application/json"}
@@ -57,6 +63,7 @@ class PendingCallClient:
             "name": name,
             "arguments": arguments,
             "namespace": namespace,
+            "passthrough_type": passthrough_type,
         }
         request = urllib.request.Request(
             self._url,
@@ -119,7 +126,9 @@ def _description(tool: dict) -> str:
 def build_handler(tools: list[dict], client: PendingCallClient):
     """JSON-RPC メッセージ 1 件を処理する関数を作る。"""
 
-    namespaces = {tool["name"]: tool.get("namespace") for tool in tools}
+    metadata = {
+        tool["name"]: (tool.get("namespace"), tool.get("passthrough_type")) for tool in tools
+    }
 
     def handle(message: dict, _client=None) -> dict | None:
         request_id = message.get("id")
@@ -138,25 +147,26 @@ def build_handler(tools: list[dict], client: PendingCallClient):
         if method == "tools/list":
             return _result(request_id, {"tools": tool_definitions(tools)})
         if method == "tools/call":
-            return _call(request_id, message.get("params") or {}, namespaces, client)
+            return _call(request_id, message.get("params") or {}, metadata, client)
         return _error(request_id, METHOD_NOT_FOUND, f"未対応のメソッドです: {method}")
 
     return handle
 
 
 def _call(
-    request_id: object, params: object, namespaces: dict, client: PendingCallClient
+    request_id: object, params: object, metadata: dict, client: PendingCallClient
 ) -> dict:
     if not isinstance(params, dict):
         return _result(request_id, _content("params はオブジェクトで指定してください", True))
     name = params.get("name")
-    if name not in namespaces:
+    if name not in metadata:
         return _result(request_id, _content(f"未対応のツールです: {name}", True))
     arguments = params.get("arguments") or {}
     if not isinstance(arguments, dict):
         return _result(request_id, _content("arguments はオブジェクトで指定してください", True))
     try:
-        call_id = client.enqueue(name, arguments, namespaces[name])
+        namespace, passthrough_type = metadata[name]
+        call_id = client.enqueue(name, arguments, namespace, passthrough_type)
     except PassthroughError as error:
         return _result(request_id, _content(str(error), True))
     return _result(

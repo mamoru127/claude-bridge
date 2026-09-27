@@ -181,6 +181,7 @@ class McpProtocolTest(unittest.TestCase):
             [
                 "create_thread",
                 "thread_start",
+                "thread_name_set",
                 "turn_start",
                 "turn_start_async",
                 "thread_list",
@@ -208,14 +209,17 @@ class McpProtocolTest(unittest.TestCase):
         # thread/start は必須引数なしで呼べる。
         self.assertEqual(schemas["thread_start"]["required"], [])
         self.assertEqual(schemas["turn_start"]["required"], ["threadId", "text"])
+        self.assertEqual(schemas["thread_name_set"]["required"], ["threadId", "name"])
 
     def test_unsupported_rpcs_are_not_exposed(self):
         # thread/items/list は app-server が未実装。呼べば必ず失敗するので公開しない。
-        self.assertNotIn("thread/items/list", {tool["method"] for tool in mcp_adapter.TOOLS})
+        self.assertNotIn(
+            "thread/items/list", {tool.get("method") for tool in mcp_adapter.TOOLS}
+        )
 
     def test_destructive_rpcs_are_not_exposed(self):
         # 破壊的操作は公開しない。
-        methods = {tool["method"] for tool in mcp_adapter.TOOLS}
+        methods = {tool.get("method") for tool in mcp_adapter.TOOLS}
         for absent in ("turn/steer", "thread/delete", "command/exec"):
             self.assertNotIn(absent, methods)
 
@@ -234,104 +238,6 @@ class McpProtocolTest(unittest.TestCase):
 
 
 class McpToolCallTest(unittest.TestCase):
-    def test_create_thread_sets_full_access_before_starting_turn(self):
-        class CreateThreadClient:
-            def __init__(self):
-                self.calls = []
-
-            def call(self, method, params, wait=None):
-                self.calls.append((method, params, wait))
-                if method == "thread/start":
-                    return {"thread": {"id": "th_new"}}
-                if method == "turn/start":
-                    return {"turn": {"id": "tn_1", "status": "inProgress"}}
-                return {}
-
-        client = CreateThreadClient()
-
-        response = call_tool(
-            client,
-            "create_thread",
-            {
-                "cwd": "/tmp/project",
-                "title": "実装タスク",
-                "prompt": "実装して",
-                "model": "gpt-5.6-sol",
-            },
-        )
-
-        self.assertEqual(
-            client.calls,
-            [
-                (
-                    "thread/start",
-                    {
-                        "cwd": "/tmp/project",
-                        "model": "gpt-5.6-sol",
-                        "modelProvider": "openai",
-                        "sandbox": "danger-full-access",
-                        "approvalPolicy": "never",
-                    },
-                    None,
-                ),
-                ("thread/name/set", {"threadId": "th_new", "name": "実装タスク"}, None),
-                (
-                    "turn/start",
-                    {
-                        "threadId": "th_new",
-                        "input": [{"type": "text", "text": "実装して"}],
-                        "sandboxPolicy": {"type": "dangerFullAccess"},
-                        "approvalPolicy": "never",
-                    },
-                    False,
-                ),
-            ],
-        )
-        self.assertEqual(
-            json.loads(response["result"]["content"][0]["text"]),
-            {"threadId": "th_new", "turn": {"id": "tn_1", "status": "inProgress"}},
-        )
-        self.assertFalse(response["result"]["isError"])
-
-    def test_create_thread_preserves_explicit_bridge_provider(self):
-        class CreateThreadClient:
-            def __init__(self):
-                self.calls = []
-
-            def call(self, method, params, wait=None):
-                self.calls.append((method, params, wait))
-                if method == "thread/start":
-                    return {"thread": {"id": "th_new"}}
-                return {"turn": {"id": "tn_1"}}
-
-        client = CreateThreadClient()
-
-        call_tool(
-            client,
-            "create_thread",
-            {
-                "cwd": "/tmp/project",
-                "title": "Claude実装",
-                "prompt": "実装して",
-                "model": "claude-opus-5",
-                "modelProvider": "claude_bridge",
-            },
-        )
-
-        self.assertEqual(client.calls[0][1]["modelProvider"], "claude_bridge")
-
-    def test_create_thread_stops_when_thread_id_is_missing(self):
-        client = FakeClient(result={"thread": {}})
-
-        response = call_tool(
-            client,
-            "create_thread",
-            {"cwd": "/tmp/project", "title": "実装タスク", "prompt": "実装して"},
-        )
-
-        self.assertTrue(response["result"]["isError"])
-        self.assertEqual(len(client.calls), 1)
-
     def test_tool_call_forwards_method_and_arguments(self):
         client = FakeClient(result={"data": [{"id": "th_1"}]})
 
@@ -350,6 +256,59 @@ class McpToolCallTest(unittest.TestCase):
 
         self.assertEqual(client.calls, [("thread/start", {"cwd": "/tmp", "model": "opus"})])
         self.assertIn("th_new", response["result"]["content"][0]["text"])
+
+    def test_create_thread_creates_names_and_starts_without_waiting(self):
+        client = mock.Mock()
+        client.call.side_effect = [
+            {"thread": {"id": "th_new"}},
+            {},
+            {"threadId": "th_new", "turn": {"id": "tn_new"}},
+        ]
+
+        response = call_tool(
+            client,
+            "create_thread",
+            {
+                "cwd": "/tmp/project",
+                "title": "調査タスク",
+                "prompt": "調べてください",
+                "model": "gpt-5.6-sol",
+            },
+        )
+
+        self.assertEqual(
+            client.call.call_args_list,
+            [
+                mock.call("thread/start", {"cwd": "/tmp/project", "model": "gpt-5.6-sol"}),
+                mock.call("thread/name/set", {"threadId": "th_new", "name": "調査タスク"}),
+                mock.call(
+                    "turn/start",
+                    {
+                        "threadId": "th_new",
+                        "input": [{"type": "text", "text": "調べてください"}],
+                    },
+                    wait=False,
+                ),
+            ],
+        )
+        self.assertEqual(
+            json.loads(response["result"]["content"][0]["text"]),
+            {"threadId": "th_new", "turn": {"id": "tn_new"}},
+        )
+        self.assertFalse(response["result"]["isError"])
+
+    def test_create_thread_rejects_missing_thread_id(self):
+        client = FakeClient(result={"thread": {}})
+
+        response = call_tool(
+            client,
+            "create_thread",
+            {"cwd": "/tmp/project", "title": "調査", "prompt": "調べて"},
+        )
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("thread.id", response["result"]["content"][0]["text"])
+        self.assertEqual(client.calls, [("thread/start", {"cwd": "/tmp/project"})])
 
     def test_missing_arguments_become_empty_params(self):
         client = FakeClient()
@@ -1372,24 +1331,26 @@ class AppServerRpcEndpointTest(unittest.TestCase):
 
 class ClaudeCliMcpArgumentTest(unittest.TestCase):
     def test_disabled_by_default(self):
-        command = build_command(make_config(), None, Session())
+        command = build_command(make_config(), None, Session(), "sid-1")
 
         self.assertIn("--strict-mcp-config", command)
         self.assertNotIn("--mcp-config", command)
         self.assertNotIn("--allowedTools", command)
 
     def test_enabled_adds_mcp_config_and_allowed_tools(self):
-        command = build_command(make_config(codex_mcp=True), None, Session())
+        command = build_command(make_config(codex_mcp=True), None, Session(), "sid-1")
 
         self.assertIn("--strict-mcp-config", command)
         self.assertEqual(command[command.index("--allowedTools") + 1], f"mcp__{MCP_SERVER_NAME}")
         self.assertNotIn("--dangerously-skip-permissions", command)
         self.assertNotIn("--allow-dangerously-skip-permissions", command)
-        self.assertNotIn("--permission-mode", command)
+        self.assertEqual(
+            command[command.index("--permission-mode") + 1], "bypassPermissions"
+        )
 
     def test_mcp_config_registers_only_the_bundled_adapter(self):
         config = make_config(codex_mcp=True, host="127.0.0.1", port=9911)
-        command = build_command(config, None, Session())
+        command = build_command(config, None, Session(), "sid-1")
         payload = json.loads(command[command.index("--mcp-config") + 1])
 
         servers = payload["mcpServers"]
@@ -1410,14 +1371,14 @@ class ClaudeCliMcpArgumentTest(unittest.TestCase):
 
     def test_mcp_config_is_a_single_argument(self):
         # JSON をシェルで組み立てず、引数配列の 1 要素として渡す。
-        command = build_command(make_config(codex_mcp=True), None, Session())
+        command = build_command(make_config(codex_mcp=True), None, Session(), "sid-1")
         value = command[command.index("--mcp-config") + 1]
 
         self.assertEqual(command.count(value), 1)
         self.assertIsInstance(json.loads(value), dict)
 
     def test_system_prompt_still_follows_mcp_arguments(self):
-        command = build_command(make_config(codex_mcp=True), "校正して", Session())
+        command = build_command(make_config(codex_mcp=True), "校正して", Session(), "sid-1")
 
         self.assertEqual(command[-2:], ["--append-system-prompt", "校正して"])
 
@@ -1480,27 +1441,27 @@ class ExtraMcpConfigFileTest(unittest.TestCase):
         return path
 
     def write_server_file(self) -> str:
-        return self.write_config_file({"mcpServers": {"example-mcp": {"command": "npx"}}})
+        return self.write_config_file({"mcpServers": {"alchemist-mcp": {"command": "npx"}}})
 
     def test_servers_are_added_and_allowed(self):
         config = build_config(
             ["--enable-codex-mcp", "--mcp-config-file", self.write_server_file()], env={}
         )
-        command = build_command(config, None, Session())
+        command = build_command(config, None, Session(), "sid-1")
         servers = json.loads(command[command.index("--mcp-config") + 1])["mcpServers"]
 
         # 同梱アダプタと追加分が両方載り、権限確認なしで使えるよう両方許可される。
-        self.assertEqual(set(servers), {MCP_SERVER_NAME, "example-mcp"})
+        self.assertEqual(set(servers), {MCP_SERVER_NAME, "alchemist-mcp"})
         allowed = command[command.index("--allowedTools") + 1]
-        self.assertEqual(set(allowed.split(",")), {f"mcp__{MCP_SERVER_NAME}", "mcp__example-mcp"})
+        self.assertEqual(set(allowed.split(",")), {f"mcp__{MCP_SERVER_NAME}", "mcp__alchemist-mcp"})
 
     def test_usable_without_the_codex_adapter(self):
         config = build_config(["--mcp-config-file", self.write_server_file()], env={})
-        command = build_command(config, None, Session())
+        command = build_command(config, None, Session(), "sid-1")
         servers = json.loads(command[command.index("--mcp-config") + 1])["mcpServers"]
 
-        self.assertEqual(set(servers), {"example-mcp"})
-        self.assertEqual(command[command.index("--allowedTools") + 1], "mcp__example-mcp")
+        self.assertEqual(set(servers), {"alchemist-mcp"})
+        self.assertEqual(command[command.index("--allowedTools") + 1], "mcp__alchemist-mcp")
 
     def test_unusable_file_is_rejected_at_startup(self):
         """壊れた設定はリクエスト時ではなく起動時に落とす。"""
@@ -1520,7 +1481,7 @@ class ExtraMcpConfigFileTest(unittest.TestCase):
 
     def test_path_comes_from_env(self):
         env = {"CLAUDE_BRIDGE_MCP_CONFIG_FILE": self.write_server_file()}
-        self.assertEqual(set(build_config([], env=env).extra_mcp_servers), {"example-mcp"})
+        self.assertEqual(set(build_config([], env=env).extra_mcp_servers), {"alchemist-mcp"})
         self.assertEqual(build_config([], env={}).extra_mcp_servers, {})
 
     def test_home_relative_path_is_expanded(self):
@@ -1530,7 +1491,7 @@ class ExtraMcpConfigFileTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": os.path.dirname(path)}):
             config = build_config(["--mcp-config-file", "~/mcp.json"], env={})
 
-        self.assertEqual(set(config.extra_mcp_servers), {"example-mcp"})
+        self.assertEqual(set(config.extra_mcp_servers), {"alchemist-mcp"})
 
 
 if __name__ == "__main__":

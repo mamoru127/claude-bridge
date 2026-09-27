@@ -8,11 +8,42 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from .config import TOOL_SEARCH_LIMIT, BridgeConfig
+from .config import (
+    ANTIGRAVITY_BACKEND,
+    CLAUDE_BACKEND,
+    TOOL_SEARCH_LIMIT,
+    BridgeConfig,
+)
 from .errors import BridgeError
 
 # Codex がモデルごとに読むメタデータ。tools / tool_choice を無視する実装に合わせた値を返す。
 REASONING_LEVELS = ("low", "medium", "high")
+
+# モデルピッカーの表示に使う、CLI ごとの違い。ここに載せた値がそのままアプリへ出る。
+CLI_METADATA = {
+    CLAUDE_BACKEND: {
+        "owned_by": "anthropic",
+        "display_name": "Claude CLI ({slug})",
+        "description": "claude-bridge 経由の Claude CLI。入力はテキストと画像、出力はテキスト。",
+        "supports_vision": True,
+        "context_window": 200000,
+    },
+    ANTIGRAVITY_BACKEND: {
+        "owned_by": "google",
+        "display_name": "Antigravity CLI ({slug})",
+        "description": (
+            "claude-bridge 経由の Antigravity CLI（agy）。入力はテキストのみ、出力はテキスト。"
+            "思考の強さはモデル名の high / medium で選ぶ。"
+        ),
+        # agy の headless 契約に画像を渡す口がなく、画像付きリクエストは 400 で拒否する。
+        # 雛形が画像対応でも、その宣言は受け継がない。
+        "supports_vision": False,
+        # headless の契約に文脈長の公表がないため、Claude と同じ控えめな値を暫定で置く。
+        # 実際の上限が分かったらここを引き上げる。小さすぎる分には Codex が送る履歴が短く
+        # なるだけで実行は失敗しない。
+        "context_window": 200000,
+    },
+}
 
 SYSTEM_ROLES = ("system", "developer")
 MESSAGE_ROLES = ("user", "assistant")
@@ -177,7 +208,7 @@ def _passthrough_tools(
                 searchable = searchable or _is_tool_search(tool)
             for expanded in _expand_tool(tool, allowed):
                 found.setdefault(expanded["name"], expanded)
-    missing = [name for name in allowed if name not in found]
+    missing = [name for name in allowed if name != "*" and name not in found]
     query = search_query if (missing and searchable and not searched and search_query) else None
     logger.info(
         "codex tools offered=%s passed=%s search=%s searchable=%s searched=%s",
@@ -231,6 +262,23 @@ def _expand_tool(tool: object, allowed: Sequence[str]) -> list[dict]:
 
     if not isinstance(tool, dict):
         return []
+    if _is_tool_search(tool) and _is_allowed_name("tool_search", allowed):
+        return [
+            {
+                "type": "function",
+                "name": "tool_search",
+                "description": tool.get("description") or "Search available Codex tools",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1},
+                    },
+                    "required": ["query"],
+                },
+                "passthrough_type": "tool_search",
+            }
+        ]
     if tool.get("type") == "namespace":
         return [
             dict(child, namespace=tool.get("name"))
@@ -244,8 +292,12 @@ def _is_allowed_function(tool: object, allowed: Sequence[str]) -> bool:
     return (
         isinstance(tool, dict)
         and tool.get("type") == "function"
-        and tool.get("name") in allowed
+        and _is_allowed_name(tool.get("name"), allowed)
     )
+
+
+def _is_allowed_name(name: object, allowed: Sequence[str]) -> bool:
+    return isinstance(name, str) and ("*" in allowed or name in allowed)
 
 
 def _parse_input_item(item: object, index: int) -> tuple[str, list] | None:
@@ -259,6 +311,20 @@ def _parse_input_item(item: object, index: int) -> tuple[str, list] | None:
     # 依頼を出したところでターンが終わっているため、続きのターンへ user の発言として渡す。
     if item.get("type") == "function_call_output":
         return "user", [_tool_output_text(item)]
+
+    # collaboration v2 の初回依頼・追送・他エージェントの報告は message ではない。
+    # CLI の継続セッションにも未読の依頼として渡し、送信元と宛先を保持する。
+    if item.get("type") == "agent_message":
+        for field in ("author", "recipient"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                raise _invalid(f"{field} は空でない文字列が必要です", param=f"{param}.{field}")
+        parts = _parse_content(item.get("content"), f"{param}.content")
+        text = _system_text(parts, f"{param}.content")
+        if not text.strip():
+            raise _invalid("agent_message の本文が空です", param=f"{param}.content")
+        return "user", [
+            f"[Codex agent message] author={item['author']} recipient={item['recipient']}\n{text}"
+        ]
 
     # Codex は additional_tools や function_call など、会話ではないアイテムを input に混ぜて送る。
     # function_call は Claude 自身の依頼で転記済みなので、結果以外は読まずに捨てる。
@@ -276,7 +342,19 @@ def _tool_output_text(item: dict) -> str:
     """function_call_output を Claude へ見せる本文にする。call_id で依頼と対応づける。"""
 
     output = item.get("output")
-    if not isinstance(output, str):
+    if isinstance(output, list):
+        texts = []
+        for block in output:
+            if (
+                isinstance(block, dict)
+                and block.get("type") in TEXT_PART_TYPES
+                and isinstance(block.get("text"), str)
+            ):
+                texts.append(block["text"])
+            elif not (isinstance(block, dict) and block.get("type") == IMAGE_PART_TYPE):
+                texts.append(json.dumps(block, ensure_ascii=False))
+        output = "\n".join(texts) or "画像結果は Codex 側に保存・表示されました。"
+    elif not isinstance(output, str):
         output = json.dumps(output, ensure_ascii=False)
     return f"[Codex ツール結果] call_id={item.get('call_id')}\n{output}"
 
@@ -383,6 +461,32 @@ def _text_blocks(text: str) -> list[dict]:
     return [{"type": "text", "text": text}] if text.strip() else []
 
 
+def ensure_text_only(messages: Sequence[Message]) -> None:
+    """画像を含む会話を弾く。Antigravity CLI の headless 契約はテキストしか受け取れない。"""
+
+    if any(not isinstance(part, str) for message in messages for part in message.parts):
+        raise BridgeError(
+            "Antigravity CLI は画像入力に対応していません。テキストだけの会話で実行するか、"
+            "Claude のモデルを選んでください",
+            status=400,
+            error_type="invalid_request_error",
+            code="unsupported_content_part",
+        )
+
+
+def build_prompt(messages: Sequence[Message], system_prompt: str | None) -> str:
+    """発言列を 1 本のプロンプト文字列にする。
+
+    Antigravity CLI の headless 契約は `-p <prompt>` の文字列だけで、system 指定の口も画像を
+    渡す口もない。system / developer の内容は落とさず `[system]` 節として先頭へ置く
+    （Claude CLI が毎ターン `--append-system-prompt` を付け直すのと同じ扱い）。
+    """
+
+    ensure_text_only(messages)
+    body = "\n".join(block["text"] for block in build_content(messages))
+    return f"[system]\n{system_prompt}\n\n{body}" if system_prompt else body
+
+
 def build_response(model: str, text: str) -> dict:
     """Responses API 形式の成功レスポンスを組み立てる。"""
 
@@ -394,39 +498,45 @@ def build_models(config: BridgeConfig, upstream: dict | None = None) -> dict:
 
     `data` は OpenAI 標準の形。`models` は Codex が読む形（`data` しかないと
     `missing field models` で解釈に失敗する）。中継が有効なときは上流の一覧を先に並べ、
-    Claude が受け持つ名前を後ろへ足す。同じ名前は Claude 側だけを残す。
+    ローカルの CLI が受け持つ名前を後ろへ足す。同じ名前はローカル側だけを残す。
 
-    載せるのは `claude_models` だけ。起動時の `--model` は CLI に渡す実行モデルであって
-    API で受け付ける名前ではないため、混ぜると中継が有効なときに上流へ流れて失敗する。
+    載せるのは `claude_models` と `antigravity_models` だけ。起動時の `--model` は CLI に渡す
+    実行モデルであって API で受け付ける名前ではないため、混ぜると中継が有効なときに上流へ
+    流れて失敗する。
     """
 
     created = int(time.time())
-    claude_ids = list(dict.fromkeys(config.claude_models))
-    upstream_data, upstream_models = _upstream_entries(upstream, claude_ids)
+    cli_ids = list(dict.fromkeys(config.cli_models))
+    upstream_data, upstream_models = _upstream_entries(upstream, cli_ids)
 
-    # 雛形は上流のエントリ。中継が無効なら空で、Claude 側の項目だけを並べる。
+    # 雛形は上流のエントリ。中継が無効なら空で、ローカル側の項目だけを並べる。
     template = upstream_models[0] if upstream_models else {}
-    models = upstream_models + [_codex_model(model_id, template) for model_id in claude_ids]
+    models = upstream_models + [_codex_model(config, model_id, template) for model_id in cli_ids]
     return {
         "object": "list",
         "data": upstream_data
         + [
-            {"id": model_id, "object": "model", "created": created, "owned_by": "anthropic"}
-            for model_id in claude_ids
+            {
+                "id": model_id,
+                "object": "model",
+                "created": created,
+                "owned_by": CLI_METADATA[config.backend(model_id)]["owned_by"],
+            }
+            for model_id in cli_ids
         ],
         # 上流とブリッジで priority が重複しないよう、並べた順に振り直す。
         "models": [{**item, "priority": priority} for priority, item in enumerate(models, start=1)],
     }
 
 
-def _upstream_entries(upstream: dict | None, claude_ids: list[str]) -> tuple[list, list]:
-    """上流の一覧から、Claude が受け持つ名前を除いたものを返す。"""
+def _upstream_entries(upstream: dict | None, cli_ids: list[str]) -> tuple[list, list]:
+    """上流の一覧から、ローカルの CLI が受け持つ名前を除いたものを返す。"""
 
     if upstream is None:
         return [], []
     return (
-        [item for item in _dict_items(upstream, "data") if item.get("id") not in claude_ids],
-        [item for item in _dict_items(upstream, "models") if item.get("slug") not in claude_ids],
+        [item for item in _dict_items(upstream, "data") if item.get("id") not in cli_ids],
+        [item for item in _dict_items(upstream, "models") if item.get("slug") not in cli_ids],
     )
 
 
@@ -437,7 +547,7 @@ def _dict_items(payload: dict, name: str) -> list[dict]:
     return [item for item in value if isinstance(item, dict)]
 
 
-def _codex_model(slug: str, template: dict) -> dict:
+def _codex_model(config: BridgeConfig, slug: str, template: dict) -> dict:
     """Codex が読むモデルメタデータ。ブリッジが実装していない機能を打ち消した値で埋める。
 
     Codex は必須項目が欠けたエントリを 1 つ見つけるだけで一覧全体の解釈に失敗する。
@@ -445,6 +555,7 @@ def _codex_model(slug: str, template: dict) -> dict:
     受け継ぎ、ブリッジが実装していない機能だけを下の値で打ち消す。
     """
 
+    metadata = CLI_METADATA[config.backend(slug)]
     return {
         **template,
         "slug": slug,
@@ -456,8 +567,10 @@ def _codex_model(slug: str, template: dict) -> dict:
         # 上流の先頭が code mode 専用モデルへ変わると雛形ごと巻き込まれるため、明示的に消す。
         # null は上流の従来モデル（gpt-5.5 など）と同じ値。
         "tool_mode": None,
-        "display_name": f"Claude CLI ({slug})",
-        "description": "claude-bridge 経由の Claude CLI。入力はテキストと画像、出力はテキスト。",
+        "display_name": metadata["display_name"].format(slug=slug),
+        "description": metadata["description"],
+        # 扱える入力は CLI で違う。雛形の宣言を受け継ぐと、実行できない入力を選ばせてしまう。
+        "supports_vision": metadata["supports_vision"],
         "visibility": "list",
         "supported_in_api": True,
         "default_reasoning_level": "medium",
@@ -469,8 +582,8 @@ def _codex_model(slug: str, template: dict) -> dict:
         # 送るため、要求の有無で内容が変わらない。要求させない値にしておく。
         "supports_reasoning_summary_parameter": False,
         "default_reasoning_summary": "none",
-        "context_window": 200000,
-        "max_context_window": 200000,
+        "context_window": metadata["context_window"],
+        "max_context_window": metadata["context_window"],
     }
 
 
@@ -490,6 +603,8 @@ class ResponseStream:
         self._output_index = 0
         # 送出済みの function_call と作業コメント。完了レスポンスの output にも同じ並びで載せる。
         self._items: list[dict] = []
+        # 最終回答のアイテムを開いたか。増分を出せる CLI のときだけ真になる。
+        self._answer_index: int | None = None
 
     def final_response(self, text: str) -> dict:
         """完了時の response オブジェクト。非ストリームのボディでもある。"""
@@ -523,7 +638,7 @@ class ResponseStream:
         """
 
         item = {
-            "id": f"rs_{uuid.uuid4().hex}",
+            "id": f"rs_bridge_{uuid.uuid4().hex}",
             "type": "reasoning",
             "summary": [{"type": "summary_text", "text": text}],
         }
@@ -553,6 +668,21 @@ class ResponseStream:
 
         events = []
         for call in calls:
+            if call.get("passthrough_type") == "tool_search":
+                item = self._tool_search_item(
+                    call["arguments"].get("query", ""),
+                    call_id=call["call_id"],
+                    limit=call["arguments"].get("limit"),
+                )
+                self._items.append(item)
+                events.append(
+                    self._event(
+                        "response.output_item.done",
+                        output_index=self._next_index(),
+                        item=item,
+                    )
+                )
+                continue
             item = {
                 "id": f"fc_{uuid.uuid4().hex}",
                 "type": "function_call",
@@ -581,18 +711,26 @@ class ResponseStream:
         limit を省くと少数で打ち切られ、名前で直接引いても全件は返らない。
         """
 
-        item = {
-            "id": f"tsc_{uuid.uuid4().hex}",
-            "type": "tool_search_call",
-            "call_id": f"call_{uuid.uuid4().hex}",
-            "status": "completed",
-            "execution": "client",
-            "arguments": {"query": query, "limit": TOOL_SEARCH_LIMIT},
-        }
+        item = self._tool_search_item(query)
         self._items.append(item)
         return [
             self._event("response.output_item.done", output_index=self._next_index(), item=item)
         ]
+
+    def _tool_search_item(
+        self, query: str, call_id: str | None = None, limit: object = None
+    ) -> dict:
+        arguments = {"query": query, "limit": TOOL_SEARCH_LIMIT}
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            arguments["limit"] = limit
+        return {
+            "id": f"tsc_{uuid.uuid4().hex}",
+            "type": "tool_search_call",
+            "call_id": call_id or f"call_{uuid.uuid4().hex}",
+            "status": "completed",
+            "execution": "client",
+            "arguments": arguments,
+        }
 
     def calls_response(self) -> dict:
         """本文のない完了レスポンス。output にはツール呼び出しだけが並ぶ。"""
@@ -604,12 +742,63 @@ class ResponseStream:
 
         return [self._event("response.completed", response=self.calls_response())]
 
-    def completed(self, text: str) -> list[tuple[str, dict]]:
-        """CLI の出力全文を 1 個の delta として送り切るイベント列。"""
+    def answer_delta(self, text: str) -> list[tuple[str, dict]]:
+        """最終回答の増分を送るイベント列。最初の 1 回で本文アイテムを開く。
 
-        return self._message_events(self.item_id, text, "final_answer") + [
+        増分を出せる CLI（Antigravity の `text_delta`）はここへ流す。増分を出せない CLI
+        （Claude は result でしか本文が分からない）は completed で全文を送り切る。
+        """
+
+        events = [] if self._answer_index is not None else self._open_answer()
+        return events + [
+            self._event("response.output_text.delta", **self._answer_place(), delta=text)
+        ]
+
+    def completed(self, text: str) -> list[tuple[str, dict]]:
+        """最終回答を確定してターンを閉じるイベント列。
+
+        増分を 1 度も送っていなければ、全文を 1 個の delta として送り切る。増分を送っていた
+        場合でも、確定した本文として載せるのは CLI が最後に返した `text` の方とする。
+        """
+
+        events = (
+            self._close_answer(text)
+            if self._answer_index is not None
+            else self._message_events(self.item_id, text, "final_answer")
+        )
+        return events + [
             self._event("response.completed", response=self._response("completed", text))
         ]
+
+    def _open_answer(self) -> list[tuple[str, dict]]:
+        """最終回答のアイテムを開く。以降の増分は同じアイテムへ積む。"""
+
+        self._answer_index = self._next_index()
+        return [
+            self._event(
+                "response.output_item.added",
+                output_index=self._answer_index,
+                item=self._item(None, self.item_id, "final_answer"),
+            ),
+            self._event("response.content_part.added", **self._answer_place(), part=_text_part("")),
+        ]
+
+    def _close_answer(self, text: str) -> list[tuple[str, dict]]:
+        """増分で送った最終回答を、確定した本文で閉じる。"""
+
+        place = self._answer_place()
+        return [
+            self._event("response.output_text.done", **place, text=text),
+            self._event("response.content_part.done", **place, part=_text_part(text)),
+            self._event(
+                "response.output_item.done",
+                output_index=self._answer_index,
+                item=self._item(text, self.item_id, "final_answer"),
+            ),
+        ]
+
+    def _answer_place(self) -> dict:
+        return {"item_id": self.item_id, "output_index": self._answer_index, "content_index": 0}
 
     def _message_events(
         self, item_id: str, text: str, phase: str

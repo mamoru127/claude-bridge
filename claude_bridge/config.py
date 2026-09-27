@@ -10,13 +10,19 @@ from urllib.parse import urlsplit
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 DEFAULT_CLAUDE_PATH = "claude"
-DEFAULT_MODEL = "opus"
+DEFAULT_MODEL = "claude-opus-5-5"
 # ツールを何度も使う長い作業では 10 分では足りない。Codex 側の待機上限（60 分）に合わせる。
 DEFAULT_TIMEOUT_SECONDS = 3600.0
-# 画像は data URL の base64 で送られてくるため、本文はテキストだけの頃より桁違いに大きくなる。
-# 実測では全画面スクリーンショット 1 枚で約 5MB あり、会話履歴として毎回送り直される。
-# 32MB は Claude API 側のリクエスト上限でもあるので、これ以上受け取っても CLI 実行で失敗する。
+# CLI へ 1 回で渡す入力の上限。32MB は Claude API 側のリクエスト上限で、これを超える分を
+# 渡しても CLI 実行で失敗する。リクエスト全体ではなく、組み立てた入力そのもの（続きのターン
+# では差分の発言と system プロンプト、ツール結果の画像は parse の時点で落としたあと）に
+# 対して判定する。CLI が最終的に API へ送る本文には転記やツール定義も載るため、この上限は
+# その本文の予測ではなく、渡す側で掛ける歯止めとして扱う。
 DEFAULT_MAX_REQUEST_BYTES = 32 * 1024 * 1024
+# ブリッジが受信するリクエスト本文の上限。OpenAI の画像入力はリクエスト全体で 512MB まで
+# 受け付ける。Codex は会話履歴を毎ターン丸ごと送り直すため、ローカルの CLI で実行する
+# リクエストもこの上限で受け取る。
+DEFAULT_MAX_UPSTREAM_REQUEST_BYTES = 512 * 1024 * 1024
 # 常駐 app-server の制御ソケット。`codex app-server --listen unix://` が作る既定の場所で、
 # Codex アプリも同じ場所へ繋ぐ。両者が 1 つの app-server を共有すると、
 # ブリッジが始めたターンの実行中表示がアプリ側にも出る。
@@ -29,36 +35,35 @@ DEFAULT_UPSTREAM_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 # API で受け付けるモデル名。GET /v1/models に載り、中継が有効ならこれ以外は上流へ中継する。
 # ここに載せた名前はそのまま CLI の --model へ渡すため、Claude CLI が解釈できる名前
-# （`opus` などの別名、または `claude-opus-5` のような正式名）だけを並べる。
+# （`opus` などの別名、または `claude-opus-5-5` のような正式名）だけを並べる。
 # 上流に実在するモデル名を選ぶと、その名前が上流一覧から除かれてアプリで選べなくなる。
-DEFAULT_CLAUDE_MODELS = ("claude-opus-5", "claude-fable-5")
+DEFAULT_CLAUDE_MODELS = ("claude-opus-5-5", "claude-fable-5-1")
+
+# Antigravity CLI（`agy`）の実行ファイル。未インストールなら該当モデルの実行時だけ失敗する。
+DEFAULT_ANTIGRAVITY_PATH = "agy"
+# Antigravity CLI が受け付けるモデル名。思考の強さは名前の high / medium で決まるため、
+# ブリッジ側で effort を渡し分けることはしない。ここに載せた名前をそのまま --model へ渡す。
+DEFAULT_ANTIGRAVITY_MODELS = ("gemini-3.8-flash-high", "gemini-3.8-flash-medium")
+
+# モデル名から決まる実行先。空文字は「ローカルの CLI では処理せず上流へ中継する」を表す。
+CLAUDE_BACKEND = "claude"
+ANTIGRAVITY_BACKEND = "antigravity"
+UPSTREAM_BACKEND = ""
 
 # --mcp-config で登録する MCP サーバー名。ツール名は mcp__<この名前>__<tool> になる。
 MCP_SERVER_NAME = "codex_app_server"
 # Codex から届いたツールを Claude へ見せるための MCP サーバー名。定義はリクエストごとに変わる。
 PASSTHROUGH_SERVER_NAME = "codex_native"
 
-# Codex へ受け渡すツール名。Codex が送ってきたものだけが対象で、定義（スキーマ）も Codex 由来。
-# 既定はスレッド操作に限る。create_thread が作るのは利用者所有のスレッドで、Codex アプリの
-# 一覧に並ぶため、スマホから進捗を追える。spawn_agent が作るサブエージェントは
-# thread_source=subagent となって一覧に出ないため、受け渡さない。
-# Claude 自身が持つ Bash や Read を置き換えないため、全件は通さない。
-DEFAULT_PASSTHROUGH_TOOLS = (
-    "create_thread",
-    "fork_thread",
-    "list_projects",
-    "list_threads",
-    "read_thread",
-    "send_message_to_thread",
-    "set_thread_title",
-)
+# Codex から届いた function ツールを Claude へ受け渡す。定義と実行権限の正本は
+# あくまで親 Codex であり、ブリッジ側で MCP 名を二重管理しない。"*" は、親がその
+# リクエストで提示した全 function と tool_search を意味する。custom など引数スキーマを
+# MCP へ写せない種類は responses 側で構造的に除外する。
+DEFAULT_PASSTHROUGH_TOOLS = ("*",)
 
-# スレッド操作は deferLoading 付きで登録されており、tool_search を通すまでリクエストへ載らない。
-# tool_search はブリッジが自分で 1 回投げる。Claude へ見せても、結果が次のターンになる分だけ
-# 往復が伸びるだけで、探す語は毎回同じだからである。
-# キーワードで探すと順位の上位しか返らず、DEFAULT_PASSTHROUGH_TOOLS に書いても届かないものが
-# 出る。select: は名前で直接引くため、語順に左右されない。
-DEFAULT_TOOL_SEARCH_QUERY = "select:" + ",".join(DEFAULT_PASSTHROUGH_TOOLS)
+# 特定名のツールだけを設定した運用向けに、ブリッジが先回りして投げる検索語も
+# 残す。既定は Claude 自身が受け渡された tool_search で必要なツールを探すため空。
+DEFAULT_TOOL_SEARCH_QUERY = ""
 
 # 検索が返す件数の上限。既定のままだと DEFAULT_PASSTHROUGH_TOOLS より少なく打ち切られる。
 TOOL_SEARCH_LIMIT = 20
@@ -96,9 +101,11 @@ class BridgeConfig:
     port: int = DEFAULT_PORT
     api_key: str | None = None
     claude_path: str = DEFAULT_CLAUDE_PATH
+    antigravity_path: str = DEFAULT_ANTIGRAVITY_PATH
     model: str = DEFAULT_MODEL
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES
+    max_upstream_request_bytes: int = DEFAULT_MAX_UPSTREAM_REQUEST_BYTES
     working_dir: str = "."
     # working_dir の外で Claude CLI にツール操作を許可する追加ディレクトリ。
     add_dirs: tuple[str, ...] = ()
@@ -110,7 +117,9 @@ class BridgeConfig:
     # 空文字なら中継しない（全モデルを Claude CLI で処理する）。
     upstream_base_url: str = ""
     claude_models: tuple[str, ...] = DEFAULT_CLAUDE_MODELS
-    # Codex から届いたツールのうち、Claude へ見せて Codex へ返すもの。空なら受け渡さない。
+    # Antigravity CLI が受け持つモデル名。空にすると Antigravity は一切公開されない。
+    antigravity_models: tuple[str, ...] = DEFAULT_ANTIGRAVITY_MODELS
+    # Codex から届いたツールのうち、Claude へ見せて Codex へ返すもの。"*" は全件、空なら無効。
     passthrough_tools: tuple[str, ...] = DEFAULT_PASSTHROUGH_TOOLS
     # 遅延読み込みのツールを引き出すためにブリッジが投げる検索語。空なら投げない。
     tool_search_query: str = DEFAULT_TOOL_SEARCH_QUERY
@@ -133,19 +142,34 @@ class BridgeConfig:
         except ValueError:
             return False
 
-    def routes_to_claude(self, model: str) -> bool:
-        """このモデルを Claude CLI で処理するか。中継が無効なら全モデルが対象。"""
+    @property
+    def cli_models(self) -> tuple[str, ...]:
+        """ローカルの CLI で処理するモデル名。GET /v1/models へ載せる一覧そのもの。"""
 
-        return not self.upstream_base_url or model in self.claude_models
+        return self.claude_models + self.antigravity_models
+
+    def backend(self, model: str) -> str:
+        """このモデルを実行する CLI。中継しない場合は空文字を返す。
+
+        一覧に載せていない名前は、中継が有効なら上流へ、無効なら Claude CLI が受け持つ。
+        Antigravity CLI は明示的に割り当てた名前だけを処理する（`agy` は Claude CLI の
+        別名を解釈できないため、既定の受け皿にはできない）。
+        """
+
+        if model in self.antigravity_models:
+            return ANTIGRAVITY_BACKEND
+        if model in self.claude_models or not self.upstream_base_url:
+            return CLAUDE_BACKEND
+        return UPSTREAM_BACKEND
 
     def cli_model(self, model: str) -> str:
         """リクエストのモデル名に対して CLI の --model へ渡す実行モデル名を返す。
 
-        渡してよいのは起動時に `--claude-models` で許可した名前だけ。中継が無効なときは
-        一覧にない名前でも Claude CLI へ回るため、そこは起動時の `--model` で実行する。
+        渡してよいのは起動時に許可した名前だけ。中継が無効なときは一覧にない名前でも
+        Claude CLI へ回るため、そこは起動時の `--model` で実行する。
         """
 
-        return model if model in self.claude_models else self.model
+        return model if model in self.cli_models else self.model
 
 
 def _env_str(env: dict, name: str, default: str) -> str:
@@ -217,6 +241,11 @@ def build_config(argv: list[str] | None = None, env: dict | None = None) -> Brid
         "--claude-path",
         default=_env_str(env, "CLAUDE_BRIDGE_CLAUDE_PATH", DEFAULT_CLAUDE_PATH),
     )
+    parser.add_argument(
+        "--antigravity-path",
+        default=_env_str(env, "CLAUDE_BRIDGE_ANTIGRAVITY_PATH", DEFAULT_ANTIGRAVITY_PATH),
+        help="Antigravity CLI（agy）の実行ファイルパス",
+    )
     parser.add_argument("--model", default=_env_str(env, "CLAUDE_BRIDGE_MODEL", DEFAULT_MODEL))
     parser.add_argument(
         "--timeout",
@@ -228,6 +257,17 @@ def build_config(argv: list[str] | None = None, env: dict | None = None) -> Brid
         type=int,
         default=int(
             _env_number(env, "CLAUDE_BRIDGE_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES)
+        ),
+    )
+    parser.add_argument(
+        "--max-upstream-request-bytes",
+        type=int,
+        default=int(
+            _env_number(
+                env,
+                "CLAUDE_BRIDGE_MAX_UPSTREAM_REQUEST_BYTES",
+                DEFAULT_MAX_UPSTREAM_REQUEST_BYTES,
+            )
         ),
     )
     parser.add_argument(
@@ -253,7 +293,17 @@ def build_config(argv: list[str] | None = None, env: dict | None = None) -> Brid
         default=_env_str(
             env, "CLAUDE_BRIDGE_CLAUDE_MODELS", ",".join(DEFAULT_CLAUDE_MODELS)
         ),
-        help="Claude CLI で処理するモデル名のカンマ区切り。GET /v1/models が返す一覧そのもの",
+        help="Claude CLI で処理するモデル名のカンマ区切り。GET /v1/models が返す一覧に載る",
+    )
+    parser.add_argument(
+        "--antigravity-models",
+        default=_env_str(
+            env, "CLAUDE_BRIDGE_ANTIGRAVITY_MODELS", ",".join(DEFAULT_ANTIGRAVITY_MODELS)
+        ),
+        help=(
+            "Antigravity CLI で処理するモデル名のカンマ区切り。GET /v1/models が返す一覧に載る。"
+            "空文字で無効"
+        ),
     )
     parser.add_argument(
         "--enable-codex-mcp",
@@ -280,7 +330,7 @@ def build_config(argv: list[str] | None = None, env: dict | None = None) -> Brid
         ),
         help=(
             "Codex から届いたツールのうち Claude へ見せる名前のカンマ区切り。"
-            "呼び出しは Codex 側で実行される。空文字で無効"
+            "* は全 function と tool_search。呼び出しは Codex 側で実行される。空文字で無効"
         ),
     )
     parser.add_argument(
@@ -301,9 +351,11 @@ def build_config(argv: list[str] | None = None, env: dict | None = None) -> Brid
         port=args.port,
         api_key=env.get("CLAUDE_BRIDGE_API_KEY") or None,
         claude_path=args.claude_path,
+        antigravity_path=args.antigravity_path,
         model=args.model,
         timeout_seconds=args.timeout,
         max_request_bytes=args.max_request_bytes,
+        max_upstream_request_bytes=args.max_upstream_request_bytes,
         working_dir=_abs_path(args.working_dir),
         add_dirs=tuple(_abs_path(path) for path in add_dirs),
         codex_mcp=args.enable_codex_mcp,
@@ -311,6 +363,7 @@ def build_config(argv: list[str] | None = None, env: dict | None = None) -> Brid
         extra_mcp_servers=_load_mcp_servers(args.mcp_config_file),
         upstream_base_url=args.upstream_base_url.rstrip("/"),
         claude_models=tuple(_split(args.claude_models, ",")),
+        antigravity_models=tuple(_split(args.antigravity_models, ",")),
         passthrough_tools=tuple(_split(args.passthrough_tools, ",")),
         tool_search_query=args.tool_search_query.strip(),
     )
@@ -327,8 +380,17 @@ def validate_config(config: BridgeConfig) -> None:
         if not os.path.isdir(directory):
             raise ValueError(f"追加ディレクトリが存在しません: {directory}")
     # 空だと GET /v1/models が空になり、クライアントからモデルを選べなくなる。
+    # model 省略時の既定にも使うため、Antigravity だけを公開する構成は取れない。
     if not config.claude_models:
         raise ValueError("Claude で処理するモデル名を 1 つ以上指定してください")
+    # 同じ名前が両方にあると、どちらの CLI で実行するかが名前から決まらなくなる。
+    overlap = set(config.claude_models) & set(config.antigravity_models)
+    if overlap:
+        raise ValueError(
+            f"同じモデル名を Claude と Antigravity の両方へ割り当てられません: {','.join(sorted(overlap))}"
+        )
+    if config.antigravity_models and not config.antigravity_path:
+        raise ValueError("Antigravity のモデルを公開する場合は実行ファイルパスが必要です")
     if config.upstream_base_url:
         upstream = urlsplit(config.upstream_base_url)
         if upstream.scheme not in ("http", "https") or not upstream.netloc:
@@ -340,6 +402,8 @@ def validate_config(config: BridgeConfig) -> None:
         raise ValueError("タイムアウトは正の秒数で指定してください")
     if config.max_request_bytes <= 0:
         raise ValueError("リクエストの上限サイズは正の値で指定してください")
+    if config.max_upstream_request_bytes <= 0:
+        raise ValueError("上流中継リクエストの上限サイズは正の値で指定してください")
     if not config.is_loopback() and not config.api_key:
         raise ValueError(
             "ループバック以外へ bind する場合は CLAUDE_BRIDGE_API_KEY の設定が必要です"

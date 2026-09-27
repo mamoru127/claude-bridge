@@ -1,5 +1,10 @@
 __pycache__/
 *.pyc
+.venv/
+.claude/
+.ruff_cache/
+.tripo/
+Artifacts/
 .ruff_cache/
 .venv/
 .claude/

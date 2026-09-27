@@ -4,22 +4,47 @@
 set -euo pipefail
 
 label="local.claude-bridge"
-launchd_dir="$(cd "$(dirname "$0")" && pwd)"
-source_plist="$launchd_dir/$label.plist"
+source_dir="$(cd "$(dirname "$0")" && pwd)"
+source_plist="$source_dir/$label.plist"
+working_dir="$(cd "$source_dir/.." && pwd)"
+python_bin="${CLAUDE_BRIDGE_PYTHON:-$(command -v python3)}"
 installed_plist="$HOME/Library/LaunchAgents/$label.plist"
 domain="gui/$(id -u)"
 health_url="http://127.0.0.1:8787/health"
+log_dir="$HOME/Library/Logs/claude-bridge"
 
-# plist のパスは環境ごとに違うため、登録時に埋める。
-# 仮想環境の python を使う場合は CLAUDE_BRIDGE_PYTHON で指定する。
-working_dir="$(cd "$launchd_dir/.." && pwd)"
-python_bin="${CLAUDE_BRIDGE_PYTHON:-$(command -v python3)}"
-if [ ! -x "$python_bin" ]; then
-  echo "python が見つかりません。CLAUDE_BRIDGE_PYTHON で絶対パスを指定してください。" >&2
-  exit 1
+# 自分がブリッジの子孫（ブリッジ経由で動く Claude CLI のシェル）かどうか。
+# bootout はブリッジのプロセスグループごと SIGKILL するため、子孫から直接実行すると
+# bootstrap へ進む前に自分が死に、登録解除だけが残ってブリッジが二度と上がらない。
+running_inside_bridge() {
+  local bridge_pid pid
+  bridge_pid="$(launchctl print "$domain/$label" 2>/dev/null | awk '/^[[:space:]]+pid = /{print $3}')"
+  [ -n "$bridge_pid" ] || return 1
+  pid=$$
+  while [ "$pid" -gt 1 ]; do
+    [ "$pid" = "$bridge_pid" ] && return 0
+    pid="$(ps -o ppid= -p "$pid" | tr -d ' ')"
+    [ -n "$pid" ] || return 1
+  done
+  return 1
+}
+
+mkdir -p "$log_dir" "$HOME/Library/LaunchAgents"
+
+if [ "${1:-}" != "--detached" ] && running_inside_bridge; then
+  # set -m でジョブ制御を有効にすると、& で起動した子が新しいプロセスグループになり、
+  # bootout の巻き添えを免れる。切り離した側が登録を完了させるので、自分は即座に戻る。
+  (set -m; nohup "$0" --detached < /dev/null >> "$log_dir/install.log" 2>&1 &)
+  echo "ブリッジ経由で実行されているため、再起動を切り離しました。この接続は切れ、Codex が約 60 秒後に再接続します。結果: $log_dir/install.log"
+  exit 0
 fi
 
-mkdir -p "$HOME/Library/Logs/claude-bridge" "$HOME/Library/LaunchAgents"
+if [ "${1:-}" = "--detached" ]; then
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') detached reinstall ==="
+  # 呼び出し元が上のメッセージを返し終えるまで待ってから止める。
+  sleep 1
+fi
+
 sed -e "s|__PYTHON_BIN__|$python_bin|g" \
     -e "s|__WORKING_DIR__|$working_dir|g" \
     -e "s|__HOME__|$HOME|g" \
@@ -44,5 +69,5 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
-echo "健康チェックに失敗しました。ログを確認してください: $HOME/Library/Logs/claude-bridge/bridge.log" >&2
+echo "健康チェックに失敗しました。ログを確認してください: $log_dir/bridge.log" >&2
 exit 1

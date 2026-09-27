@@ -1,7 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- install-app-server.sh がこのファイルの __HOME__ を実際の値へ置き換えて
-     ~/Library/LaunchAgents/ へ書き出します。 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -15,10 +13,15 @@
 
        実行ファイルは Codex アプリ内蔵のものを使う。アプリはソケット越しに得た
        app-server のバージョンを見て接続可否を決めるため、アプリと揃える。
-       アプリを更新したらこのサービスも再起動する。 -->
+       また、内蔵ブラウザのmacOS署名確認が peer/parent/grandparent を検査するため、
+       app-server はOpenAI署名済みの同梱Nodeを親にして起動する。
+       アプリ更新による実行ファイルの差し替えは親プロセスが見張り、見つけ次第
+       app-server を落として KeepAlive の再起動で新しい実行ファイルへ入れ替える。 -->
   <key>ProgramArguments</key>
   <array>
-    <string>/Applications/ChatGPT.app/Contents/Resources/codex</string>
+    <string>__CODEX_BUNDLED_NODE__</string>
+    <string>__CODEX_APP_SERVER_PARENT_WRAPPER__</string>
+    <string>__CODEX_BUNDLED_CLI__</string>
     <string>app-server</string>
     <string>--listen</string>
     <string>unix://</string>

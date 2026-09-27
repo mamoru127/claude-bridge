@@ -12,6 +12,7 @@ import urllib.request
 
 from claude_bridge.claude_cli import build_mcp_servers
 from claude_bridge.config import (
+    DEFAULT_PASSTHROUGH_TOOLS,
     PASSTHROUGH_DEFS_ENV,
     PASSTHROUGH_SERVER_NAME,
     PASSTHROUGH_TOKEN_ENV,
@@ -23,7 +24,7 @@ from claude_bridge.passthrough_adapter import (
     load_tools,
     tool_definitions,
 )
-from claude_bridge.responses import parse_request
+from claude_bridge.responses import ResponseStream, parse_request
 from claude_bridge.sessions import PendingCalls
 
 from tests.test_bridge import BridgeHTTPTestCase, FakeRunner, make_config
@@ -45,6 +46,22 @@ CODEX_APP = {
     "tools": [CREATE_THREAD],
 }
 EXEC_COMMAND = {"type": "function", "name": "exec_command", "description": "実行"}
+IMAGEGEN = {
+    "type": "function",
+    "name": "imagegen",
+    "description": "画像を生成する",
+    "parameters": {
+        "type": "object",
+        "properties": {"prompt": {"type": "string"}},
+        "required": ["prompt"],
+    },
+}
+IMAGE_GEN = {
+    "type": "namespace",
+    "name": "image_gen",
+    "description": "画像生成",
+    "tools": [IMAGEGEN],
+}
 TOOL_SEARCH = {"type": "tool_search", "execution": "client", "description": "探索"}
 APPLY_PATCH = {"type": "custom", "name": "apply_patch", "description": "差分適用"}
 # 受け渡し後の create_thread。namespace は parse_request が添える。
@@ -76,6 +93,22 @@ def payload_with(*tools: dict, text: str = "スレッドを作って") -> dict:
 
 
 class ParseToolsTest(unittest.TestCase):
+    def test_default_passthrough_inherits_all_parent_functions(self):
+        self.assertEqual(DEFAULT_PASSTHROUGH_TOOLS, ("*",))
+
+    def test_wildcard_keeps_functions_and_exposes_tool_search(self):
+        request = parse_request(
+            payload_with(EXEC_COMMAND, CODEX_APP, TOOL_SEARCH, APPLY_PATCH),
+            "gpt-5",
+            ["*"],
+        )
+
+        self.assertEqual(
+            [tool["name"] for tool in request.tools],
+            ["exec_command", "create_thread", "tool_search"],
+        )
+        self.assertEqual(request.tools[-1]["passthrough_type"], "tool_search")
+
     def test_reads_tools_from_additional_tools_item(self):
         payload = payload_with(EXEC_COMMAND, CODEX_APP)
 
@@ -87,6 +120,12 @@ class ParseToolsTest(unittest.TestCase):
         request = parse_request(payload_with(CODEX_APP), "gpt-5", ["create_thread"])
 
         self.assertEqual(request.tools[0]["namespace"], "codex_app")
+
+    def test_imagegen_carries_image_gen_namespace(self):
+        request = parse_request(payload_with(IMAGE_GEN), "gpt-5", ["imagegen"])
+
+        self.assertEqual(request.tools[0]["name"], "imagegen")
+        self.assertEqual(request.tools[0]["namespace"], "image_gen")
 
     def test_top_level_function_has_no_namespace(self):
         request = parse_request(payload_with(EXEC_COMMAND), "gpt-5", ["exec_command"])
@@ -215,6 +254,31 @@ class ParseToolsTest(unittest.TestCase):
 
         self.assertIn('"id": 7', request.messages[-1].parts[0])
 
+    def test_image_tool_output_keeps_text_without_base64(self):
+        payload = {
+            "input": [
+                {"type": "message", "role": "user", "content": "画像を作って"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "image_call",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64," + "A" * 100_000,
+                        },
+                        {"type": "input_text", "text": "保存先: /tmp/generated.png"},
+                    ],
+                },
+            ]
+        }
+
+        request = parse_request(payload, "gpt-5")
+        result = request.messages[-1].parts[0]
+
+        self.assertIn("保存先: /tmp/generated.png", result)
+        self.assertNotIn("base64", result)
+        self.assertLess(len(result), 1_000)
+
 
 class McpServerTest(unittest.TestCase):
     def test_registers_passthrough_server_with_definitions(self):
@@ -248,10 +312,16 @@ class FakeEnqueueClient:
         self.raises = raises
         self.calls = []
 
-    def enqueue(self, name: str, arguments: dict, namespace: str | None = None) -> str:
+    def enqueue(
+        self,
+        name: str,
+        arguments: dict,
+        namespace: str | None = None,
+        passthrough_type: str | None = None,
+    ) -> str:
         if self.raises:
             raise self.raises
-        self.calls.append((name, arguments, namespace))
+        self.calls.append((name, arguments, namespace, passthrough_type))
         return self.call_id
 
 
@@ -286,7 +356,9 @@ class AdapterTest(unittest.TestCase):
             client,
         )
 
-        self.assertEqual(client.calls, [("create_thread", {"prompt": "やって"}, "codex_app")])
+        self.assertEqual(
+            client.calls, [("create_thread", {"prompt": "やって"}, "codex_app", None)]
+        )
         self.assertIn("call_7", response["result"]["content"][0]["text"])
         self.assertFalse(response["result"]["isError"])
 
@@ -297,7 +369,24 @@ class AdapterTest(unittest.TestCase):
             {"id": 1, "method": "tools/call", "params": {"name": "exec_command"}}
         )
 
-        self.assertEqual(client.calls, [("exec_command", {}, None)])
+        self.assertEqual(client.calls, [("exec_command", {}, None, None)])
+
+    def test_tool_search_keeps_its_passthrough_type(self):
+        client = FakeEnqueueClient()
+        tool = parse_request(payload_with(TOOL_SEARCH), "gpt-5", ["*"]).tools[0]
+
+        build_handler([tool], client)(
+            {
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "tool_search", "arguments": {"query": "Unity scene"}},
+            }
+        )
+
+        self.assertEqual(
+            client.calls,
+            [("tool_search", {"query": "Unity scene"}, None, "tool_search")],
+        )
 
     def test_unknown_tool_is_reported_as_error(self):
         response = self.handle({"id": 1, "method": "tools/call", "params": {"name": "nope"}})
@@ -338,6 +427,14 @@ class PendingCallsTest(unittest.TestCase):
 
         self.assertNotIn("namespace", pending.close(token)[0])
 
+    def test_call_keeps_passthrough_type(self):
+        pending = PendingCalls()
+        token = pending.open()
+
+        pending.add(token, "tool_search", {"query": "Blender scene"}, passthrough_type="tool_search")
+
+        self.assertEqual(pending.close(token)[0]["passthrough_type"], "tool_search")
+
     def test_add_after_close_is_rejected(self):
         pending = PendingCalls()
         token = pending.open()
@@ -346,6 +443,26 @@ class PendingCallsTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             pending.add(token, "create_thread", {})
 
+
+class ResponseStreamToolSearchTest(unittest.TestCase):
+    def test_passthrough_tool_search_becomes_native_search_call(self):
+        stream = ResponseStream("claude-fable-5-1")
+
+        events = stream.function_calls(
+            [
+                {
+                    "call_id": "call_search",
+                    "name": "tool_search",
+                    "arguments": {"query": "Unity scene", "limit": 7},
+                    "passthrough_type": "tool_search",
+                }
+            ]
+        )
+
+        item = events[0][1]["item"]
+        self.assertEqual(item["type"], "tool_search_call")
+        self.assertEqual(item["call_id"], "call_search")
+        self.assertEqual(item["arguments"], {"query": "Unity scene", "limit": 7})
 
 class CallingRunner(FakeRunner):
     """Claude が受け渡しツールを 1 回呼ぶ様子を再現するランナー。"""

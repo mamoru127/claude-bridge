@@ -26,42 +26,61 @@ _LIMIT = {"type": "integer", "description": "取得件数の上限"}
 _CURSOR = {"type": "string", "description": "前回の応答が返したページングカーソル"}
 _SORT_DIRECTION = {"type": "string", "enum": ["asc", "desc"], "description": "並び順"}
 _THREAD_ID = {"type": "string", "description": "スレッド ID"}
-_FULL_ACCESS_SANDBOX = "danger-full-access"
-_FULL_ACCESS_SANDBOX_POLICY = {"type": "dangerFullAccess"}
-_NO_APPROVAL_POLICY = "never"
-_DEFAULT_MODEL_PROVIDER = "openai"
+_THREAD_START_PROPERTIES = {
+    "cwd": {"type": "string", "description": "スレッドの作業ディレクトリ"},
+    "model": {"type": "string", "description": "使用するモデル名"},
+    "modelProvider": {
+        "type": "string",
+        "description": (
+            "使用するモデルプロバイダ名。通常は指定しない。"
+            "ブリッジはモデル名で振り分け、Claude 以外は上流へそのまま中継するため、"
+            "既定の claude_bridge のままでも指定したモデルで動く。"
+        ),
+    },
+    "ephemeral": {"type": "boolean", "description": "履歴を残さないスレッドにするか"},
+}
 
-# 公開する RPC。読み取り系に加えて、スレッド作成とターン実行を公開する。
-# app-server 経由で作ったスレッドは Codex アプリの一覧に載る（codex exec のセッションは載らない）。
+# 公開する RPC。読み取り系に加えて、スレッド作成、名前付け、ターン実行を公開する。
+# アプリ側の create_thread は thread_tools フィーチャーゲートが無効な間は呼べないため、
+# 別タスクを起こす経路はこちらになる。cwd が保存済みプロジェクトと一致するスレッドは、
+# 最初のターンを開始するとアプリのそのプロジェクト配下に表示される。
 # turn_start は外部サービスを呼び、指示すればさらに入れ子のターンも作れる点に注意。
 # thread/items/list は app-server 側が未実装（is not supported yet）なので公開しない。
 # 項目の中身は thread_read の includeTurns で読む。
 TOOLS = (
     {
         "name": "create_thread",
-        "method": None,
+        "create": True,
         "description": (
-            "Codex app-server にフルアクセス・承認不要の新しいスレッドを作成し、"
-            "名前を設定して最初のターンを非同期で開始する。"
+            "Codex app-server へスレッド作成、表示名設定、最初のターン開始を順に送り、"
+            "Codex アプリの別タスクを作成する。ターンの完了は待たない。cwd が保存済み"
+            "プロジェクトと一致すれば、そのプロジェクト配下にタスクが表示される。"
         ),
         "required": ["cwd", "title", "prompt"],
         "properties": {
-            "cwd": {"type": "string", "description": "スレッドの作業ディレクトリ"},
-            "title": {"type": "string", "description": "スレッド名"},
-            "prompt": {"type": "string", "description": "最初のユーザーメッセージ"},
-            "model": {"type": "string", "description": "使用するモデル名"},
-            "modelProvider": {"type": "string", "description": "使用するモデルプロバイダ名"},
+            **_THREAD_START_PROPERTIES,
+            "title": {"type": "string", "description": "タスク一覧に表示する名前"},
+            "prompt": {"type": "string", "description": "最初に送るユーザーメッセージ"},
         },
     },
     {
         "name": "thread_start",
         "method": "thread/start",
-        "description": "Codex app-server に新しいスレッドを作成する。ターンは開始しない。",
+        "description": (
+            "Codex app-server に新しいスレッドを作成する。ターンは開始しない。"
+            "名前も空のままなので、"
+            "作成直後に thread_name_set で名前を付け、turn_start_async で最初の指示を送る。"
+        ),
+        "properties": _THREAD_START_PROPERTIES,
+    },
+    {
+        "name": "thread_name_set",
+        "method": "thread/name/set",
+        "description": "スレッドの表示名を設定する。",
+        "required": ["threadId", "name"],
         "properties": {
-            "cwd": {"type": "string", "description": "スレッドの作業ディレクトリ"},
-            "model": {"type": "string", "description": "使用するモデル名"},
-            "modelProvider": {"type": "string", "description": "使用するモデルプロバイダ名"},
-            "ephemeral": {"type": "boolean", "description": "履歴を残さないスレッドにするか"},
+            "threadId": _THREAD_ID,
+            "name": {"type": "string", "description": "一覧に表示する名前"},
         },
     },
     {
@@ -247,7 +266,7 @@ def _call_tool(request_id: object, params: object, client: BridgeRpcClient) -> d
         return _result(request_id, _content("arguments はオブジェクトで指定してください", True))
 
     try:
-        if tool["name"] == "create_thread":
+        if tool.get("create"):
             result = _create_thread(client, arguments)
         elif tool.get("turn"):
             result = client.call(tool["method"], _turn_params(arguments), wait=tool["wait"])
@@ -260,32 +279,21 @@ def _call_tool(request_id: object, params: object, client: BridgeRpcClient) -> d
 
 
 def _create_thread(client: BridgeRpcClient, arguments: dict) -> dict:
-    """権限を明示してスレッド作成、命名、最初のターン開始を直列実行する。"""
+    """スレッド作成、命名、最初のターン開始を一つのツール呼び出しで行う。"""
 
     start_params = {
-        "cwd": arguments.get("cwd"),
-        "sandbox": _FULL_ACCESS_SANDBOX,
-        "approvalPolicy": _NO_APPROVAL_POLICY,
+        key: value for key, value in arguments.items() if key in _THREAD_START_PROPERTIES
     }
-    if arguments.get("model") is not None:
-        start_params["model"] = arguments["model"]
-    start_params["modelProvider"] = arguments.get("modelProvider") or _DEFAULT_MODEL_PROVIDER
-
     started = client.call("thread/start", start_params)
     thread = started.get("thread") if isinstance(started, dict) else None
     thread_id = thread.get("id") if isinstance(thread, dict) else None
-    if not thread_id:
+    if not isinstance(thread_id, str) or not thread_id:
         raise AppServerError("thread/start の応答に thread.id がありません")
 
     client.call("thread/name/set", {"threadId": thread_id, "name": arguments.get("title")})
     turn = client.call(
         "turn/start",
-        {
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": arguments.get("prompt")}],
-            "sandboxPolicy": _FULL_ACCESS_SANDBOX_POLICY,
-            "approvalPolicy": _NO_APPROVAL_POLICY,
-        },
+        _turn_params({"threadId": thread_id, "text": arguments.get("prompt")}),
         wait=False,
     )
     return {"threadId": thread_id, "turn": turn.get("turn") if isinstance(turn, dict) else turn}

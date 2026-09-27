@@ -10,10 +10,14 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+from .antigravity_cli import stream_antigravity, validate_prompt_argument
 from .app_server import TURN_METHOD, AppServerClient, AppServerError
-from .claude_cli import run_claude, stream_claude
+from .claude_cli import input_line, stream_claude
+from .cli_process import final_text
 from .config import (
+    ANTIGRAVITY_BACKEND,
     APP_SERVER_PATH,
+    CLAUDE_BACKEND,
     HEALTH_PATH,
     IMAGE_PATHS,
     MODELS_PATH,
@@ -25,7 +29,10 @@ from .errors import BridgeError
 from .responses import (
     ParsedRequest,
     ResponseStream,
+    build_content,
     build_models,
+    build_prompt,
+    ensure_text_only,
     parse_request,
     requested_model,
 )
@@ -36,6 +43,7 @@ from .upstream import (
     open_upstream,
     request_headers,
     response_headers,
+    responses_body,
 )
 
 logger = logging.getLogger("claude_bridge")
@@ -162,33 +170,45 @@ class BridgeHandler(BaseHTTPRequestHandler):
             payload = self._decode_json(body)
             # model 省略時の既定。config.model は CLI へ渡す実行モデル名なので使わない。
             default_model = config.claude_models[0]
-            if not config.routes_to_claude(requested_model(payload, default_model)):
-                self._relay(config, body)
+            backend = config.backend(requested_model(payload, default_model))
+            if not backend:
+                self._relay(config, responses_body(payload, body))
                 return
+            # Antigravity の headless 契約にはリクエスト単位のツール登録の口がないため、
+            # Codex のツール受け渡しと tool_search は Claude のときだけ有効にする。
+            claude = backend == CLAUDE_BACKEND
             request = parse_request(
                 payload,
                 default_model,
-                config.passthrough_tools,
-                config.tool_search_query,
+                config.passthrough_tools if claude else (),
+                config.tool_search_query if claude else "",
             )
             # アプリが選んだモデルで実行する。CLI へ届くのは一覧に載せた名前だけ。
             config = replace(config, model=config.cli_model(request.model))
+            # 実行できない入力は、会話の状態を触る前に弾く。この後の acquire は相手の
+            # いなくなった実行を止めて会話を引き継ぐため、ここを通さないと、実行できない
+            # 入力のために同じ会話の中断済みターンまで落としてしまう。
+            if not request.tool_search_query:
+                self._validate_minimum_cli_input(config, request, backend)
         except BridgeError as error:
             self._send_error(error)
             return
 
-        # 同じ会話は 1 リクエストずつ実行する。先行するリクエストがあれば止めて引き継ぐ。
-        # 検索だけのターンも同じ会話の 1 回なので、先行する実行を残したまま返さない。
-        session = self.server.sessions.acquire(request.session_key)
+        # 同じ会話は 1 リクエストずつ実行する。相手の消えた実行は止めて引き継ぎ、相手が
+        # 残っている実行の隣へ届いたリクエストは、その場限りのセッションで並行して走らせる。
+        # 生死を見るため、今回の接続を渡す。
+        # 検索だけのターンも同じ会話の 1 回として借りる。並行して届いた場合は、他と同じく
+        # その場限りのセッションを受け取り、先行する実行を残したまま検索結果だけ返す。
+        session = self.server.sessions.acquire(request.session_key, self.connection)
         try:
             # 遅延読み込みのツールは、tool_search を 1 回通さないとリクエストへ載らない。
             # Claude を動かす前に検索だけ返し、ツールが揃った次のリクエストで本題へ進む。
             if request.tool_search_query:
                 self._send_tool_search(request)
             elif request.stream:
-                self._send_stream(config, request, session)
+                self._send_stream(config, request, session, backend)
             else:
-                self._send_once(config, request, session)
+                self._send_once(config, request, session, backend)
         finally:
             self.server.sessions.release(session)
 
@@ -239,9 +259,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
         namespace = payload.get("namespace")
         if namespace is not None and not isinstance(namespace, str):
             raise self._invalid_rpc("namespace は文字列で指定してください")
+        passthrough_type = payload.get("passthrough_type")
+        if passthrough_type not in (None, "tool_search"):
+            raise self._invalid_rpc("passthrough_type が不正です")
         try:
             call_id = self.server.pending.add(
-                str(payload.get("token")), name, arguments, namespace
+                str(payload.get("token")),
+                name,
+                arguments,
+                namespace,
+                passthrough_type,
             )
         except KeyError as error:
             # 終わったターンの預かり口へ届いた呼び出し。記録しても渡す先がない。
@@ -292,26 +319,99 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             logger.info("stream aborted by client")
 
-    def _send_once(self, config: BridgeConfig, request: ParsedRequest, session) -> None:
+    def _cli_events(
+        self, config: BridgeConfig, request: ParsedRequest, session, backend: str, token: str
+    ):
+        """モデルに割り当てられた CLI を起動し、共通の (種別, 本文) 列として返す。
+
+        会話の続き具合はどちらの CLI でも同じ規則で決まるため、渡す発言の絞り込みは
+        セッション側で共通に行い、CLI ごとの入力の形だけをここで作り分ける。
+        """
+
+        if backend == ANTIGRAVITY_BACKEND:
+            # 実行できない入力は、会話の状態を触る前に弾く。prepare は続き具合を確定させる
+            # ため、後から失敗すると同じスレッドの Claude 側の会話まで開始し直しになる。
+            # 実際に渡すのは全履歴の部分集合なので、ここで確かめれば組み立てでも通る。
+            ensure_text_only(request.messages)
+        messages = session.prepare(request.messages, backend)
+        # 上限は CLI へ渡す分にだけかける。続きのターンでは差分の発言しか渡さないため、
+        # 履歴に積み上がった画像でリクエストが膨らんでも実行は妨げない。判定には渡す本体を
+        # そのまま使う。別に見積もると、JSON の枠や毎ターン渡し直す system プロンプトが
+        # 抜けて上限を素通りする。
+        payload, size = self._cli_input(messages, request.system_prompt, backend)
+        self._validate_body_size(size, config.max_request_bytes, "CLI へ渡す入力")
+        if backend == ANTIGRAVITY_BACKEND:
+            return stream_antigravity(config, payload, session, self.server.runner)
+        return stream_claude(
+            config,
+            payload,
+            request.system_prompt,
+            session,
+            self.server.runner,
+            request.tools,
+            token,
+        )
+
+    def _cli_input(self, messages, system_prompt: str | None, backend: str):
+        """CLI へ渡す入力と、その大きさ。上限の判定と実行で同じ組み立てを使う。"""
+
+        if backend == ANTIGRAVITY_BACKEND:
+            prompt = build_prompt(messages, system_prompt)
+            return prompt, len(prompt.encode("utf-8"))
+        content = build_content(messages)
+        size = len(input_line(content)) + len((system_prompt or "").encode("utf-8"))
+        return content, size
+
+    def _validate_minimum_cli_input(
+        self, config: BridgeConfig, request: ParsedRequest, backend: str
+    ) -> None:
+        """続き具合によらず必ず上限を超える入力を、会話の状態を触る前に弾く。
+
+        CLI へ渡す発言はセッションが決めるため、渡す本体の大きさはセッションを借りてからで
+        ないと出せない。ただしどの決まり方でも、履歴の最後の発言か最後のユーザー発言の
+        どちらかは必ず渡る（続きにできなければ全履歴、続きなら未送のユーザー発言、
+        それが空なら最後の発言）。その小さい方だけで上限を超えるなら、続き具合がどうでも
+        実行は成立しないため、ここで弾いてよい。実際に渡す本体はこれ以上に大きくなるので、
+        通るはずの入力をここで落とすことはない。
+
+        これがセッションを借りずに判定できる限界でもある。未送の発言をすべて足した
+        大きさで判定できれば取りこぼしはなくなるが、その範囲は `_sent` を読まないと
+        決まらず、`_sent` は実行中のターンが confirm で動かす。借りずに読むと、確定前の
+        古い値から実際より大きい入力を数えて、通るはずのリクエストを 413 にする。
+        それは履歴の画像で誤って 413 を返していた以前の判定へ戻ることになる。
+
+        そのため、1 通ずつは収まるのに未送ぶんの合計で超える入力は、セッションを借りた
+        あとの判定まで残る。この場合も、`SessionRegistry.acquire` が落とすのは相手の消えた
+        実行だけなので、動いているターンを巻き添えにすることはない。
+        """
+
+        candidates = [request.messages[-1:]]
+        user_messages = tuple(m for m in request.messages if m.role == "user")
+        if user_messages:
+            candidates.append(user_messages[-1:])
+        smallest_input, smallest_size = min(
+            (self._cli_input(candidate, request.system_prompt, backend) for candidate in candidates),
+            key=lambda item: item[1],
+        )
+        self._validate_body_size(smallest_size, config.max_request_bytes, "CLI へ渡す入力")
+        if backend == ANTIGRAVITY_BACKEND:
+            validate_prompt_argument(smallest_input)
+
+    def _send_once(
+        self, config: BridgeConfig, request: ParsedRequest, session, backend: str
+    ) -> None:
         token = self._open_pending(request)
         try:
             try:
-                content = session.prepare(request.messages)
-                text = run_claude(
-                    config,
-                    content,
-                    request.system_prompt,
-                    session,
-                    self.server.runner,
-                    request.tools,
-                    token,
+                text = final_text(
+                    self._cli_events(config, request, session, backend, token)
                 )
             except BridgeError as error:
                 self._send_error(error)
                 return
             stream = ResponseStream(request.model)
             stream.function_calls(self.server.pending.close(token))
-            self._log_completed(config, request, session, text)
+            self._log_completed(config, request, session, backend, text)
             self._send_json(200, stream.final_response(text))
         finally:
             # 失敗や切断で渡しそびれた預かり口を残さない。渡し済みなら何も起きない。
@@ -322,11 +422,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         return self.server.pending.open() if request.tools else ""
 
-    def _send_stream(self, config: BridgeConfig, request: ParsedRequest, session) -> None:
+    def _send_stream(
+        self, config: BridgeConfig, request: ParsedRequest, session, backend: str
+    ) -> None:
         """SSE で返す。
 
         CLI の思考とツール使用を reasoning、作業の区切りで書く本文と最終テキストを message
-        として送る。本文はいずれも 1 個の delta で送り切る。
+        として送る。最終テキストの増分を出せる CLI はその増分を、出せない CLI は完了時に
+        全文を 1 個の delta で送り切る。
         """
 
         stream = ResponseStream(request.model)
@@ -339,20 +442,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 alive.write(sse(stream.started()))
                 text = ""
                 try:
-                    content = session.prepare(request.messages)
-                    for kind, value in stream_claude(
-                        config,
-                        content,
-                        request.system_prompt,
-                        session,
-                        self.server.runner,
-                        request.tools,
-                        token,
+                    for kind, value in self._cli_events(
+                        config, request, session, backend, token
                     ):
                         if kind == "reasoning":
                             alive.write(sse(stream.reasoning(value)))
                         elif kind == "message":
                             alive.write(sse(stream.message(value)))
+                        elif kind == "delta":
+                            alive.write(sse(stream.answer_delta(value)))
                         else:
                             text = value
                 except BridgeError as error:
@@ -363,7 +461,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     # 結果を次のリクエストへ載せてくる。
                     alive.write(sse(stream.function_calls(self.server.pending.close(token))))
                     alive.write(sse(stream.completed(text)))
-                    self._log_completed(config, request, session, text)
+                    self._log_completed(config, request, session, backend, text)
                 alive.write(SSE_DONE)
         except (BrokenPipeError, ConnectionResetError):
             logger.info("stream aborted by client")
@@ -372,11 +470,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.server.pending.close(token)
 
     def _log_completed(
-        self, config: BridgeConfig, request: ParsedRequest, session, text: str
+        self, config: BridgeConfig, request: ParsedRequest, session, backend: str, text: str
     ) -> None:
         logger.info(
-            "responses completed model=%s cli_model=%s stream=%s resume=%s output_chars=%d",
+            "responses completed model=%s backend=%s cli_model=%s stream=%s resume=%s "
+            "output_chars=%d",
             request.model,
+            backend,
             config.model,
             request.stream,
             session.resume,
@@ -425,7 +525,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             ) from error
 
     def _content_length(self, config: BridgeConfig) -> int:
-        """ボディを読む前に Content-Length を検証し、読み取ってよいバイト数を返す。"""
+        """ボディを読む前に Content-Length を検証し、読み取ってよいバイト数を返す。
+
+        受け取れる大きさは中継先で変えない。Codex は会話履歴を丸ごと送り直すため、
+        ローカルの CLI で実行するリクエストも履歴ぶんの大きさで届く。CLI へ渡せる量の
+        判定は max_request_bytes で別に行う。
+        """
 
         length_header = self.headers.get("Content-Length")
         if length_header is None:
@@ -442,14 +547,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
         # 負値は 0 バイト読み取りや無限読み取りを招くため、読み取り前に拒否する。
         if length < 0:
             raise self._invalid_length()
-        if length > config.max_request_bytes:
+        self._validate_body_size(
+            length, config.max_upstream_request_bytes, "リクエストボディ"
+        )
+        return length
+
+    def _validate_body_size(self, length: int, max_bytes: int, what: str) -> None:
+        if length > max_bytes:
             raise BridgeError(
-                f"リクエストボディが上限 {config.max_request_bytes} バイトを超えました",
+                f"{what}が上限 {max_bytes} バイトを超えました",
                 status=413,
                 error_type="invalid_request_error",
                 code="request_too_large",
             )
-        return length
 
     def _invalid_length(self) -> BridgeError:
         return BridgeError(

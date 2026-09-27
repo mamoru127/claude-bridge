@@ -1,8 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- install.sh がこのファイルの __PLACEHOLDER__ を実際の値へ置き換えて
-     ~/Library/LaunchAgents/ へ書き出します。手で登録する場合は
-     __PYTHON_BIN__ / __WORKING_DIR__ / __HOME__ を自分の環境の値にしてください。 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -21,30 +18,41 @@
     <string>claude_bridge</string>
     <string>--upstream-base-url</string>
     <string>https://chatgpt.com/backend-api/codex</string>
-    <!-- Claude CLI に触らせる作業ディレクトリを増やす場合は、ここへ
-         <string>--add-dir</string> と <string>/path/to/dir</string> を追加する。 -->
+    <string>--claude-models</string>
+    <string>claude-opus-5-5,claude-fable-5-1</string>
+    <string>--antigravity-models</string>
+    <string>gemini-3.8-flash-high</string>
+    <!-- create_thread は Codex が遅延読み込みにしているため additional_tools に載らない。
+         名前を明示すると未取得と判定され、下の検索語で先回りして引き出せる。
+         * だけだと未取得の一覧が常に空になり、検索語を書いても発火しない。 -->
+    <string>--passthrough-tools</string>
+    <string>*,create_thread,list_projects</string>
+    <string>--tool-search-query</string>
+    <string>create_thread fork_thread list_threads</string>
   </array>
 
   <!-- python -m claude_bridge の import 元であり、working-dir オプションの既定値でもある。 -->
   <key>WorkingDirectory</key>
   <string>__WORKING_DIR__</string>
 
-  <!-- launchd はログインシェルの環境を引き継がない。claude と codex を見つけられる PATH を明示する。 -->
+  <!-- launchd はログインシェルの環境を引き継がない。claude と codex と agy を見つけられる PATH を明示する。
+       agy は公式インストーラが ~/.local/bin へ置くため、そこを先頭に加える。 -->
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key>
     <string>__HOME__</string>
+    <!-- Claude CLI の推論エフォート。ブリッジは Codex の reasoning.effort を CLI へ渡さないため、
+         ここで CLI の既定を high に固定する。値を変えたら install.sh で再登録する。 -->
+    <key>CLAUDE_CODE_EFFORT_LEVEL</key>
+    <string>high</string>
     <!-- app-server の RPC を MCP として Claude へ公開する。受け渡し（create_thread）とは
          別経路で、アプリ側のツール提供方式が変わっても動く。
          繋ぎ先は local.codex-app-server が常駐させる共有 app-server。
          そちらを先に登録しておくこと（launchd/install-app-server.sh）。 -->
     <key>CLAUDE_BRIDGE_ENABLE_CODEX_MCP</key>
     <string>1</string>
-    <!-- 追加で有効にする MCP サーバー。リポジトリ外のユーザー設定として置く。 -->
-    <key>CLAUDE_BRIDGE_MCP_CONFIG_FILE</key>
-    <string>__HOME__/.config/claude-bridge/mcp.json</string>
   </dict>
 
   <!-- ログイン時に起動し、落ちたら再起動する。 -->
