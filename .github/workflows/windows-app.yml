@@ -8,6 +8,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
       - name: Install ChatGPT desktop app
         shell: pwsh
         run: |
@@ -19,7 +23,8 @@ jobs:
       - name: Activate app through a Codex URL
         shell: pwsh
         run: |
-          Start-Process 'codex://settings'
+          python -c "from claude_bridge.mobile_browser_patch import open_in_chatgpt; open_in_chatgpt('01a02c76-328c-7c21-b5e4-b7466f62f05d')"
+          if ($LASTEXITCODE -ne 0) { throw "URL activation exited with $LASTEXITCODE" }
           Start-Sleep -Seconds 10
           $process = Get-Process | Where-Object { $_.ProcessName -match 'ChatGPT|Codex' }
           if (-not $process) { throw 'Codex app process did not start' }
