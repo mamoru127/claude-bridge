@@ -46,8 +46,8 @@ claude-bridge/
 
 1. **Python 3.11 以上と Claude CLI がインストール済みであること**（macOS は `which claude`、Windows は `Get-Command claude` で確認）
 2. **Claude CLI の認証が済んでいること**
-   ブリッジは認証を一切代行しません。あらかじめターミナルで `claude` を一度起動してログインを完了させるか、
-   `ANTHROPIC_API_KEY` を設定しておいてください。未認証のままだとブリッジは CLI の異常終了を
+   あらかじめターミナルで `claude` を一度起動してログインを完了させてください。
+   ブリッジ用にも Anthropic 用にも API キーは不要です。未認証のままだとブリッジは CLI の異常終了を
    `502 claude_cli_failed` として返します。
    動作確認: `claude -p "ping" --output-format json`
 3. **（任意）Antigravity CLI がインストール済みで、Google アカウントでログイン済みであること**
@@ -164,7 +164,6 @@ Antigravity CLI は明示的に割り当てた名前だけを処理します（`
 例:
 
 ```bash
-CLAUDE_BRIDGE_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))') \
 python -m claude_bridge \
   --claude-path /opt/homebrew/bin/claude \
   --model sonnet \
@@ -172,7 +171,8 @@ python -m claude_bridge \
   --working-dir /path/to/project
 ```
 
-シークレットは引数ではなく環境変数でのみ受け取ります（`ps` で他プロセスから見えないようにするため）。
+既定のローカル起動に API キーは必要ありません。`CLAUDE_BRIDGE_API_KEY` は、上流中継を使わず
+ループバック以外へ公開する特殊な構成でだけ使う、HTTP 接続用の共有シークレットです。
 
 ### 常駐させる（launchd / macOS）
 
@@ -274,8 +274,6 @@ DBの変更を確認します。DBに変更がない間はタスクを再検索�
 name = "Claude CLI bridge"
 base_url = "http://127.0.0.1:8787/v1"
 wire_api = "responses"
-# CLAUDE_BRIDGE_API_KEY を設定した場合のみ。Codex 側にも同じ値を環境変数で渡す。
-env_key = "CLAUDE_BRIDGE_API_KEY"
 
 [profiles.claude]
 model_provider = "claude_bridge"
@@ -284,8 +282,8 @@ model = "claude-opus-5-5"
 
 利用時: `codex --profile claude`
 
-`env_key` を指定した場合、Codex は `Authorization: Bearer $CLAUDE_BRIDGE_API_KEY` を送ります。
-ブリッジ側と同じ値を両方のシェルに設定してください。
+ローカル利用では `env_key` を指定しません。Claude CLI のログイン情報を使い、
+Codex とブリッジの間に別の API キーは設けません。
 
 ### Codex デスクトップアプリ（トップレベル `model_provider` が必要）
 
