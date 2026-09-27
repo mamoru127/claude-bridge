@@ -26,6 +26,9 @@ jobs:
           $errors = $null
           [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path windows/install.ps1).Path, [ref]$tokens, [ref]$errors) | Out-Null
           if ($errors.Count) { throw ($errors | Out-String) }
+      - name: Test Windows Remote thread URL launch
+        if: runner.os == 'Windows'
+        run: python -m unittest tests.test_windows_url_handler
       - name: Test macOS integrations
         if: runner.os == 'macOS'
         run: python -m unittest discover -s tests
