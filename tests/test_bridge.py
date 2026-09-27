@@ -6,6 +6,7 @@ import os
 import socket
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -2303,6 +2304,13 @@ class ImagePassthroughTest(BridgeHTTPTestCase):
 
 
 class AddDirTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.paths = (os.path.join(directory.name, "one"), os.path.join(directory.name, "two"))
+        for path in self.paths:
+            os.mkdir(path)
+
     def test_add_dir_is_absent_by_default(self):
         self.assertNotIn(
             "--add-dir", build_command(make_config(), None, Session(), "sid-1")
@@ -2310,25 +2318,25 @@ class AddDirTest(unittest.TestCase):
 
     def test_add_dirs_reach_the_cli_as_one_flag(self):
         # --add-dir は可変長引数なので、ディレクトリを続けて並べる。
-        command = build_command(make_config(add_dirs=("/tmp", "/var")), None, Session(), "sid-1")
+        command = build_command(make_config(add_dirs=self.paths), None, Session(), "sid-1")
         index = command.index("--add-dir")
 
-        self.assertEqual(command[index + 1 : index + 3], ["/tmp", "/var"])
+        self.assertEqual(command[index + 1 : index + 3], list(self.paths))
         self.assertEqual(command.count("--add-dir"), 1)
 
     def test_repeated_add_dir_arguments_are_collected(self):
-        config = build_config(["--add-dir", "/tmp", "--add-dir", "/var"], env={})
+        config = build_config(["--add-dir", self.paths[0], "--add-dir", self.paths[1]], env={})
 
-        self.assertEqual(config.add_dirs, ("/tmp", "/var"))
+        self.assertEqual(config.add_dirs, self.paths)
 
     def test_add_dirs_env_is_split_by_pathsep(self):
-        config = build_config([], env={"CLAUDE_BRIDGE_ADD_DIRS": os.pathsep.join(["/tmp", "/var"])})
+        config = build_config([], env={"CLAUDE_BRIDGE_ADD_DIRS": os.pathsep.join(self.paths)})
 
-        self.assertEqual(config.add_dirs, ("/tmp", "/var"))
+        self.assertEqual(config.add_dirs, self.paths)
 
     def test_missing_add_dir_is_rejected(self):
         with self.assertRaises(ValueError):
-            build_config(["--add-dir", "/no/such/directory"], env={})
+            build_config(["--add-dir", os.path.join(self.paths[0], "missing")], env={})
 
 
 def conversation(*pairs: tuple[str, str]) -> tuple[Message, ...]:
