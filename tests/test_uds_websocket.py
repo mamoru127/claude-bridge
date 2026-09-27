@@ -123,6 +123,7 @@ class FakeAppServer:
             self.received.put((opcode, masked, payload))
 
 
+@unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Python に AF_UNIX がない")
 class UdsWebSocketTest(unittest.TestCase):
     def setUp(self) -> None:
         # macOS の長い TMPDIR は避け、Windows では OS の一時領域を使う。

@@ -14,10 +14,12 @@
 """
 
 import json
+import os
 import queue
 import threading
 import time
 
+from .proxy_websocket import ProxyWebSocket
 from .uds_websocket import UdsWebSocket
 
 CLIENT_INFO = {"name": "claude-bridge", "version": "0.1.0"}
@@ -124,12 +126,12 @@ class AppServerClient:
         socket_path: str,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         turn_timeout_seconds: float = DEFAULT_TURN_TIMEOUT_SECONDS,
-        connect=UdsWebSocket,
+        connect=None,
     ) -> None:
         self._socket_path = socket_path
         self._timeout_seconds = timeout_seconds
         self._turn_timeout_seconds = turn_timeout_seconds
-        self._connect_transport = connect
+        self._connect_transport = connect or (ProxyWebSocket if os.name == "nt" else UdsWebSocket)
         self._conn: _Connection | None = None
         self._last_id = 0
         # 接続と送信の直列化だけに使う。応答待ちの間は持たない。

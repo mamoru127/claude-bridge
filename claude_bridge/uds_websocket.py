@@ -29,8 +29,8 @@ _OP_PONG = 0xA
 class UdsWebSocket:
     """制御ソケット 1 本ぶんの接続。"""
 
-    def __init__(self, socket_path: str) -> None:
-        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    def __init__(self, socket_path: str, transport=None) -> None:
+        self._socket = transport or socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._send_lock = threading.Lock()
         self._buffer = b""
         try:

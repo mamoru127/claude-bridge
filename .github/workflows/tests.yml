@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Test portable bridge
-        run: python -m unittest tests.test_bridge tests.test_passthrough tests.test_antigravity tests.test_app_server_mcp tests.test_uds_websocket tests.test_main
+        run: python -m unittest tests.test_bridge tests.test_passthrough tests.test_antigravity tests.test_app_server_mcp tests.test_uds_websocket tests.test_proxy_websocket tests.test_main
       - name: Check Windows installer syntax
         if: runner.os == 'Windows'
         shell: pwsh
