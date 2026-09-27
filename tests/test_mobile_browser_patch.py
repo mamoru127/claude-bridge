@@ -3,7 +3,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from claude_bridge.mobile_browser_patch import (
     MobileThreadWatcher,
@@ -90,6 +90,20 @@ class MobileThreadWatcherTests(unittest.TestCase):
 
             self.assertEqual(opener.call_count, 2)
 
+    def test_retries_when_windows_url_handler_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            opener = Mock(side_effect=[OSError("no handler"), None])
+            watcher = MobileThreadWatcher(Path(directory), opener=opener)
+            day_directory = watcher._day_directory()
+            day_directory.mkdir(parents=True)
+            watcher.prime()
+
+            write_session(day_directory / "rollout-mobile.jsonl", "codex_chatgpt_ios_remote")
+            watcher.scan()
+            watcher.scan()
+
+            self.assertEqual(opener.call_count, 2)
+
     def test_retries_until_session_metadata_is_written(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             watcher = MobileThreadWatcher(Path(directory), opener=Mock())
@@ -110,12 +124,21 @@ class MobileThreadWatcherTests(unittest.TestCase):
 class OpenInChatGPTTests(unittest.TestCase):
     def test_uses_background_codex_thread_url(self) -> None:
         run = Mock()
-        open_in_chatgpt(THREAD_ID, run=run)
+        with patch("claude_bridge.mobile_browser_patch.sys.platform", "darwin"):
+            open_in_chatgpt(THREAD_ID, run=run)
         run.assert_called_once_with(
             ["/usr/bin/open", "-g", f"codex://threads/{THREAD_ID}"],
             check=True,
             timeout=5,
         )
+
+    def test_uses_windows_url_handler(self) -> None:
+        with (
+            patch("claude_bridge.mobile_browser_patch.sys.platform", "win32"),
+            patch("claude_bridge.mobile_browser_patch.os.startfile", create=True) as startfile,
+        ):
+            open_in_chatgpt(THREAD_ID, run=Mock())
+        startfile.assert_called_once_with(f"codex://threads/{THREAD_ID}")
 
 
 if __name__ == "__main__":

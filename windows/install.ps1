@@ -48,6 +48,16 @@ $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seco
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName $taskName
 
+$routeTaskName = 'CodexMobileBrowserRoute'
+$existingRouteTask = Get-ScheduledTask -TaskName $routeTaskName -ErrorAction SilentlyContinue
+if ($existingRouteTask -and $existingRouteTask.State -eq 'Running') {
+    Stop-ScheduledTask -TaskName $routeTaskName
+}
+$routeArguments = '-m claude_bridge.mobile_browser_patch'
+$routeAction = New-ScheduledTaskAction -Execute $python -Argument $routeArguments -WorkingDirectory $repoDir
+Register-ScheduledTask -TaskName $routeTaskName -Action $routeAction -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+Start-ScheduledTask -TaskName $routeTaskName
+
 for ($attempt = 0; $attempt -lt 30; $attempt++) {
     try {
         Invoke-RestMethod -Uri 'http://127.0.0.1:8787/health' -TimeoutSec 2 | Out-Null

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from datetime import datetime
@@ -62,8 +64,12 @@ def open_in_chatgpt(
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> None:
+    url = f"codex://threads/{thread_id}"
+    if sys.platform == "win32":
+        os.startfile(url)
+        return
     run(
-        ["/usr/bin/open", "-g", f"codex://threads/{thread_id}"],
+        ["/usr/bin/open", "-g", url],
         check=True,
         timeout=5,
     )
@@ -111,7 +117,7 @@ class MobileThreadWatcher:
                 continue
             try:
                 self.opener(thread_id)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                 self.known_paths.remove(path)
                 print(f"failed to open mobile thread {thread_id}: {error}", flush=True)
                 continue

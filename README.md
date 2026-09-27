@@ -96,14 +96,13 @@ Codex CLI をインストールし、ログインしてから PowerShell で実�
 .\windows\install.ps1 -WorkingDir C:\path\to\project
 ```
 
-ログオン時にブリッジを起動し、Codex の共有 app-server とスレッド操作も既定で使えます。再設定時も 8787 を使う別のプロセスは停止しません。
+ログオン時にブリッジとスマホ Remote のスレッド表示補助を起動します。Codex の共有 app-server とスレッド操作も既定で使えます。再設定時も 8787 を使う別のプロセスは停止しません。
 
 ## 注意点
 
 - ブリッジはループバックアドレスでのみ待ち受けます。ブリッジ自体に HTTP 認証はありません。
 - Claude と Antigravity は非対話実行時のツール操作を自動承認します。`--working-dir` と `--add-dir` には信頼できる場所だけを指定してください。
 - Windows でも Codex から渡されたツール（imagegen や Browser など）と共有 app-server のスレッド操作を利用できます。
-- スマホ Remote のスレッドを Mac 版アプリで自動表示する補助機能は macOS 専用です。
 - 画像生成・編集 API は `--upstream-base-url` を指定した場合に上流へ中継します。
 
 ## テスト
