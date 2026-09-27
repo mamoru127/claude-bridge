@@ -16,7 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     server = BridgeServer(config)
     host, port = server.server_address[:2]
     logger.info(
-        "listening on http://%s:%s%s (claude=%s antigravity=%s model=%s cwd=%s auth=%s "
+        "listening on http://%s:%s%s (claude=%s antigravity=%s model=%s cwd=%s "
         "codex_mcp=%s)",
         host,
         port,
@@ -25,7 +25,6 @@ def main(argv: list[str] | None = None) -> int:
         config.antigravity_path if config.antigravity_models else "disabled",
         config.model,
         config.working_dir,
-        "bearer" if config.api_key else "none",
         config.app_server_socket if config.codex_mcp else "disabled",
     )
     try:

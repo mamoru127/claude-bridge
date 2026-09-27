@@ -94,7 +94,6 @@ def build_mcp_servers(
     base_env = {
         "PYTHONPATH": package_parent,
         "CLAUDE_BRIDGE_URL": config.bridge_url,
-        **({"CLAUDE_BRIDGE_API_KEY": config.api_key} if config.api_key else {}),
     }
     # 追加定義を先に置き、ブリッジが用意するサーバーを後から重ねる。逆にすると
     # 同名の追加定義が token 付きのアダプタを差し替え、受け渡しが動かなくなる。

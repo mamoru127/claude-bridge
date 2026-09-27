@@ -36,13 +36,11 @@ class PendingCallClient:
         self,
         token: str,
         base_url: str = DEFAULT_BRIDGE_URL,
-        api_key: str | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         opener=urllib.request.urlopen,
     ) -> None:
         self._token = token
         self._url = base_url.rstrip("/") + PASSTHROUGH_PATH
-        self._api_key = api_key
         self._timeout_seconds = timeout_seconds
         self._opener = opener
 
@@ -56,8 +54,6 @@ class PendingCallClient:
         """呼び出しを預け、Codex と対応づける call_id を受け取る。"""
 
         headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
         payload = {
             "token": self._token,
             "name": name,
@@ -194,7 +190,6 @@ def main() -> int:
     client = PendingCallClient(
         token=os.environ.get(PASSTHROUGH_TOKEN_ENV, ""),
         base_url=os.environ.get("CLAUDE_BRIDGE_URL") or DEFAULT_BRIDGE_URL,
-        api_key=os.environ.get("CLAUDE_BRIDGE_API_KEY") or None,
     )
     tools = load_tools(os.environ.get(PASSTHROUGH_DEFS_ENV, ""))
     serve(sys.stdin.buffer, sys.stdout.buffer, client, build_handler(tools, client))

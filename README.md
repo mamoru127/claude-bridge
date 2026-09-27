@@ -89,17 +89,16 @@ Codex app-server の共有を有効にする `--enable-codex-mcp` は Windows �
 Antigravity CLI はプロンプトを `-p` 引数で受け取るため、OS 共通で UTF-8 の 16,000 バイトまでを
 受け付けます。これを超える入力は CLI 起動前に `413 antigravity_cli_prompt_too_large` を返します。
 
-| メソッド・パス | 認証 | 内容 |
-| --- | --- | --- |
-| `GET /health` | 不要 | `{"status": "ok"}` を返すヘルスチェック |
-| `GET /v1/models` | 必要 | `--claude-models` と `--antigravity-models` で指定した名前を並べたモデル一覧 |
-| `POST /v1/responses` | 必要 | Responses API 本体。`stream` の真偽で JSON と SSE を切り替える |
-| `POST /v1/images/generations` | 必要 | 画像生成リクエストを上流へ素通しする（`--upstream-base-url` 必須） |
-| `POST /v1/images/edits` | 必要 | 画像編集リクエストを上流へ素通しする（`--upstream-base-url` 必須） |
+| メソッド・パス | 内容 |
+| --- | --- |
+| `GET /health` | `{"status": "ok"}` を返すヘルスチェック |
+| `GET /v1/models` | `--claude-models` と `--antigravity-models` で指定した名前を並べたモデル一覧 |
+| `POST /v1/responses` | Responses API 本体。`stream` の真偽で JSON と SSE を切り替える |
+| `POST /v1/images/generations` | 画像生成リクエストを上流へ素通しする（`--upstream-base-url` 必須） |
+| `POST /v1/images/edits` | 画像編集リクエストを上流へ素通しする（`--upstream-base-url` 必須） |
 
-（「認証」は `CLAUDE_BRIDGE_API_KEY` を設定した場合のみ必要という意味です。画像 API の
-中継時は、Codex から受け取った `Authorization` を上流へそのまま渡します。上記以外のパスは
-404 を返します。）
+画像 API の中継時は、Codex から受け取った `Authorization` を上流へそのまま渡します。
+上記以外のパスは 404 を返します。
 
 ルーティングはクエリ文字列を除いたパスで判定します。Codex は `GET /v1/models?client_version=0.144.5` の
 ようにクエリを付けて送りますが、クエリの内容は読まずに無視します。
@@ -135,7 +134,6 @@ Antigravity CLI はプロンプトを `-p` 引数で受け取るため、OS 共�
 `--upstream-base-url` を省略すると中継はせず、**一覧にない名前で来たときは Claude CLI が処理します。**
 Antigravity CLI は明示的に割り当てた名前だけを処理します（`agy` は `opus` のような Claude の別名を
 解釈できないため、未知の名前の受け皿にはできません）。
-中継の有効時は `CLAUDE_BRIDGE_API_KEY` と併用できません（上流の認証をそのまま転送するため）。
 
 ### オプション
 
@@ -159,7 +157,6 @@ Antigravity CLI は明示的に割り当てた名前だけを処理します（`
 | `--mcp-config-file` | `CLAUDE_BRIDGE_MCP_CONFIG_FILE` | なし | 追加で有効にする MCP サーバーを書いた JSON ファイル（`mcpServers` 形式、後述）。起動時に読み込み、読めなければ起動しない |
 | `--passthrough-tools` | `CLAUDE_BRIDGE_PASSTHROUGH_TOOLS` | `*` | 親 Codex がリクエストで提示したツールのうち Claude へ受け渡す名前。`*` は全 function と `tool_search`、カンマ区切りで個別指定、引数の空文字で無効 |
 | `--tool-search-query` | `CLAUDE_BRIDGE_TOOL_SEARCH_QUERY` | なし | 個別指定した遅延ツールをブリッジが先回り検索するときの検索語。`*` では Claude 自身に `tool_search` を渡すため不要 |
-| （なし） | `CLAUDE_BRIDGE_API_KEY` | なし | 設定すると `Authorization: Bearer` を必須にする共有シークレット |
 
 例:
 
@@ -171,8 +168,7 @@ python -m claude_bridge \
   --working-dir /path/to/project
 ```
 
-既定のローカル起動に API キーは必要ありません。`CLAUDE_BRIDGE_API_KEY` は、上流中継を使わず
-ループバック以外へ公開する特殊な構成でだけ使う、HTTP 接続用の共有シークレットです。
+ブリッジ自体に API キーの設定は不要です。接続先はループバックアドレスに限定されます。
 
 ### 常駐させる（launchd / macOS）
 
@@ -705,14 +701,13 @@ Claude が MCP ツールを使っても、`POST /v1/responses` が返すのは**
 
 `POST /v1/responses` は次のように処理されます。
 
-1. `Authorization` を検証（`CLAUDE_BRIDGE_API_KEY` 設定時のみ）
-2. `instructions` と `input` からシステムプロンプトとユーザープロンプトを抽出（`tools` は読まずに捨てる）
-3. `claude --print --output-format stream-json --input-format stream-json --verbose
+1. `instructions` と `input` からシステムプロンプトとユーザープロンプトを抽出（`tools` は読まずに捨てる）
+2. `claude --print --output-format stream-json --input-format stream-json --verbose
    --thinking-display summarized --strict-mcp-config --model <model>
    [--mcp-config <JSON> --allowedTools mcp__codex_app_server] [--append-system-prompt <system>]` を
    **引数配列で**起動し、プロンプトは標準入力から渡す
    （`--mcp-config` が付くのは `--enable-codex-mcp` を指定したときだけ）
-4. CLI が標準出力へ 1 行ずつ吐く JSON を読みながら、`result` の最終テキストを
+3. CLI が標準出力へ 1 行ずつ吐く JSON を読みながら、`result` の最終テキストを
    Responses API 形式で返す（`stream=true` なら SSE で逐次返す）
 
 `input` は文字列でも配列でも受け付けます。配列の場合、`system` / `developer` ロールはシステムプロンプトへ、
@@ -857,7 +852,6 @@ data: {"type":"response.failed","sequence_number":3,"response":{"id":"resp_...",
 
 | code | HTTP | 意味 |
 | --- | --- | --- |
-| `invalid_api_key` | 401 | `Authorization` が不正 |
 | `not_found` | 404 | 未対応のパス |
 | `invalid_request` | 400 | `input` が空・`model` が文字列でない・`stream` が真偽値でない など |
 | `invalid_json` | 400 | ボディを JSON として解釈できない |
@@ -956,8 +950,7 @@ data: {"type":"response.failed","sequence_number":3,"response":{"id":"resp_...",
 
 ## セキュリティ上の注意
 
-- 既定の bind 先は `127.0.0.1` です。ループバック以外（`0.0.0.0` など）に bind する場合、
-  `CLAUDE_BRIDGE_API_KEY` の設定が**必須**で、未設定なら起動時に失敗します。
+- 既定の bind 先は `127.0.0.1` です。ループバック以外（`0.0.0.0` など）への bind は起動時に拒否します。
 - **任意のシェル文字列を実行しません。** CLI は必ず引数配列で `subprocess.Popen` に渡し、`shell=True` は使いません。
   Claude へのプロンプトは引数ではなく標準入力から渡します。Antigravity は headless 契約が
   `-p <prompt>` の引数渡しのみのため引数で渡しますが、シェルを介さないので展開は起きません
@@ -972,9 +965,6 @@ data: {"type":"response.failed","sequence_number":3,"response":{"id":"resp_...",
 - ログにはメソッド・パス・ステータス・エラーコード・出力文字数のみを記録します。
   **プロンプト本文・CLI 出力・`Authorization` ヘッダの値・URL のクエリ文字列はログに出しません。**
   クエリで秘密値を渡すクライアントがあるため、記録するのはクエリを除いたパスだけです（404 のエラー本文も同様）。
-- トークン比較は `hmac.compare_digest` を使います。
-- `GET /health` だけは認証なしで応答します（返すのは `{"status": "ok"}` のみ）。
-  `GET /v1/models` と `POST /v1/responses` は `CLAUDE_BRIDGE_API_KEY` 設定時に認証必須です。
 - `--working-dir` で指定したディレクトリが Claude CLI と Antigravity CLI の作業ディレクトリになります。
   CLI はそのディレクトリのファイルを読めるため、**信頼できるディレクトリを指定してください。**
   `--add-dir` を足すと両CLIの操作範囲が広がります。既定では 1 つも渡しません。

@@ -928,15 +928,6 @@ class StreamingEndpointTest(BridgeHTTPTestCase):
         completed = dict(events)["response.completed"]["response"]
         self.assertEqual([item["type"] for item in completed["output"]], ["message"])
 
-    def test_stream_requires_authorization(self):
-        base_url = self.start_server(make_config(api_key="secret-token"), FakeRunner())
-
-        with self.assertRaises(urllib.error.HTTPError) as raised:
-            self.post_stream(base_url, {"input": "やあ"})
-
-        self.assertEqual(raised.exception.code, 401)
-        self.assertEqual(json.loads(raised.exception.read())["error"]["code"], "invalid_api_key")
-
     def test_stream_with_tool_choice_still_streams(self):
         # tool_choice は無視するだけなので、stream=true でも通常どおり SSE を返す。
         base_url = self.start_server(make_config(), FakeRunner())
@@ -1106,18 +1097,6 @@ class ModelsEndpointTest(BridgeHTTPTestCase):
                 config.backend(item["id"]), (CLAUDE_BACKEND, ANTIGRAVITY_BACKEND)
             )
 
-    def test_requires_authorization(self):
-        base_url = self.start_server(make_config(api_key="secret-token"), FakeRunner())
-
-        status, body = self.get_json(base_url, "/v1/models")
-        self.assertEqual(status, 401)
-        self.assertEqual(body["error"]["code"], "invalid_api_key")
-
-        status, payload = self.get_json(
-            base_url, "/v1/models", headers={"Authorization": "Bearer secret-token"}
-        )
-        self.assertEqual(status, 200)
-
     def test_codex_query_string_is_ignored_when_routing(self):
         # Codex が実際に送る形。クエリ付きでもモデル一覧を返す。
         base_url = self.start_server(make_config(model="opus"), FakeRunner())
@@ -1128,13 +1107,13 @@ class ModelsEndpointTest(BridgeHTTPTestCase):
         self.assertEqual(payload["object"], "list")
         self.assertEqual(payload["data"][0]["id"], "claude-opus-5-5")
 
-    def test_query_string_does_not_bypass_authorization(self):
-        base_url = self.start_server(make_config(api_key="secret-token"), FakeRunner())
-
-        status, body = self.get_json(base_url, "/v1/models?client_version=0.144.5")
-
-        self.assertEqual(status, 401)
-        self.assertEqual(body["error"]["code"], "invalid_api_key")
+    def test_query_string_is_not_logged(self):
+        base_url = self.start_server(make_config(), FakeRunner())
+        with self.assertLogs("claude_bridge", level="INFO") as logs:
+            self.get_json(base_url, "/v1/models?private=secret-token")
+        output = "\n".join(logs.output)
+        self.assertNotIn("secret-token", output)
+        self.assertIn("/v1/models", output)
 
     def test_health_accepts_query_string(self):
         base_url = self.start_server(make_config(), FakeRunner())
@@ -1448,64 +1427,6 @@ class RequestValidationTest(BridgeHTTPTestCase):
         )
         self.assertEqual(status, 413)
         self.assertEqual(body["error"]["code"], "request_too_large")
-
-
-class AuthorizationTest(BridgeHTTPTestCase):
-    def setUp(self):
-        self.runner = FakeRunner()
-        self.base_url = self.start_server(make_config(api_key="secret-token"), self.runner)
-
-    def test_missing_authorization_is_rejected(self):
-        status, body = self.post(self.base_url, {"input": "やあ"})
-        self.assertEqual(status, 401)
-        self.assertEqual(body["error"]["code"], "invalid_api_key")
-        self.assertEqual(self.runner.calls, [])
-
-    def test_wrong_token_is_rejected(self):
-        status, _ = self.post(
-            self.base_url, {"input": "やあ"}, headers={"Authorization": "Bearer wrong"}
-        )
-        self.assertEqual(status, 401)
-        self.assertEqual(self.runner.calls, [])
-
-    def test_wrong_scheme_is_rejected(self):
-        status, _ = self.post(
-            self.base_url, {"input": "やあ"}, headers={"Authorization": "Basic secret-token"}
-        )
-        self.assertEqual(status, 401)
-
-    def test_valid_token_is_accepted(self):
-        status, payload = self.post(
-            self.base_url, {"input": "やあ"}, headers={"Authorization": "Bearer secret-token"}
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["output_text"], "こんにちは")
-
-    def test_secret_is_not_logged(self):
-        with self.assertLogs("claude_bridge", level="INFO") as logs:
-            self.post(
-                self.base_url,
-                {"input": "やあ"},
-                headers={"Authorization": "Bearer secret-token"},
-            )
-        self.assertNotIn("secret-token", "\n".join(logs.output))
-
-    def test_query_string_is_not_logged(self):
-        # クエリで秘密値を渡すクライアントもあるため、リクエスト行のクエリは記録しない。
-        with self.assertLogs("claude_bridge", level="INFO") as logs:
-            self.get_json(
-                self.base_url,
-                "/v1/models?api_key=secret-token",
-                headers={"Authorization": "Bearer secret-token"},
-            )
-        output = "\n".join(logs.output)
-        self.assertNotIn("secret-token", output)
-        self.assertIn("/v1/models", output)
-
-    def test_no_api_key_configured_allows_request(self):
-        open_url = self.start_server(make_config(), FakeRunner())
-        status, _ = self.post(open_url, {"input": "やあ"})
-        self.assertEqual(status, 200)
 
 
 class ClaudeCliFailureTest(BridgeHTTPTestCase):
@@ -1974,7 +1895,6 @@ class ConfigTest(unittest.TestCase):
         config = build_config([], env={})
         self.assertEqual(config.host, "127.0.0.1")
         self.assertEqual(config.port, 8787)
-        self.assertIsNone(config.api_key)
 
     def test_default_claude_model_does_not_collide_with_upstream_names(self):
         # 上流に実在する名前を使うと、その名前が上流一覧から除かれてアプリで選べなくなる。
@@ -1996,20 +1916,20 @@ class ConfigTest(unittest.TestCase):
             env={
                 "CLAUDE_BRIDGE_PORT": "9000",
                 "CLAUDE_BRIDGE_MODEL": "sonnet",
-                "CLAUDE_BRIDGE_API_KEY": "secret",
                 "CLAUDE_BRIDGE_TIMEOUT_SECONDS": "30",
                 "CLAUDE_BRIDGE_MAX_UPSTREAM_REQUEST_BYTES": "123456",
             },
         )
         self.assertEqual(config.port, 9000)
         self.assertEqual(config.model, "sonnet")
-        self.assertEqual(config.api_key, "secret")
         self.assertEqual(config.timeout_seconds, 30.0)
         self.assertEqual(config.max_upstream_request_bytes, 123456)
 
-    def test_non_loopback_bind_requires_api_key(self):
+    def test_non_loopback_bind_is_rejected(self):
         with self.assertRaises(ValueError):
             build_config(["--host", "0.0.0.0"], env={})
+        with self.assertRaises(ValueError):
+            build_config(["--host", "192.0.2.1"], env={})
 
     def test_missing_working_dir_is_rejected(self):
         with self.assertRaises(ValueError):

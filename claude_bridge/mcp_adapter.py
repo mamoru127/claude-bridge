@@ -174,19 +174,15 @@ class BridgeRpcClient:
     def __init__(
         self,
         base_url: str = DEFAULT_BRIDGE_URL,
-        api_key: str | None = None,
         timeout_seconds: float = DEFAULT_RPC_TIMEOUT_SECONDS,
         opener=urllib.request.urlopen,
     ) -> None:
         self._url = base_url.rstrip("/") + APP_SERVER_PATH
-        self._api_key = api_key
         self._timeout_seconds = timeout_seconds
         self._opener = opener
 
     def call(self, method: str, params: dict, wait: bool = False) -> object:
         headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
         request = urllib.request.Request(
             self._url,
             data=json.dumps({"method": method, "params": params, "wait": wait}).encode("utf-8"),
@@ -360,9 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    client = BridgeRpcClient(
-        base_url=args.bridge_url, api_key=os.environ.get("CLAUDE_BRIDGE_API_KEY") or None
-    )
+    client = BridgeRpcClient(base_url=args.bridge_url)
     serve(sys.stdin.buffer, sys.stdout.buffer, client)
     return 0
 

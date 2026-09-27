@@ -1142,14 +1142,7 @@ class BridgeRpcClientTest(unittest.TestCase):
 
         self.assertEqual(seen["request"].full_url, "http://127.0.0.1:9911" + APP_SERVER_PATH)
 
-    def test_api_key_is_sent_as_a_bearer_token(self):
-        client, seen = self.make_client({"result": {}}, api_key="secret")
-
-        client.call("thread/list", {})
-
-        self.assertEqual(seen["request"].get_header("Authorization"), "Bearer secret")
-
-    def test_no_authorization_header_without_an_api_key(self):
+    def test_no_authorization_header(self):
         client, seen = self.make_client({"result": {}})
 
         client.call("thread/list", {})
@@ -1315,19 +1308,6 @@ class AppServerRpcEndpointTest(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertEqual(payload["error"]["code"], "invalid_request")
         self.assertEqual(app_server.calls, [])
-
-    def test_api_key_is_required_when_configured(self):
-        app_server = FakeAppServer()
-        base_url = self.start_server(app_server, make_config(api_key="secret"))
-
-        status, _ = self.post(base_url, {"method": "thread/list", "params": {}})
-        self.assertEqual(status, 401)
-
-        status, _ = self.post(
-            base_url, {"method": "thread/list", "params": {}}, {"Authorization": "Bearer secret"}
-        )
-        self.assertEqual(status, 200)
-
 
 class ClaudeCliMcpArgumentTest(unittest.TestCase):
     def test_disabled_by_default(self):

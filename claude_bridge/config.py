@@ -99,7 +99,6 @@ class BridgeConfig:
 
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
-    api_key: str | None = None
     claude_path: str = DEFAULT_CLAUDE_PATH
     antigravity_path: str = DEFAULT_ANTIGRAVITY_PATH
     model: str = DEFAULT_MODEL
@@ -349,7 +348,6 @@ def build_config(argv: list[str] | None = None, env: dict | None = None) -> Brid
     config = BridgeConfig(
         host=args.host,
         port=args.port,
-        api_key=env.get("CLAUDE_BRIDGE_API_KEY") or None,
         claude_path=args.claude_path,
         antigravity_path=args.antigravity_path,
         model=args.model,
@@ -395,16 +393,11 @@ def validate_config(config: BridgeConfig) -> None:
         upstream = urlsplit(config.upstream_base_url)
         if upstream.scheme not in ("http", "https") or not upstream.netloc:
             raise ValueError(f"中継先の URL が不正です: {config.upstream_base_url}")
-        # 中継では Codex が送る Authorization をそのまま上流へ渡すため、独自キーの検証と両立しない。
-        if config.api_key:
-            raise ValueError("中継の有効時に CLAUDE_BRIDGE_API_KEY は併用できません")
     if config.timeout_seconds <= 0:
         raise ValueError("タイムアウトは正の秒数で指定してください")
     if config.max_request_bytes <= 0:
         raise ValueError("リクエストの上限サイズは正の値で指定してください")
     if config.max_upstream_request_bytes <= 0:
         raise ValueError("上流中継リクエストの上限サイズは正の値で指定してください")
-    if not config.is_loopback() and not config.api_key:
-        raise ValueError(
-            "ループバック以外へ bind する場合は CLAUDE_BRIDGE_API_KEY の設定が必要です"
-        )
+    if not config.is_loopback():
+        raise ValueError("ループバック以外へ bind できません")

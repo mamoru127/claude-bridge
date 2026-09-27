@@ -1,6 +1,5 @@
 """127.0.0.1 で待ち受けるローカル HTTP サーバー。"""
 
-import hmac
 import json
 import logging
 import subprocess
@@ -127,7 +126,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         config = self.server.config
         try:
-            self._authorize(config)
             if path != MODELS_PATH:
                 raise self._not_found(path)
             payload = build_models(config, self._upstream_models(config))
@@ -147,7 +145,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
         config = self.server.config
         path = self.route_path()
         try:
-            self._authorize(config)
             if path == APP_SERVER_PATH:
                 self._send_json(200, {"result": self._app_server_rpc(config)})
                 return
@@ -482,18 +479,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             session.resume,
             len(text),
         )
-
-    def _authorize(self, config: BridgeConfig) -> None:
-        if not config.api_key:
-            return
-        scheme, _, token = self.headers.get("Authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not hmac.compare_digest(token.strip(), config.api_key):
-            raise BridgeError(
-                "Authorization ヘッダが不正です",
-                status=401,
-                error_type="invalid_request_error",
-                code="invalid_api_key",
-            )
 
     def _read_body(self, config: BridgeConfig) -> bytes:
         """中継でそのまま送れるよう、本文を生のバイト列で読む。"""
