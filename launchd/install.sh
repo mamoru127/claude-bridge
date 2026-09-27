@@ -8,10 +8,29 @@ source_dir="$(cd "$(dirname "$0")" && pwd)"
 source_plist="$source_dir/$label.plist"
 working_dir="$(cd "$source_dir/.." && pwd)"
 python_bin="${CLAUDE_BRIDGE_PYTHON:-$(command -v python3)}"
+project_dir="${CLAUDE_BRIDGE_WORKING_DIR:-$working_dir}"
 installed_plist="$HOME/Library/LaunchAgents/$label.plist"
 domain="gui/$(id -u)"
 health_url="http://127.0.0.1:8787/health"
 log_dir="$HOME/Library/Logs/claude-bridge"
+app_server_socket="${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
+
+if [ ! -d "$project_dir" ]; then
+  echo "作業ディレクトリが存在しません: $project_dir" >&2
+  exit 1
+fi
+if ! "$python_bin" -c 'import sys; sys.exit(sys.version_info < (3, 11))' < /dev/null; then
+  echo "Python 3.11 以上が必要です: $python_bin" >&2
+  exit 1
+fi
+# 既存の別サービスが使っている場合は、登録済みブリッジも止めずに終了する。
+registered_pid="$(launchctl print "$domain/$label" 2>/dev/null | awk '/^[[:space:]]+pid = /{print $3}' || true)"
+for pid in $(lsof -ti tcp:8787 -sTCP:LISTEN || true); do
+  if [ "$pid" != "$registered_pid" ]; then
+    echo "ポート 8787 は別のプロセスが使用中です (pid=$pid)。停止せずに終了します。" >&2
+    exit 1
+  fi
+done
 
 # 自分がブリッジの子孫（ブリッジ経由で動く Claude CLI のシェル）かどうか。
 # bootout はブリッジのプロセスグループごと SIGKILL するため、子孫から直接実行すると
@@ -45,19 +64,38 @@ if [ "${1:-}" = "--detached" ]; then
   sleep 1
 fi
 
+# 初回は共有 app-server もセットアップし、Claude から Codex の機能を使えるようにする。
+if [ ! -S "$app_server_socket" ]; then
+  "$source_dir/install-app-server.sh"
+  if [ ! -S "$app_server_socket" ]; then
+    echo "共有 app-server のソケットが見つかりません: $app_server_socket" >&2
+    exit 1
+  fi
+else
+  # 既存の共有 app-server にも Codex のツールが登録されていることを保証する。
+  "$source_dir/install-app-server.sh" --connection-only
+fi
+
 sed -e "s|__PYTHON_BIN__|$python_bin|g" \
     -e "s|__WORKING_DIR__|$working_dir|g" \
+    -e "s|__PROJECT_DIR__|$project_dir|g" \
     -e "s|__HOME__|$HOME|g" \
     "$source_plist" > "$installed_plist"
 
 # 登録済みなら一度外す。未登録の場合の失敗は無視する。
 launchctl bootout "$domain/$label" 2>/dev/null || true
 
-# 手動起動したブリッジが 8787 を掴んだままだと bind に失敗するため、先に止める。
-for pid in $(lsof -ti tcp:8787 -sTCP:LISTEN || true); do
-  echo "stopping existing listener pid=$pid"
-  kill "$pid" 2>/dev/null || true
+# 他のサービスが使うポートを勝手に解放しない。自分の bootout が完了するまでだけ待つ。
+for _ in $(seq 1 5); do
+  if [ -z "$(lsof -ti tcp:8787 -sTCP:LISTEN)" ]; then
+    break
+  fi
+  sleep 1
 done
+if [ -n "$(lsof -ti tcp:8787 -sTCP:LISTEN)" ]; then
+  echo "ポート 8787 は別のプロセスが使用中です。停止せずに終了します。" >&2
+  exit 1
+fi
 
 launchctl bootstrap "$domain" "$installed_plist"
 

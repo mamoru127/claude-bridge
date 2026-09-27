@@ -10,13 +10,22 @@ jobs:
     strategy:
       matrix:
         os: [macos-latest, windows-latest]
+        python-version: ['3.11', '3.14']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: ${{ matrix.python-version }}
       - name: Test portable bridge
-        run: python -m unittest tests.test_bridge tests.test_passthrough tests.test_antigravity
+        run: python -m unittest tests.test_bridge tests.test_passthrough tests.test_antigravity tests.test_app_server_mcp tests.test_uds_websocket tests.test_main
+      - name: Check Windows installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path windows/install.ps1).Path, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count) { throw ($errors | Out-String) }
       - name: Test macOS integrations
         if: runner.os == 'macOS'
         run: python -m unittest discover -s tests

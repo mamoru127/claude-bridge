@@ -1375,7 +1375,9 @@ class CodexMcpConfigTest(unittest.TestCase):
 
         self.assertFalse(config.codex_mcp)
         self.assertTrue(
-            config.app_server_socket.endswith("app-server-control/app-server-control.sock")
+            config.app_server_socket.endswith(
+                os.path.join("app-server-control", "app-server-control.sock")
+            )
         )
 
     def test_enabled_by_flag(self):
@@ -1405,7 +1407,7 @@ class CodexMcpConfigTest(unittest.TestCase):
 
         self.assertEqual(
             config.app_server_socket,
-            "/tmp/codex-home/app-server-control/app-server-control.sock",
+            os.path.join("/tmp/codex-home", "app-server-control", "app-server-control.sock"),
         )
 
 

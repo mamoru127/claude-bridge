@@ -41,6 +41,7 @@ Claude だけを使う場合は `--antigravity-models ""` を付けてくださ�
 name = "Claude CLI bridge"
 base_url = "http://127.0.0.1:8787/v1"
 wire_api = "responses"
+requires_openai_auth = true
 
 [profiles.claude]
 model_provider = "claude_bridge"
@@ -54,7 +55,7 @@ model_provider = "claude_bridge"
 model = "opus"
 ```
 
-Codex のモデル一覧に Claude と GPT を一緒に表示する場合は、ブリッジの起動時に `--upstream-base-url https://chatgpt.com/backend-api/codex` を指定します。Claude / Gemini 以外のモデルは上流へ中継され、Codex から受け取った認証ヘッダーもそのまま転送されます。ブリッジに上流用の API キーを設定する必要はありません。
+`requires_openai_auth` は、Codex のログイン情報を上流の ChatGPT へ転送するための設定です。ブリッジ用の API キーではありません。GPT も使う場合は、ブリッジの起動時に `--upstream-base-url https://chatgpt.com/backend-api/codex` を指定します。macOS の常駐設定では指定済みです。
 
 ## モデルと主な設定
 
@@ -72,7 +73,7 @@ Codex のモデル一覧に Claude と GPT を一緒に表示する場合は、�
 | `--claude-models NAMES` | Claude に割り当てるモデル名のカンマ区切り |
 | `--antigravity-models NAMES` | Gemini に割り当てるモデル名のカンマ区切り。空文字で無効 |
 | `--upstream-base-url URL` | それ以外のモデルの中継先 |
-| `--enable-codex-mcp` | Claude から共有 Codex app-server のツールを使う（macOS のみ） |
+| `--enable-codex-mcp` | Claude から Codex app-server のスレッド操作を使う |
 | `--mcp-config-file PATH` | Claude に追加する MCP サーバーの設定 |
 
 Gemini の公開名は固定です。実行時に `agy models` を参照して対応する最新バージョンへ変換し、結果は最大 10 分保持します。特定バージョンに固定したい場合は `--antigravity-models` に実際のモデル名を指定できます。
@@ -82,16 +83,27 @@ Gemini の公開名は固定です。実行時に `agy models` を参照して�
 ## macOS で常駐させる
 
 ```bash
-launchd/install.sh
+CLAUDE_BRIDGE_WORKING_DIR=/path/to/project launchd/install.sh
 ```
 
-起動設定は `launchd/local.claude-bridge.plist` にあります。変更後は `launchd/install.sh` を再実行してください。この操作は実行中のブリッジを再起動します。
+起動設定は `launchd/local.claude-bridge.plist` にあります。Codex が渡すツール（imagegen など）は Claude でも既定で使えます。スレッド操作用の共有 app-server もインストーラーが設定します。macOS の ChatGPT アプリを `/Applications` にインストールしてから実行し、連携設定を反映するためにアプリを再起動してください。使用中の 8787 を持つ別プロセスは停止しません。
+
+## Windows で常駐させる
+
+Codex CLI をインストールし、ログインしてから PowerShell で実行します。
+
+```powershell
+.\windows\install.ps1 -WorkingDir C:\path\to\project
+```
+
+ログオン時にブリッジを起動し、Codex の共有 app-server とスレッド操作も既定で使えます。再設定時も 8787 を使う別のプロセスは停止しません。
 
 ## 注意点
 
 - ブリッジはループバックアドレスでのみ待ち受けます。ブリッジ自体に HTTP 認証はありません。
 - Claude と Antigravity は非対話実行時のツール操作を自動承認します。`--working-dir` と `--add-dir` には信頼できる場所だけを指定してください。
-- Windows では HTTP ブリッジ、Claude CLI、上流中継を利用できます。`launchd/`、共有 Codex app-server、Mac 版アプリの Browser 連携は macOS 専用です。
+- Windows でも Codex から渡されたツール（imagegen や Browser など）と共有 app-server のスレッド操作を利用できます。
+- スマホ Remote のスレッドを Mac 版アプリで自動表示する補助機能は macOS 専用です。
 - 画像生成・編集 API は `--upstream-base-url` を指定した場合に上流へ中継します。
 
 ## テスト

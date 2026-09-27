@@ -16,6 +16,8 @@
     <string>__PYTHON_BIN__</string>
     <string>-m</string>
     <string>claude_bridge</string>
+    <string>--working-dir</string>
+    <string>__PROJECT_DIR__</string>
     <string>--upstream-base-url</string>
     <string>https://chatgpt.com/backend-api/codex</string>
     <string>--claude-models</string>

@@ -97,7 +97,7 @@ def default_app_server_socket(env=None) -> str:
 
     env = os.environ if env is None else env
     codex_home = env.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
-    return os.path.join(codex_home, APP_SERVER_SOCKET_RELATIVE_PATH)
+    return os.path.join(codex_home, *APP_SERVER_SOCKET_RELATIVE_PATH.split("/"))
 
 
 @dataclass(frozen=True)
