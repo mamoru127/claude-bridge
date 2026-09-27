@@ -125,8 +125,8 @@ class FakeAppServer:
 
 class UdsWebSocketTest(unittest.TestCase):
     def setUp(self) -> None:
-        # ソケットのパスには長さの上限がある。TMPDIR が長い環境を避ける。
-        self.directory = tempfile.mkdtemp(dir="/tmp")
+        # macOS の長い TMPDIR は避け、Windows では OS の一時領域を使う。
+        self.directory = tempfile.mkdtemp(dir=None if os.name == "nt" else "/tmp")
         self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
 
     def read_in_background(self, client) -> queue.Queue:
