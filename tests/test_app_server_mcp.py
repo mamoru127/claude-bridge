@@ -1470,7 +1470,10 @@ class ExtraMcpConfigFileTest(unittest.TestCase):
         """launchd の環境変数では `~` が展開されないため、設定側で解決する。"""
 
         path = self.write_server_file()
-        with mock.patch.dict(os.environ, {"HOME": os.path.dirname(path)}):
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": os.path.dirname(path), "USERPROFILE": os.path.dirname(path)},
+        ):
             config = build_config(["--mcp-config-file", "~/mcp.json"], env={})
 
         self.assertEqual(set(config.extra_mcp_servers), {"alchemist-mcp"})
