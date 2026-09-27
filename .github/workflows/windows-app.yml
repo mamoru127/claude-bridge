@@ -1,0 +1,26 @@
+name: Windows app smoke test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  app:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install ChatGPT desktop app
+        shell: pwsh
+        run: |
+          winget install --id 9PLM9XGG6VKS -s msstore --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { throw "winget exited with $LASTEXITCODE" }
+          $package = Get-AppxPackage -Name OpenAI.Codex
+          if (-not $package) { throw 'OpenAI.Codex package was not registered' }
+          Write-Host "Installed: $($package.PackageFullName)"
+      - name: Activate app through a Codex URL
+        shell: pwsh
+        run: |
+          Start-Process 'codex://settings'
+          Start-Sleep -Seconds 10
+          $process = Get-Process | Where-Object { $_.ProcessName -match 'ChatGPT|Codex' }
+          if (-not $process) { throw 'Codex app process did not start' }
+          $process | Select-Object ProcessName, Id
