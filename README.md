@@ -57,6 +57,15 @@ model = "opus"
 
 `requires_openai_auth` は、Codex のログイン情報を上流の ChatGPT へ転送するための設定です。ブリッジ用の API キーではありません。GPT も使う場合は、ブリッジの起動時に `--upstream-base-url https://chatgpt.com/backend-api/codex` を指定します。macOS の常駐設定では指定済みです。
 
+音声を使う場合は、`~/.codex/config.toml` の先頭（テーブルより前）に次を追加し、Codex アプリを再起動してください。音声の WebRTC 開始を ChatGPT 側へ、WebSocket 制御を OpenAI API 側へ直接接続し、通常の会話はブリッジ経由のまま使います。
+
+```toml
+experimental_realtime_webrtc_call_base_url = "https://chatgpt.com/backend-api/codex"
+experimental_realtime_ws_base_url = "wss://api.openai.com/v1"
+```
+
+ChatGPT ログイン用の音声開始 API は `/realtime/calls?intent=quicksilver&architecture=avas` で、本文も通常の `/v1/live` と異なります。単に `/live` を上流へ転送するだけでは動作しません。
+
 ## モデルと主な設定
 
 | モデル名 | 実行先 |
@@ -104,6 +113,7 @@ Codex CLI をインストールし、ログインしてから PowerShell で実�
 - Claude と Antigravity は非対話実行時のツール操作を自動承認します。`--working-dir` と `--add-dir` には信頼できる場所だけを指定してください。
 - Windows でも Codex から渡されたツール（imagegen や Browser など）と共有 app-server のスレッド操作を利用できます。
 - 画像生成・編集 API は `--upstream-base-url` を指定した場合に上流へ中継します。
+- 音声はブリッジではなく Codex のネイティブ OpenAI 経路を使います。「Codex から使う」の音声設定が必要です。
 
 ## テスト
 
