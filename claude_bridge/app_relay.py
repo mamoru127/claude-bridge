@@ -46,6 +46,7 @@ class FrameReader:
         self._buffer = bytearray()
         self._opcode = None
         self._parts: list[bytes] = []
+        self._reported_compression = False
 
     def feed(self, data: bytes) -> list[bytes]:
         self._buffer += data
@@ -72,6 +73,10 @@ class FrameReader:
         if len(buffer) < 2:
             return None
         final = bool(buffer[0] & 0x80)
+        if buffer[0] & 0x40 and not self._reported_compression:
+            # 圧縮されたフレームは中身を読めない。気づけるよう一度だけ残す。
+            self._reported_compression = True
+            logger.info("compressed WebSocket frame seen; messages on this connection are unreadable")
         opcode = buffer[0] & 0x0F
         masked = bool(buffer[1] & 0x80)
         length = buffer[1] & 0x7F
@@ -123,12 +128,15 @@ class SteerWatch:
     def __init__(self, notify) -> None:
         self._notify = notify
         self._pending: dict = {}
+        self._reported_unreadable = False
         self._lock = threading.Lock()
 
     def from_app(self, text: bytes) -> None:
         message = _decode(text)
         if message is None:
-            logger.debug("app message not JSON (%d bytes)", len(text))
+            if not self._reported_unreadable:
+                self._reported_unreadable = True
+                logger.info("app message not JSON (%d bytes, starts %r)", len(text), text[:8])
             return
         method = message.get("method")
         logger.debug("app request method=%s", method)
@@ -267,6 +275,10 @@ class AppRelay:
                         continue
                     head, rest = head.split(_HEAD_END, 1)
                     if rewrite_head:
+                        lines = head.split(b"\r\n")
+                        names = [line.split(b":", 1)[0].decode("latin-1") for line in lines[1:]]
+                        logger.info("app connection opened: %s headers=%s",
+                                    lines[0][:80].decode("latin-1"), ",".join(names))
                         head = strip_extensions(head)
                     target.sendall(head + _HEAD_END + rest)
                     in_head = False
