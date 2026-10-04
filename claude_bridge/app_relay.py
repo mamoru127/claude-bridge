@@ -127,7 +127,17 @@ class SteerWatch:
 
     def from_app(self, text: bytes) -> None:
         message = _decode(text)
-        if message is None or message.get("method") not in STEER_METHODS:
+        if message is None:
+            logger.debug("app message not JSON (%d bytes)", len(text))
+            return
+        method = message.get("method")
+        logger.debug("app request method=%s", method)
+        if isinstance(method, str) and method.startswith(("turn/", "thread/queue/")):
+            # アプリが指示の送り方を変えたときに気づけるよう、指示らしい要求は名前を残す。
+            params = message.get("params")
+            logger.info("app sent %s for thread %s", method,
+                        params.get("threadId") if isinstance(params, dict) else None)
+        if method not in STEER_METHODS:
             return
         params = message.get("params")
         thread_id = params.get("threadId") if isinstance(params, dict) else None
@@ -147,6 +157,9 @@ class SteerWatch:
         with self._lock:
             thread_id = self._pending.pop(_id_key(message["id"]), None)
         # 受理されてから区切る。先に区切ると、指示が差し込まれる前にターンが終わる。
+        if thread_id is not None:
+            logger.info("instruction for thread %s %s", thread_id,
+                        "accepted" if "result" in message else "rejected")
         if thread_id is not None and "result" in message:
             self._notify(thread_id)
 
@@ -283,7 +296,8 @@ def main(argv: list[str] | None = None) -> int:
         help="知らせを送るブリッジの URL",
     )
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    level = os.environ.get("CLAUDE_BRIDGE_RELAY_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
     relay = AppRelay(args.listen, args.upstream, BridgeNotifier(args.bridge_url))
     logger.info("relaying %s -> %s", args.listen, args.upstream)
     relay.serve_forever()
