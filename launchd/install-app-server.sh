@@ -14,9 +14,10 @@ fi
 setup_connection() {
   /usr/bin/python3 "$source_dir/install-app-connection.py"
   # ChatGPT アプリは自分が起動していないプロセスからのアプリ用ツール接続を拒むため、
-  # 照合に失敗しても app-server とブリッジの登録は止めない。
+  # launchd の共有 app-server では codex_app が必ず失敗する。無効にしておき、
+  # スレッドの作成や送信はブリッジの codex_app_server を使う。
   if ! PYTHONPATH="$source_dir/.." "$bridge_python" -m claude_bridge.app_tools_setup; then
-    echo "警告: Codex アプリ用ツール (codex_app) を確認できませんでした。登録は続けます。" >&2
+    echo "警告: codex_app を無効にできませんでした。登録は続けます。" >&2
   fi
 }
 if [ "${1:-}" = "--connection-only" ] && [ "$#" -eq 1 ]; then
