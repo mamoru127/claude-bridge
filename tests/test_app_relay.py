@@ -46,6 +46,11 @@ class FrameReaderTest(unittest.TestCase):
 
         self.assertEqual(reader.feed(data), [b"abcd"])
 
+    def test_reads_binary_messages(self):
+        reader = FrameReader()
+
+        self.assertEqual(reader.feed(masked_frame(0x2, b'{"id": 2}')), [b'{"id": 2}'])
+
     def test_reads_extended_lengths(self):
         medium, large = b"m" * 300, b"l" * 70000
         reader = FrameReader()

@@ -63,8 +63,8 @@ class FrameReader:
                 # ping・pong・close は読み飛ばす。中継は同じバイトをそのまま流している。
                 continue
             if final:
-                if self._opcode == _OP_TEXT:
-                    messages.append(b"".join(self._parts))
+                # JSON-RPC をバイナリ形式で流すクライアントもある。どちらも JSON として読む。
+                messages.append(b"".join(self._parts))
                 self._opcode, self._parts = None, []
 
     def _next_frame(self):
@@ -132,6 +132,11 @@ class SteerWatch:
             return
         method = message.get("method")
         logger.debug("app request method=%s", method)
+        if method == "initialize":
+            params = message.get("params")
+            client = params.get("clientInfo") if isinstance(params, dict) else None
+            logger.info("app client connected: %s",
+                        client.get("name") if isinstance(client, dict) else None)
         if isinstance(method, str) and method.startswith(("turn/", "thread/queue/")):
             # アプリが指示の送り方を変えたときに気づけるよう、指示らしい要求は名前を残す。
             params = message.get("params")
