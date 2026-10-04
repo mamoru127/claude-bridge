@@ -54,17 +54,16 @@ class SteerEndpointTest(BridgeHTTPTestCase):
             time.sleep(0.01)
         return thread, results
 
-    def steered(self, base_url, thread_id):
-        status, body = self.post(base_url, {"threadId": thread_id}, path="/app-server/steered")
-        self.assertEqual(status, 200)
-        return body["result"]["handedBack"]
+    def steered(self, server, thread_id):
+        # app-server の記録に差し込みが現れたときと同じく、そのスレッドの CLI を区切る。
+        return server.sessions.hand_back(thread_id)
 
     def test_working_cli_is_stopped_and_the_turn_closes_normally(self):
         runner = HangingRunner()
-        _, base_url = self.start_bridge(runner)
+        server, base_url = self.start_bridge(runner)
         turn, results = self.run_claude(base_url, runner)
 
-        self.assertTrue(self.steered(base_url, "thread-1"))
+        self.assertTrue(self.steered(server, "thread-1"))
         turn.join(5)
 
         # 失敗ではなく完了で閉じる。Codex は差し込まれた指示を載せて次を送ってくる。
@@ -75,10 +74,10 @@ class SteerEndpointTest(BridgeHTTPTestCase):
 
     def test_non_stream_turn_also_closes_normally(self):
         runner = HangingRunner()
-        _, base_url = self.start_bridge(runner)
+        server, base_url = self.start_bridge(runner)
         turn, results = self.run_claude(base_url, runner, stream=False)
 
-        self.steered(base_url, "thread-1")
+        self.steered(server, "thread-1")
         turn.join(5)
 
         status, body = results[0]
@@ -87,10 +86,10 @@ class SteerEndpointTest(BridgeHTTPTestCase):
 
     def test_other_threads_are_left_alone(self):
         runner = HangingRunner()
-        _, base_url = self.start_bridge(runner)
+        server, base_url = self.start_bridge(runner)
         self.run_claude(base_url, runner)
 
-        self.assertFalse(self.steered(base_url, "thread-2"))
+        self.assertFalse(self.steered(server, "thread-2"))
         self.assertEqual(runner.processes[0].killed, 0)
         runner.processes[0].kill()
 

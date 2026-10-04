@@ -22,7 +22,6 @@ from .config import (
     MODELS_PATH,
     PASSTHROUGH_PATH,
     RESPONSES_PATH,
-    STEERED_PATH,
     BridgeConfig,
     codex_home,
 )
@@ -187,9 +186,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if path == PASSTHROUGH_PATH:
                 self._send_json(200, {"result": self._pending_call(config)})
                 return
-            if path == STEERED_PATH:
-                self._send_json(200, {"result": self._steered(config)})
-                return
             if path in IMAGE_PATHS:
                 if not config.upstream_base_url:
                     raise BridgeError(
@@ -282,13 +278,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             raise BridgeError(
                 str(error), status=502, error_type="api_error", code="app_server_failed"
             ) from error
-
-    def _steered(self, config: BridgeConfig) -> dict:
-        """アプリとの中継から、作業中のスレッドへ指示が受理されたと知らせを受ける。"""
-
-        payload = self._decode_json(self._read_json_body(config))
-        thread_id = payload.get("threadId") if isinstance(payload, dict) else None
-        return {"handedBack": self._hand_back(thread_id)}
 
     def _hand_back(self, thread_id: object) -> bool:
         """そのスレッドで走っている Claude CLI の作業を区切る。走っていなければ何もしない。"""
