@@ -112,6 +112,14 @@ class AppRelayTest(unittest.TestCase):
 
         self.assertEqual(self.notified.get(timeout=5), "th-1")
 
+    def test_queued_instruction_is_reported_after_the_server_accepts_it(self):
+        queued = {"id": 8, "method": "thread/queue/add", "params": {"threadId": "th-2"}}
+
+        self.request(queued)
+        self.reply({"id": 8, "result": {}})
+
+        self.assertEqual(self.notified.get(timeout=5), "th-2")
+
     def test_rejected_steer_is_not_reported(self):
         self.request({"id": "a", "method": "turn/steer", "params": {"threadId": "th-1"}})
         self.reply({"id": "a", "error": {"code": -32600, "message": "no active turn"}})

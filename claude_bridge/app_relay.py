@@ -33,7 +33,9 @@ _OP_CONTINUATION = 0x0
 _OP_TEXT = 0x1
 _OP_BINARY = 0x2
 # 作業中のスレッドへ指示を差し込む要求。作業中でなければ app-server が新しいターンにする。
-STEER_METHODS = ("turn/steer", "turn/start")
+# 今のアプリは入力欄の指示を thread/queue/add でキューに積み、app-server がそれを
+# 作業中のターンへ差し込む。
+STEER_METHODS = ("turn/steer", "turn/start", "thread/queue/add")
 NOTIFY_TIMEOUT_SECONDS = 5.0
 
 
