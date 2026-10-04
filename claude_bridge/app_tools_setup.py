@@ -43,7 +43,10 @@ def verify_tools(client):
 
 def install_tools(client, user_home: Path, codex_home: Path, resources: Path = RESOURCES):
     plugin = resources / "plugins/openai-bundled/plugins/codex-app-tools"
-    defaults = json.loads((plugin / "desktop-mcp.json").read_text())["mcpServers"]["codex_app"]
+    # ChatGPT renamed desktop-mcp.json to .mcp.json; read whichever this build ships.
+    manifest = next((plugin / name for name in (".mcp.json", "desktop-mcp.json") if (plugin / name).is_file()),
+                    plugin / ".mcp.json")
+    defaults = json.loads(manifest.read_text())["mcpServers"]["codex_app"]
     for path in [resources / "cua_node/bin/node", plugin / "server.mjs", LAUNCHER]:
         if not path.is_file():
             raise FileNotFoundError(path)

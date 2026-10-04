@@ -29,7 +29,7 @@ class AppToolsSetupTests(unittest.TestCase):
         defaults = {"command": "./scripts/launch_codex_app_tools_mcp", "args": ["./server.mjs"],
                     "cwd": ".", "enabled": True, "env_vars": ["HOME"],
                     "tools": {"create_thread": {"approval_mode": "prompt"}}}
-        (self.plugin / "desktop-mcp.json").write_text(json.dumps({"mcpServers": {"codex_app": defaults}}))
+        (self.plugin / ".mcp.json").write_text(json.dumps({"mcpServers": {"codex_app": defaults}}))
         (self.plugin / "server.mjs").touch()
         node = self.resources / "cua_node/bin/node"
         node.parent.mkdir(parents=True)
@@ -66,6 +66,11 @@ class AppToolsSetupTests(unittest.TestCase):
 
     def install(self):
         setup.install_tools(self.client, self.home, self.codex_home, self.resources)
+
+    def test_install_reads_older_desktop_mcp_manifest(self):
+        (self.plugin / ".mcp.json").rename(self.plugin / "desktop-mcp.json")
+        self.install()
+        self.assertEqual(self.config["mcp_servers"]["codex_app"]["env_vars"], ["HOME"])
 
     def test_install_repairs_transport_and_deferred_exposure_preserving_permissions(self):
         self.install()
