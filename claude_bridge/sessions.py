@@ -11,6 +11,7 @@ import json
 import select
 import socket
 import threading
+import time
 import uuid
 from collections import OrderedDict
 
@@ -38,6 +39,8 @@ class Session:
         self._pending = (0, "", "")
         self._process_lock = threading.Lock()
         self._process = None
+        # 今の CLI を起動した時刻。指示より後に起動した実行は、その指示を受け取っている。
+        self._started_at = 0.0
         # 今の実行の結果を待っている相手。take_over が生死を見るためだけに持つ。
         self._client = None
         # この会話の引き継ぎを予約した実行がいるか。引き継いだ側が借りるまでの間だけ真。
@@ -77,6 +80,7 @@ class Session:
 
         with self._process_lock:
             self._process = process
+            self._started_at = time.time()
 
     def abort(self) -> None:
         """相手が切断した実行の CLI を、子孫ごと止める。会話の後片付けは finish が行う。"""
@@ -85,8 +89,11 @@ class Session:
             if self._process is not None:
                 kill_tree(self._process)
 
-    def hand_back(self) -> bool:
+    def hand_back(self, steered_at: float | None = None) -> bool:
         """作業をここで区切って Codex へ返す。CLI を止められたかを返す。
+
+        steered_at は指示が受理された時刻。それより後に起動した CLI は、Codex がその指示を
+        載せて送ってきた実行なので止めない。
 
         作業中のスレッドへ届いた指示を、app-server は次のモデル呼び出しへ差し込む。
         Claude CLI はターン全体を 1 回の呼び出しで走らせるため、区切らないと作業が
@@ -96,6 +103,8 @@ class Session:
 
         with self._process_lock:
             if self._process is None:
+                return False
+            if steered_at is not None and self._started_at >= steered_at:
                 return False
             self._handed_back = True
             kill_tree(self._process)
@@ -293,7 +302,7 @@ class SessionRegistry:
         session.finish()
         session.lock.release()
 
-    def hand_back(self, key: object) -> bool:
+    def hand_back(self, key: object, steered_at: float | None = None) -> bool:
         """この会話で走っている CLI の作業を区切って Codex へ返す。返したかを返す。
 
         並行して走るその場限りの実行は会話に登録しないため、ここからは止めない。
@@ -301,7 +310,7 @@ class SessionRegistry:
 
         with self._lock:
             session = self._sessions.get(key) if isinstance(key, str) else None
-        return session is not None and session.hand_back()
+        return session is not None and session.hand_back(steered_at)
 
 
 def _standalone(client) -> Session:

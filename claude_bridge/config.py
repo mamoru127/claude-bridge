@@ -94,12 +94,17 @@ PASSTHROUGH_DEFS_ENV = "CLAUDE_BRIDGE_PASSTHROUGH_DEFS"
 PASSTHROUGH_TOKEN_ENV = "CLAUDE_BRIDGE_PASSTHROUGH_TOKEN"
 
 
+def codex_home(env=None) -> str:
+    """Codex の設定と記録の置き場所。CODEX_HOME に従う。"""
+
+    env = os.environ if env is None else env
+    return env.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+
+
 def default_app_server_socket(env=None) -> str:
     """常駐 app-server の制御ソケットの既定の場所。CODEX_HOME に従う。"""
 
-    env = os.environ if env is None else env
-    codex_home = env.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
-    return os.path.join(codex_home, *APP_SERVER_SOCKET_RELATIVE_PATH.split("/"))
+    return os.path.join(codex_home(env), *APP_SERVER_SOCKET_RELATIVE_PATH.split("/"))
 
 
 @dataclass(frozen=True)

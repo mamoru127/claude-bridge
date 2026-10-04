@@ -24,6 +24,7 @@ from .config import (
     RESPONSES_PATH,
     STEERED_PATH,
     BridgeConfig,
+    codex_home,
 )
 from .errors import BridgeError
 from .responses import (
@@ -37,6 +38,7 @@ from .responses import (
     requested_model,
 )
 from .sessions import PendingCalls, SessionRegistry, connected
+from .steer_log import SteerLogWatcher
 from .upstream import (
     RELAY_CHUNK_BYTES,
     fetch_models,
@@ -691,7 +693,19 @@ class BridgeServer(ThreadingHTTPServer):
         self.pending = PendingCalls()
         # app-server はここで持つ。実行中のターンをアダプタの再起動から切り離すための要。
         self.app_server = AppServerClient(socket_path=config.app_server_socket)
+        self.steer_log = None
+        if config.codex_mcp:
+            self.steer_log = SteerLogWatcher(codex_home(), self._steered_in_log)
+            self.steer_log.start()
+
+    def _steered_in_log(self, thread_id: str, steered_at: float) -> None:
+        """app-server が作業中のスレッドへ指示を差し込んだ。アプリ・iPhone・MCP のどれでも届く。"""
+
+        if self.sessions.hand_back(thread_id, steered_at):
+            logger.info("cli handed back to codex for a new instruction")
 
     def server_close(self) -> None:
+        if self.steer_log is not None:
+            self.steer_log.stop()
         self.app_server.close()
         super().server_close()
