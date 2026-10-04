@@ -13,7 +13,11 @@ if [ ! -x "$bridge_python" ]; then
 fi
 setup_connection() {
   /usr/bin/python3 "$source_dir/install-app-connection.py"
-  PYTHONPATH="$source_dir/.." "$bridge_python" -m claude_bridge.app_tools_setup
+  # ChatGPT アプリは自分が起動していないプロセスからのアプリ用ツール接続を拒むため、
+  # 照合に失敗しても app-server とブリッジの登録は止めない。
+  if ! PYTHONPATH="$source_dir/.." "$bridge_python" -m claude_bridge.app_tools_setup; then
+    echo "警告: Codex アプリ用ツール (codex_app) を確認できませんでした。登録は続けます。" >&2
+  fi
 }
 if [ "${1:-}" = "--connection-only" ] && [ "$#" -eq 1 ]; then
   setup_connection

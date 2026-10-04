@@ -34,7 +34,8 @@ def verify_tools(client):
             if server["name"] == "codex_app":
                 missing = REQUIRED_TOOLS - server["tools"].keys()
                 if missing:
-                    raise RuntimeError(f"codex_app is missing required tools: {', '.join(sorted(missing))}")
+                    raise RuntimeError(f"codex_app is missing required tools: {', '.join(sorted(missing))}"
+                                       f" ({server.get('toolsError') or 'no error reported'})")
                 return
         cursor = page.get("nextCursor")
         if not cursor:
