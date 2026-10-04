@@ -97,6 +97,15 @@ CLAUDE_BRIDGE_WORKING_DIR=/path/to/project launchd/install.sh
 
 起動設定は `launchd/local.claude-bridge.plist` にあります。Codex が渡すツール（imagegen など）は Claude でも既定で使えます。スレッド操作用の共有 app-server もインストーラーが設定します。macOS の ChatGPT アプリを `/Applications` にインストールしてから実行し、連携設定を反映するためにアプリを再起動してください。使用中の 8787 を持つ別プロセスは停止しません。
 
+このマシンだけの設定（Claude に触らせる追加ディレクトリ、追加の MCP サーバーなど）は、リポジトリではなく `~/.config/claude-bridge/bridge.env` に `NAME=value` の形で書きます。`install.sh` が plist の環境変数へ足します。変えたら `install.sh` を実行し直してください。
+
+```bash
+CLAUDE_BRIDGE_ADD_DIRS=/Users/me/project-a:/Users/me/project-b
+CLAUDE_BRIDGE_MCP_CONFIG_FILE=/Users/me/.config/claude-bridge/mcp.json
+```
+
+Python はリポジトリの `.venv` があればそれを使います。別のものを使うときは `CLAUDE_BRIDGE_PYTHON` を指定します。
+
 ## Windows で常駐させる
 
 Codex CLI をインストールし、ログインしてから PowerShell で実行します。

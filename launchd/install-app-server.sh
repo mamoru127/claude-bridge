@@ -4,7 +4,9 @@
 set -euo pipefail
 
 source_dir="$(cd "$(dirname "$0")" && pwd)"
-bridge_python="${CLAUDE_BRIDGE_PYTHON:-$(command -v python3)}"
+default_python="$source_dir/../.venv/bin/python"
+[ -x "$default_python" ] || default_python="$(command -v python3)"
+bridge_python="${CLAUDE_BRIDGE_PYTHON:-$default_python}"
 if [ ! -x "$bridge_python" ]; then
   echo "Bridge Python is missing: $bridge_python" >&2
   exit 1
@@ -31,7 +33,9 @@ installed_wrapper="$installed_wrapper_dir/codex-app-server-parent.mjs"
 domain="gui/$(id -u)"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
 socket_path="$codex_home/app-server-control/app-server-control.sock"
-app_codex="/Applications/ChatGPT.app/Contents/Resources/codex"
+# アプリの版によって内蔵 codex の置き場所が違う。
+app_codex="/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+[ -x "$app_codex" ] || app_codex="/Applications/ChatGPT.app/Contents/Resources/codex"
 app_node="/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
 
 mkdir -p \

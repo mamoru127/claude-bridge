@@ -7,13 +7,18 @@ label="local.claude-bridge"
 source_dir="$(cd "$(dirname "$0")" && pwd)"
 source_plist="$source_dir/$label.plist"
 working_dir="$(cd "$source_dir/.." && pwd)"
-python_bin="${CLAUDE_BRIDGE_PYTHON:-$(command -v python3)}"
+# リポジトリに .venv があればそれを使う。
+default_python="$working_dir/.venv/bin/python"
+[ -x "$default_python" ] || default_python="$(command -v python3)"
+python_bin="${CLAUDE_BRIDGE_PYTHON:-$default_python}"
 project_dir="${CLAUDE_BRIDGE_WORKING_DIR:-$working_dir}"
 installed_plist="$HOME/Library/LaunchAgents/$label.plist"
 domain="gui/$(id -u)"
 health_url="http://127.0.0.1:8787/health"
 log_dir="$HOME/Library/Logs/claude-bridge"
 app_server_socket="${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
+# このマシンだけの設定（追加ディレクトリなど）。CLAUDE_BRIDGE_* の環境変数として plist へ足す。
+env_file="${CLAUDE_BRIDGE_ENV_FILE:-$HOME/.config/claude-bridge/bridge.env}"
 
 if [ ! -d "$project_dir" ]; then
   echo "作業ディレクトリが存在しません: $project_dir" >&2
@@ -81,6 +86,9 @@ sed -e "s|__PYTHON_BIN__|$python_bin|g" \
     -e "s|__PROJECT_DIR__|$project_dir|g" \
     -e "s|__HOME__|$HOME|g" \
     "$source_plist" > "$installed_plist"
+if [ -f "$env_file" ]; then
+  /usr/bin/python3 "$source_dir/merge-plist-env.py" "$installed_plist" "$env_file"
+fi
 
 # 登録済みなら一度外す。未登録の場合の失敗は無視する。
 launchctl bootout "$domain/$label" 2>/dev/null || true

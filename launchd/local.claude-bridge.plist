@@ -20,8 +20,6 @@
     <string>__PROJECT_DIR__</string>
     <string>--upstream-base-url</string>
     <string>https://chatgpt.com/backend-api/codex</string>
-    <string>--claude-models</string>
-    <string>opus</string>
     <string>--antigravity-models</string>
     <string>gemini-flash-high</string>
     <!-- create_thread は Codex が遅延読み込みにしているため additional_tools に載らない。
