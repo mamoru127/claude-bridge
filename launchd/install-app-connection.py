@@ -9,13 +9,25 @@ from urllib.parse import quote
 
 
 LABEL = "local.codex-shared-connection"
+# When the claude-bridge relay is installed, the app connects through it so the bridge
+# learns about instructions sent to a working Claude thread (see install-app-relay.sh).
+RELAY_LABEL = "local.claude-bridge-relay"
+RELAY_SOCKET = ".claude-bridge/app-relay.sock"
+
+
+def connection_socket(user_home: Path, codex_home: Path) -> Path:
+    """The socket the app should connect to: the relay if installed, else the app-server."""
+
+    if (user_home / "Library/LaunchAgents" / f"{RELAY_LABEL}.plist").exists():
+        return user_home / RELAY_SOCKET
+    return codex_home / "app-server-control/app-server-control.sock"
 
 
 def install_connection(user_home: Path, codex_home: Path, uid: int) -> str:
-    socket_path = codex_home / "app-server-control/app-server-control.sock"
+    socket_path = connection_socket(user_home, codex_home)
     # ws+unix splits at ':' and doesn't unescape its socket pathname.
     if not socket_path.is_absolute() or quote(str(socket_path), safe="/") != str(socket_path):
-        raise ValueError("CODEX_HOME must be an absolute URL-safe path for ws+unix")
+        raise ValueError("The app connection socket must be an absolute URL-safe path for ws+unix")
     # A localhost hostname also avoids the app's proxy for non-local WS URLs.
     url = f"ws+unix://localhost{socket_path}:/rpc"
     arguments = ["/bin/launchctl", "setenv", "CODEX_APP_SERVER_WS_URL", url]

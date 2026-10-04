@@ -137,16 +137,22 @@ def stream_claude(
     session_id = transcript_id(session)
     command = build_command(config, system_prompt, session, session_id, tools, token)
     process, stderr = launch(CLAUDE, command, config.working_dir, runner)
-    # 起動できた時点で、渡した範囲を会話へ確定させる。ここまで来れば CLI 側に転記が作られる。
     session.start(process)
-    session.confirm(session_id)
     write_stdin(process, input_line(content))
 
     seen_result = False
+    confirmed = False
     # 最後の作業コメントは result と同じ本文になる。1 件だけ保留し、重複する場合は捨てる。
     pending = None
     for line in read_lines(CLAUDE, process, stderr, config.timeout_seconds):
         for kind, value in _line_events(line):
+            # 応答が出始めた時点で、渡した範囲を会話へ確定させる。起動直後に止められた CLI は
+            # 転記を作っていないことがあり、そこで確定させると次の --resume が
+            # 「No conversation found」で失敗し続ける。確定前に止まった範囲は、次の
+            # リクエストでもう一度渡る。
+            if not confirmed:
+                session.confirm(session_id)
+                confirmed = True
             if kind == "message":
                 if pending is not None:
                     yield "message", pending

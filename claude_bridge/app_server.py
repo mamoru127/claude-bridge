@@ -146,11 +146,12 @@ class AppServerClient:
             pending = self._write(conn, method, params)
         return self._result(conn, pending, method)
 
-    def run_turn(self, params: dict) -> dict:
+    def run_turn(self, params: dict, on_accepted=None) -> dict:
         """turn/start を投げ、そのターンが終わるまで待って結果を返す。
 
         app-server は turn/start の応答を即返し、実行の経過と結果は通知で送る。
         最終メッセージを組み立てるため、turn/completed か turn/failed の通知まで読み続ける。
+        on_accepted は受理応答を受け取った直後、完了を待つ前に呼ぶ。
         """
 
         thread_id = params.get("threadId")
@@ -161,11 +162,13 @@ class AppServerClient:
             pending = self._write(conn, TURN_METHOD, params)
         try:
             self._result(conn, pending, TURN_METHOD)
+            if on_accepted is not None:
+                on_accepted()
             return self._collect(conn, notices)
         finally:
             conn.unwatch(thread_id)
 
-    def start_turn(self, params: dict) -> dict:
+    def start_turn(self, params: dict, on_accepted=None) -> dict:
         """turn/start を投げ、受理応答だけ読んで返す。完了は待たない。
 
         ターンは app-server 側で走り続け、経過と結果はセッション履歴へ書かれる。
@@ -176,6 +179,8 @@ class AppServerClient:
             conn = self._connect()
             pending = self._write(conn, TURN_METHOD, params)
         result = self._result(conn, pending, TURN_METHOD)
+        if on_accepted is not None:
+            on_accepted()
         turn = result.get("turn") if isinstance(result, dict) else None
         return {"threadId": params.get("threadId"), "turn": turn}
 

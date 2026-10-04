@@ -8,6 +8,7 @@ CLI ごとに違うのは引数の組み立てと出力の解釈だけで、起�
 import contextlib
 import os
 import shutil
+import signal
 import subprocess
 import threading
 from collections.abc import Iterator
@@ -121,7 +122,7 @@ def read_lines(
 
     def on_timeout() -> None:
         timed_out.set()
-        process.kill()
+        kill_tree(process)
 
     timer = threading.Timer(timeout_seconds, on_timeout)
     timer.start()
@@ -133,7 +134,7 @@ def read_lines(
         timer.cancel()
         # エラーやクライアント切断で読み取りを抜けた場合は、子プロセスを落として回収する。
         if returncode is None:
-            process.kill()
+            kill_tree(process)
             process.wait()
 
     if timed_out.is_set():
@@ -147,6 +148,60 @@ def read_lines(
         raise kind.error(
             f"が異常終了しました (exit={returncode}): {snippet(stderr.read())}", "failed"
         )
+
+
+def kill_tree(process) -> None:
+    """CLI とその子孫をまとめて止める。
+
+    CLI だけを落とすと、Bash ツールが起動したシェルとコマンドは親を失ったまま走り続ける。
+    子孫は CLI を落とす前に洗い出す。落とした後では親子の対応が消えて辿れない。
+    """
+
+    pid = getattr(process, "pid", None)
+    descendants: list[int] = []
+    if isinstance(pid, int) and pid > 0:
+        if os.name == "nt":
+            # /T で子孫ごと止める。止め損ねても下の kill で CLI 本体だけは確実に落とす。
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            descendants = _descendants(pid)
+    with contextlib.suppress(OSError):
+        process.kill()
+    for child in descendants:
+        with contextlib.suppress(OSError):
+            os.kill(child, signal.SIGKILL)
+
+
+def _descendants(pid: int) -> list[int]:
+    """pid の子孫。ps の一覧から親子を辿る。ps を使えなければ空。"""
+
+    try:
+        listing = subprocess.run(
+            ["ps", "-A", "-o", "pid=", "-o", "ppid="],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+    except OSError:
+        return []
+    children: dict[int, list[int]] = {}
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and all(field.isdigit() for field in fields):
+            children.setdefault(int(fields[1]), []).append(int(fields[0]))
+    found: list[int] = []
+    pending = [pid]
+    while pending:
+        for child in children.get(pending.pop(), ()):
+            if child not in found:
+                found.append(child)
+                pending.append(child)
+    return found
 
 
 def final_text(events: Iterator[tuple[str, str]]) -> str:

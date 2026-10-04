@@ -38,6 +38,18 @@ class AppConnectionInstallTests(unittest.TestCase):
                 if args[1] == "bootout":
                     self.assertEqual(args[2], f"gui/123/{installer.LABEL}")
 
+    def test_installed_relay_becomes_the_app_connection(self):
+        # 再インストールのたびに直結へ戻すと、中継を入れた意味がなくなる。
+        with tempfile.TemporaryDirectory() as directory, patch.object(installer.subprocess, "run"):
+            root = Path(directory)
+            relay_plist = root / "Library/LaunchAgents" / f"{installer.RELAY_LABEL}.plist"
+            relay_plist.parent.mkdir(parents=True)
+            relay_plist.write_bytes(b"")
+
+            url = installer.install_connection(root, root / ".codex", 123)
+
+            self.assertEqual(url, f"ws+unix://localhost{root}/.claude-bridge/app-relay.sock:/rpc")
+
     def test_invalid_socket_url_path_does_not_modify_environment_or_files(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             installer.subprocess, "run"

@@ -86,6 +86,8 @@ HEALTH_PATH = "/health"
 APP_SERVER_PATH = "/app-server/rpc"
 # 受け渡しツールのアダプタが、Claude からの呼び出しを預ける先。
 PASSTHROUGH_PATH = "/codex-tool/call"
+# 作業中のスレッドへ指示が届いたことを、アプリとの中継（app_relay）が知らせる先。
+STEERED_PATH = "/app-server/steered"
 # 受け渡しアダプタへツール定義と預かり口を渡す環境変数。
 # 定義はリクエストごとに変わるため、起動時の設定（CLAUDE_BRIDGE_PASSTHROUGH_TOOLS）とは別名にする。
 PASSTHROUGH_DEFS_ENV = "CLAUDE_BRIDGE_PASSTHROUGH_DEFS"

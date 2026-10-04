@@ -114,6 +114,9 @@ Codex CLI をインストールし、ログインしてから PowerShell で実�
 - Windows でも Codex から渡されたツール（imagegen や Browser など）と共有 app-server のスレッド操作を利用できます。
 - 画像生成・編集 API は `--upstream-base-url` を指定した場合に上流へ中継します。
 - 音声はブリッジではなく Codex のネイティブ OpenAI 経路を使います。「Codex から使う」の音声設定が必要です。
+- Codex で停止すると、ブリッジは 1 秒以内に Claude CLI を Bash などの子プロセスごと止めます。
+- Claude はターン全体を 1 回のモデル呼び出しで実行するため、そのままでは作業中に送った指示が作業の終わるまで届きません。ブリッジの `turn_start` / `turn_start_async` で作業中の Claude のスレッドへ送った指示は、受理された時点でブリッジが Claude の作業を区切り、同じターンの続きとして指示に沿って進めます。
+- ChatGPT アプリから作業中に送った指示も同じように扱うには、`launchd/install-app-relay.sh` で中継を入れ、アプリを再起動します。アプリは中継経由で共有 app-server へ繋ぎ、中継が指示の受理をブリッジへ知らせます。中継が止まるとアプリは app-server へ繋がらないため、launchd が常駐させます。外すときは `launchd/install-app-relay.sh --uninstall` を実行してアプリを再起動します。
 
 ## テスト
 

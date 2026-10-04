@@ -14,6 +14,7 @@ import threading
 import uuid
 from collections import OrderedDict
 
+from .cli_process import kill_tree
 from .responses import Message
 
 # 保持する会話の数。超えた分は古い会話から捨て、次に来たときは新しいセッションを開始する。
@@ -41,6 +42,8 @@ class Session:
         self._client = None
         # この会話の引き継ぎを予約した実行がいるか。引き継いだ側が借りるまでの間だけ真。
         self._handed_over = False
+        # 新しい指示に応えるため、実行中の作業を区切って Codex へ返したか。
+        self._handed_back = False
 
     def prepare(self, messages: tuple[Message, ...], backend: str) -> tuple[Message, ...]:
         """今回 CLI へ渡す発言を決める。
@@ -74,6 +77,33 @@ class Session:
 
         with self._process_lock:
             self._process = process
+
+    def abort(self) -> None:
+        """相手が切断した実行の CLI を、子孫ごと止める。会話の後片付けは finish が行う。"""
+
+        with self._process_lock:
+            if self._process is not None:
+                kill_tree(self._process)
+
+    def hand_back(self) -> bool:
+        """作業をここで区切って Codex へ返す。CLI を止められたかを返す。
+
+        作業中のスレッドへ届いた指示を、app-server は次のモデル呼び出しへ差し込む。
+        Claude CLI はターン全体を 1 回の呼び出しで走らせるため、区切らないと作業が
+        すべて終わるまで届かない。止めた実行はそこまでの作業で応答を閉じ、Codex は
+        指示を載せた次のリクエストを送ってくる。転記に作業が残るので、続きから進む。
+        """
+
+        with self._process_lock:
+            if self._process is None:
+                return False
+            self._handed_back = True
+            kill_tree(self._process)
+            return True
+
+    def handed_back(self) -> bool:
+        with self._process_lock:
+            return self._handed_back
 
     def try_hold(self, client) -> bool:
         """空いていればこの会話を借りる。借りられたかを返す。
@@ -118,6 +148,7 @@ class Session:
         with self._process_lock:
             self._process = None
             self._client = None
+            self._handed_back = False
 
     def is_idle(self) -> bool:
         """引き継ぎ予約も実行もないときだけ、レジストリから破棄できる。"""
@@ -143,7 +174,7 @@ class Session:
             if self._handed_over or connected(self._client):
                 return False
             if self._process is not None:
-                self._process.kill()
+                kill_tree(self._process)
                 self._process = None
             self._handed_over = True
             return True
@@ -261,6 +292,16 @@ class SessionRegistry:
     def release(self, session: Session) -> None:
         session.finish()
         session.lock.release()
+
+    def hand_back(self, key: object) -> bool:
+        """この会話で走っている CLI の作業を区切って Codex へ返す。返したかを返す。
+
+        並行して走るその場限りの実行は会話に登録しないため、ここからは止めない。
+        """
+
+        with self._lock:
+            session = self._sessions.get(key) if isinstance(key, str) else None
+        return session is not None and session.hand_back()
 
 
 def _standalone(client) -> Session:

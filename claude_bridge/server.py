@@ -22,6 +22,7 @@ from .config import (
     MODELS_PATH,
     PASSTHROUGH_PATH,
     RESPONSES_PATH,
+    STEERED_PATH,
     BridgeConfig,
 )
 from .errors import BridgeError
@@ -35,7 +36,7 @@ from .responses import (
     parse_request,
     requested_model,
 )
-from .sessions import PendingCalls, SessionRegistry
+from .sessions import PendingCalls, SessionRegistry, connected
 from .upstream import (
     RELAY_CHUNK_BYTES,
     fetch_models,
@@ -51,6 +52,8 @@ SSE_DONE = "data: [DONE]\n\n"
 
 # 書き込みが途切れている間に合図を送る間隔。クライアントの待機上限より十分短くする。
 KEEPALIVE_INTERVAL_SECONDS = 15
+# 相手の切断を確かめる間隔。停止してから CLI が止まるまでの遅れはこれ以下になる。
+CLIENT_WATCH_INTERVAL_SECONDS = 1.0
 
 
 def sse(events: list[tuple[str, dict]]) -> str:
@@ -106,6 +109,37 @@ class Keepalive:
                     return
 
 
+class ClientWatch:
+    """リクエストの相手が切断したら、走っている CLI を止める。
+
+    CLI の読み取りは出力があるまで戻らないため、長い Bash を待っている間は切断に気づけない。
+    気づくのが CLI の終了後になると、停止したはずの作業がその間も走り続ける。別スレッドで
+    接続を見張り、切れたらその場で止める。
+    """
+
+    def __init__(self, client, on_lost, interval: float = CLIENT_WATCH_INTERVAL_SECONDS) -> None:
+        self._client = client
+        self._on_lost = on_lost
+        self._interval = interval
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self) -> "ClientWatch":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self._stopped.set()
+        self._thread.join()
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            if not connected(self._client):
+                logger.info("client disconnected; stopping cli")
+                self._on_lost()
+                return
+
+
 class BridgeHandler(BaseHTTPRequestHandler):
     """Responses API の最小エンドポイントを処理する。"""
 
@@ -150,6 +184,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             if path == PASSTHROUGH_PATH:
                 self._send_json(200, {"result": self._pending_call(config)})
+                return
+            if path == STEERED_PATH:
+                self._send_json(200, {"result": self._steered(config)})
                 return
             if path in IMAGE_PATHS:
                 if not config.upstream_base_url:
@@ -230,13 +267,34 @@ class BridgeHandler(BaseHTTPRequestHandler):
         try:
             if method != TURN_METHOD:
                 return client.call(method, params)
+
+            # 作業中のスレッドへの turn/start は、app-server が次のモデル呼び出しへ差し込む。
+            # 受理された後で Claude の作業を区切り、その呼び出しを起こさせる。
+            def hand_back() -> None:
+                self._hand_back(params.get("threadId"))
+
             if payload.get("wait"):
-                return client.run_turn(params)
-            return client.start_turn(params)
+                return client.run_turn(params, on_accepted=hand_back)
+            return client.start_turn(params, on_accepted=hand_back)
         except AppServerError as error:
             raise BridgeError(
                 str(error), status=502, error_type="api_error", code="app_server_failed"
             ) from error
+
+    def _steered(self, config: BridgeConfig) -> dict:
+        """アプリとの中継から、作業中のスレッドへ指示が受理されたと知らせを受ける。"""
+
+        payload = self._decode_json(self._read_json_body(config))
+        thread_id = payload.get("threadId") if isinstance(payload, dict) else None
+        return {"handedBack": self._hand_back(thread_id)}
+
+    def _hand_back(self, thread_id: object) -> bool:
+        """そのスレッドで走っている Claude CLI の作業を区切る。走っていなければ何もしない。"""
+
+        handed_back = self.server.sessions.hand_back(thread_id)
+        if handed_back:
+            logger.info("cli handed back to codex for a new instruction")
+        return handed_back
 
     def _pending_call(self, config: BridgeConfig) -> dict:
         """受け渡しアダプタが預けたツール呼び出しを、実行中のターンへ記録する。
@@ -400,14 +458,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
         token = self._open_pending(request)
         try:
             try:
-                text = final_text(
-                    self._cli_events(config, request, session, backend, token)
-                )
+                with ClientWatch(self.connection, session.abort):
+                    text = final_text(
+                        self._cli_events(config, request, session, backend, token)
+                    )
             except BridgeError as error:
-                self._send_error(error)
-                return
+                if not session.handed_back():
+                    self._send_error(error)
+                    return
+                text = None
             stream = ResponseStream(request.model)
             stream.function_calls(self.server.pending.close(token))
+            if text is None:
+                self._send_json(200, stream.calls_response())
+                return
             self._log_completed(config, request, session, backend, text)
             self._send_json(200, stream.final_response(text))
         finally:
@@ -434,7 +498,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         token = self._open_pending(request)
         try:
             self._send_sse_headers()
-            with keepalive as alive:
+            with keepalive as alive, ClientWatch(self.connection, session.abort):
                 # CLI の完了を待つ前に受理を伝える。ここから先のエラーは SSE で返すしかない。
                 alive.write(sse(stream.started()))
                 text = ""
@@ -451,8 +515,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         else:
                             text = value
                 except BridgeError as error:
-                    logger.warning("stream failed status=%d code=%s", error.status, error.code)
-                    alive.write(sse(stream.failed(error)))
+                    if session.handed_back():
+                        # 止めたのは新しい指示に応えるため。そこまでの作業で応答を閉じると、
+                        # Codex が指示を載せた次のリクエストを送ってくる。
+                        alive.write(
+                            sse(stream.function_calls(self.server.pending.close(token)))
+                        )
+                        alive.write(sse(stream.completed_calls()))
+                    else:
+                        logger.warning(
+                            "stream failed status=%d code=%s", error.status, error.code
+                        )
+                        alive.write(sse(stream.failed(error)))
                 else:
                     # 本文より先に出す。Codex は function_call を見てツールを実行し、
                     # 結果を次のリクエストへ載せてくる。

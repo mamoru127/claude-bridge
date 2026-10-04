@@ -1199,16 +1199,20 @@ class FakeAppServer:
             raise self.raises
         return {"method": method}
 
-    def run_turn(self, params):
+    def run_turn(self, params, on_accepted=None):
         self.waited.append(params)
         if self.raises:
             raise self.raises
+        if on_accepted is not None:
+            on_accepted()
         return {"waited": True}
 
-    def start_turn(self, params):
+    def start_turn(self, params, on_accepted=None):
         self.started.append(params)
         if self.raises:
             raise self.raises
+        if on_accepted is not None:
+            on_accepted()
         return {"started": True}
 
     def close(self):
