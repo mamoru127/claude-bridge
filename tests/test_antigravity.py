@@ -866,6 +866,25 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
 
 
 class AntigravityModelsTest(BridgeHTTPTestCase):
+    def test_argon_is_published_and_runs_through_antigravity(self):
+        config = build_config(["--port", "0"], env={})
+        runner = SequenceRunner([agy_output()])
+        base_url = self.start_server(config, runner)
+        status, catalog = self.get_json(base_url, "/v1/models")
+        self.assertEqual(status, 200)
+        entries = {item["id"]: item for item in catalog["data"]}
+        for model in ("gemini-4-argon-high", "gemini-4-argon-medium"):
+            self.assertEqual(entries[model]["owned_by"], "google")
+            self.assertEqual(config.backend(model), ANTIGRAVITY_BACKEND)
+
+        status, payload = self.post(
+            base_url, {"model": "gemini-4-argon-high", "input": "やあ"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["model"], "gemini-4-argon-high")
+        command = runner.command()
+        self.assertEqual(command[command.index("--model") + 1], "gemini-4-argon-high")
+
     def test_models_include_both_clis(self):
         base_url = self.start_server(make_config(claude_models=("claude-opus-5-5",)), FakeRunner())
 
@@ -983,7 +1002,10 @@ class AntigravityConfigTest(unittest.TestCase):
 
         self.assertEqual(config.antigravity_path, "agy")
         self.assertEqual(config.antigravity_models, DEFAULT_ANTIGRAVITY_MODELS)
-        self.assertEqual(config.antigravity_models, ("gemini-flash-high", "gemini-flash-medium"))
+        self.assertEqual(config.antigravity_models, (
+            "gemini-flash-high", "gemini-flash-medium",
+            "gemini-4-argon-high", "gemini-4-argon-medium",
+        ))
 
     def test_env_overrides(self):
         config = build_config(

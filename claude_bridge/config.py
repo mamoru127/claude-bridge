@@ -41,8 +41,14 @@ DEFAULT_CLAUDE_MODELS = ("opus", "fable")
 
 # Antigravity CLI（`agy`）の実行ファイル。未インストールなら該当モデルの実行時だけ失敗する。
 DEFAULT_ANTIGRAVITY_PATH = "agy"
-# 公開名は固定し、実行時に `agy models` から最新の Flash を選ぶ。
-DEFAULT_ANTIGRAVITY_MODELS = ("gemini-flash-high", "gemini-flash-medium")
+# Flash の公開名は固定し、実行時に `agy models` から最新版を選ぶ。
+# Argon は agy の正式名をそのまま渡す。利用にはアカウント側のアクセス権が必要。
+DEFAULT_ANTIGRAVITY_MODELS = (
+    "gemini-flash-high",
+    "gemini-flash-medium",
+    "gemini-4-argon-high",
+    "gemini-4-argon-medium",
+)
 
 # 旧版の設定を使うクライアントが上流へ誤転送されないよう、以前の公開名も受け付ける。
 LEGACY_MODEL_ALIASES = {

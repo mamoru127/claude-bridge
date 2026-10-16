@@ -72,6 +72,7 @@ ChatGPT ログイン用の音声開始 API は `/realtime/calls?intent=quicksilv
 | --- | --- |
 | `opus`, `fable` | Claude CLI の同名別名（最新版） |
 | `gemini-flash-high`, `gemini-flash-medium` | `agy models` にある最新の Gemini Flash |
+| `gemini-4-argon-high`, `gemini-4-argon-medium` | Antigravity CLI の Gemini 4 Argon（アカウント側のアクセス権が必要） |
 | その他 | `--upstream-base-url` 指定時は上流。未指定時は Claude CLI |
 
 | 引数 | 用途 |
@@ -85,7 +86,7 @@ ChatGPT ログイン用の音声開始 API は `/realtime/calls?intent=quicksilv
 | `--enable-codex-mcp` | Claude から Codex app-server のスレッド操作を使う |
 | `--mcp-config-file PATH` | Claude に追加する MCP サーバーの設定 |
 
-Gemini の公開名は固定です。実行時に `agy models` を参照して対応する最新バージョンへ変換し、結果は最大 10 分保持します。特定バージョンに固定したい場合は `--antigravity-models` に実際のモデル名を指定できます。
+Gemini Flash の公開名は固定です。実行時に `agy models` を参照して対応する最新バージョンへ変換し、結果は最大 10 分保持します。Argon は正式なモデル名をそのまま CLI へ渡します。`--antigravity-models` に実際のモデル名を指定して、バージョンや公開するモデルを選べます。macOS の常駐設定では Flash High と Argon High を公開します。
 
 その他の引数は `python3 -m claude_bridge --help`（Windows は `py -3 -m claude_bridge --help`）で確認できます。
 
@@ -105,6 +106,8 @@ CLAUDE_BRIDGE_MCP_CONFIG_FILE=/Users/me/.config/claude-bridge/mcp.json
 ```
 
 Python はリポジトリの `.venv` があればそれを使います。別のものを使うときは `CLAUDE_BRIDGE_PYTHON` を指定します。
+
+設定を変えたあとの再起動も `install.sh` で行います。`launchctl bootout` と `launchctl bootstrap` を続けて直接実行しないでください。`bootout` は旧プロセスが止まりきる前に戻るため、直後の `bootstrap` が `Bootstrap failed: 5: Input/output error` で失敗し、登録が外れたままブリッジが二度と上がらなくなります。`install.sh` は旧プロセスの終了を待ってから登録し直し、ブリッジ経由のシェルから実行された場合は自分が巻き添えで止まらないよう再起動を切り離します。
 
 ## Windows で常駐させる
 
