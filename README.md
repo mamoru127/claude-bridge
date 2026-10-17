@@ -96,7 +96,7 @@ Gemini Flash の公開名は固定です。実行時に `agy models` を参照�
 CLAUDE_BRIDGE_WORKING_DIR=/path/to/project launchd/install.sh
 ```
 
-起動設定は `launchd/local.claude-bridge.plist` にあります。Codex が渡すツール（imagegen など）は Claude でも既定で使えます。スレッド操作用の共有 app-server もインストーラーが設定します。macOS の ChatGPT アプリを `/Applications` にインストールしてから実行し、連携設定を反映するためにアプリを再起動してください。使用中の 8787 を持つ別プロセスは停止しません。
+起動設定は `launchd/local.claude-bridge.plist` にあります。Codex が渡すツール（imagegen など）は Claude でも既定で使えます。スレッド操作用の共有 app-server もインストーラーが設定します。macOS の ChatGPT アプリを `/Applications` にインストールしてから実行してください。ログイン時のアプリ復元が先に動いても、共有接続を明示して起動し直します。実行中のタスクがある間は終了を待ち、処理を中断しません。確認ログは `~/Library/Logs/claude-bridge/app-connection.log` です。使用中の 8787 を持つ別プロセスは停止しません。
 
 このマシンだけの設定（Claude に触らせる追加ディレクトリ、追加の MCP サーバーなど）は、リポジトリではなく `~/.config/claude-bridge/bridge.env` に `NAME=value` の形で書きます。`install.sh` が plist の環境変数へ足します。変えたら `install.sh` を実行し直してください。
 

@@ -29,8 +29,11 @@ class AppConnectionInstallTests(unittest.TestCase):
             path = root / "Library/LaunchAgents" / f"{installer.LABEL}.plist"
             job = plistlib.loads(path.read_bytes())
             self.assertTrue(job["RunAtLoad"])
-            self.assertEqual(job["ProgramArguments"], run.call_args_list[0].args[0])
-            self.assertEqual(job["ProgramArguments"][-1], first)
+            self.assertEqual(run.call_args_list[0].args[0][-1], first)
+            self.assertIn("--endpoint", job["ProgramArguments"])
+            self.assertIn(first, job["ProgramArguments"])
+            self.assertEqual(job["ProgramArguments"][-1], str(codex_home))
+            self.assertTrue(Path(job["ProgramArguments"][1]).is_file())
             self.assertEqual(len(list(path.parent.glob("*.plist"))), 1)
             for call in run.call_args_list:
                 args = call.args[0]

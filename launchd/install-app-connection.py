@@ -3,7 +3,9 @@
 
 import os
 import plistlib
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from urllib.parse import quote
 
@@ -19,12 +21,20 @@ def install_connection(user_home: Path, codex_home: Path, uid: int) -> str:
     # A localhost hostname also avoids the app's proxy for non-local WS URLs.
     url = f"ws+unix://localhost{socket_path}:/rpc"
     arguments = ["/bin/launchctl", "setenv", "CODEX_APP_SERVER_WS_URL", url]
+    helper = user_home / ".local/share/claude-bridge/ensure-app-connection.py"
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(Path(__file__).with_name(helper.name), helper)
+    log_dir = user_home / "Library/Logs/claude-bridge"
+    log_dir.mkdir(parents=True, exist_ok=True)
     plist_path = user_home / "Library/LaunchAgents" / f"{LABEL}.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_bytes(plistlib.dumps({
         "Label": LABEL,
-        "ProgramArguments": arguments,
+        "ProgramArguments": [sys.executable, str(helper), "--endpoint", url,
+                             "--codex-home", str(codex_home)],
         "RunAtLoad": True,
+        "StandardOutPath": str(log_dir / "app-connection.log"),
+        "StandardErrorPath": str(log_dir / "app-connection.log"),
     }))
     domain = f"gui/{uid}"
     # Apply now as well as at the next login. No app-server restart is needed.
@@ -44,4 +54,4 @@ if __name__ == "__main__":
         home_dir, Path(os.environ.get("CODEX_HOME", str(home_dir / ".codex"))), os.getuid(),
     )
     print(f"ChatGPT shared app-server: {endpoint}")
-    print("Restart ChatGPT after stopping its active tasks to apply the connection setting.")
+    print("ChatGPT will reconnect automatically after its active tasks finish.")
