@@ -6,7 +6,7 @@ Claude CLI と Antigravity CLI を、ローカルの OpenAI Responses API 互換
 
 - Python 3.11 以上
 - インストールとログインを済ませた Claude CLI（`claude -p "ping"` で確認）
-- Gemini も使う場合のみ、インストールとログインを済ませた Antigravity CLI（`agy`）
+- Gemini も使う場合のみ、インストールとログインを済ませた Antigravity CLI（`agy` 1.1.15 以降）
 
 ブリッジ用の API キーは不要です。Claude と Antigravity は各 CLI のログイン情報を使います。
 
@@ -121,6 +121,7 @@ Codex CLI をインストールし、ログインしてから PowerShell で実�
 
 ## 注意点
 
+- Antigravity への指示と履歴は標準入力の `stream-json` で渡すため、従来の16KB制限はありません。
 - ブリッジはループバックアドレスでのみ待ち受けます。ブリッジ自体に HTTP 認証はありません。
 - Claude と Antigravity は非対話実行時のツール操作を自動承認します。`--working-dir` と `--add-dir` には信頼できる場所だけを指定してください。
 - Windows でも Codex から渡されたツール（imagegen や Browser など）と共有 app-server のスレッド操作を利用できます。

@@ -1,8 +1,11 @@
 """Antigravity CLI（`agy`）を headless で実行し、途中経過と最終テキストを逐次取り出す。
 
-headless の契約は次のとおり（agy 1.1.13 の実出力で確認）。
+headless の契約は次のとおり（NDJSON 入力を含め実機で確認）。
 
-    agy -p <prompt> --model gemini-3.8-flash-high --output-format stream-json
+    agy -p "" --input-format stream-json --model gemini-3.8-flash-high --output-format stream-json
+
+標準入力へ {"event":"user","message":{"role":"user","content":"<prompt>"}} を1行渡す。
+入力形式は agy 1.1.15 以降で対応し、長いプロンプトも OS の引数長制限を受けない。
 
 標準出力は NDJSON で、各行は `event` で種別を示し、本体を同じ名前のキーへ入れ子で持つ。
 
@@ -24,6 +27,7 @@ import math
 import os
 import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterator, Mapping
 from functools import lru_cache
@@ -45,10 +49,6 @@ BILLING_ENV_KEYS = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY")
 
 # ツール進捗の 1 行説明に載せる引数の長さ。
 TOOL_DETAIL_CHARS = 200
-
-# agy の -p は OS のコマンドライン引数になる。Windows の約 32K 文字制限にも
-# 実行ファイル名・他の引数の余裕を残す。stdin 入力へ移行したら撤廃できる。
-MAX_PROMPT_ARGUMENT_BYTES = 16_000
 
 
 def agy_env(env: Mapping[str, str] | None = None) -> dict:
@@ -87,29 +87,19 @@ def _latest_flash_model(path: str, effort: str, refresh_bucket: int) -> str:
     return max(candidates)[1]
 
 
-def validate_prompt_argument(prompt: str) -> None:
-    if len(prompt.encode("utf-8")) > MAX_PROMPT_ARGUMENT_BYTES:
-        raise ANTIGRAVITY.error(
-            f"への入力は {MAX_PROMPT_ARGUMENT_BYTES} バイト以内にしてください",
-            "prompt_too_large",
-            status=413,
-            error_type="invalid_request_error",
-        )
-
-
-def build_command(config: BridgeConfig, prompt: str, session) -> list[str]:
+def build_command(config: BridgeConfig, session) -> list[str]:
     """実行するコマンド配列を組み立てる。シェルは介さない。
 
     `--conversation` は前回の実行が `conversation_id` を返したときだけ付ける。初回は付けずに
     実行し、`result` で受け取った ID をセッションへ記録して次のターンから続きにする。
     """
 
-    validate_prompt_argument(prompt)
-
     command = [
         config.antigravity_path,
         "-p",
-        prompt,
+        "",
+        "--input-format",
+        "stream-json",
         "--model",
         resolve_model(config.antigravity_path, config.model),
         "--output-format",
@@ -142,16 +132,22 @@ def stream_antigravity(
     `text`。`text` は `result` の `response` で、増分と食い違った場合もこちらが正となる。
     """
 
-    command = build_command(config, prompt, session)
-    # `-p` でプロンプトを渡すため標準入力は使わない。開けたままにすると子が待ち続ける。
-    process, stderr = launch(
-        ANTIGRAVITY,
-        command,
-        config.working_dir,
-        runner,
-        stdin=subprocess.DEVNULL,
-        env=agy_env(),
-    )
+    command = build_command(config, session)
+    # agy 1.1.15 以降の NDJSON 入力。引数へ載せず、長い system 指示や履歴も省略せず渡す。
+    # パイプへ同期書き込みすると、起動時の stdout と相互に詰まり得るため一時ファイルを
+    # stdin にする。子は起動時に複製したハンドルから読み、親のファイルは直ちに閉じる。
+    message = {"event": "user", "message": {"role": "user", "content": prompt}}
+    with tempfile.TemporaryFile() as stdin:
+        stdin.write((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
+        stdin.seek(0)
+        process, stderr = launch(
+            ANTIGRAVITY,
+            command,
+            config.working_dir,
+            runner,
+            stdin=stdin,
+            env=agy_env(),
+        )
     session.start(process)
 
     result = None

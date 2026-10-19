@@ -13,7 +13,6 @@ from unittest import mock
 
 from claude_bridge.antigravity_cli import (
     BILLING_ENV_KEYS,
-    MAX_PROMPT_ARGUMENT_BYTES,
     _latest_flash_model,
     agy_env,
     build_command,
@@ -138,9 +137,18 @@ class SequenceRunner(FakeRunner):
     def command(self, index: int = 0) -> list[str]:
         return self.calls[index]["command"]
 
+    def __call__(self, command, **kwargs):
+        stdin = kwargs["stdin"]
+        payload = b""
+        if hasattr(stdin, "read"):
+            payload = stdin.read()
+            stdin.seek(0)
+        process = super().__call__(command, **kwargs)
+        self.calls[-1]["input"] = payload
+        return process
+
     def prompt(self, index: int = 0) -> str:
-        command = self.command(index)
-        return command[command.index("-p") + 1]
+        return json.loads(self.calls[index]["input"])["message"]["content"]
 
 
 def agy_config(**overrides):
@@ -154,14 +162,16 @@ class AntigravityCommandTest(unittest.TestCase):
         session = Session()
         session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
 
-        command = build_command(agy_config(antigravity_path="/opt/bin/agy"), "やあ", session)
+        command = build_command(agy_config(antigravity_path="/opt/bin/agy"), session)
 
         self.assertEqual(
             command,
             [
                 "/opt/bin/agy",
                 "-p",
-                "やあ",
+                "",
+                "--input-format",
+                "stream-json",
                 "--model",
                 HIGH,
                 "--output-format",
@@ -182,14 +192,13 @@ class AntigravityCommandTest(unittest.TestCase):
             ANTIGRAVITY_BACKEND,
         )
 
-        command = build_command(agy_config(), "2問目", session)
+        command = build_command(agy_config(), session)
 
         self.assertEqual(command[-2:], ["--conversation", "conv-9"])
 
     def test_add_dirs_are_passed_to_agy(self):
         command = build_command(
             agy_config(add_dirs=("/workspace", "/Users/example/.gemini")),
-            "やあ",
             Session(),
         )
 
@@ -200,23 +209,13 @@ class AntigravityCommandTest(unittest.TestCase):
 
     def test_fractional_timeout_is_not_truncated_to_zero(self):
         # 秒は小数で指定できる。切り捨てると agy 側が即時打ち切りになる。
-        command = build_command(agy_config(timeout_seconds=0.5), "やあ", Session())
+        command = build_command(agy_config(timeout_seconds=0.5), Session())
 
         self.assertEqual(command[command.index("--print-timeout") + 1], "500ms")
 
     def test_executable_path_is_not_shell_interpreted(self):
         config = agy_config(antigravity_path="/opt/my tools/agy; rm -rf /")
-        self.assertEqual(build_command(config, "やあ", Session())[0], "/opt/my tools/agy; rm -rf /")
-
-    def test_prompt_argument_limit_is_checked_before_launch(self):
-        allowed = "a" * MAX_PROMPT_ARGUMENT_BYTES
-        self.assertEqual(build_command(agy_config(), allowed, Session())[2], allowed)
-        with self.assertRaises(BridgeError) as raised:
-            build_command(agy_config(), allowed + "a", Session())
-        self.assertEqual(raised.exception.status, 413)
-        self.assertEqual(raised.exception.code, "antigravity_cli_prompt_too_large")
-        with self.assertRaises(BridgeError):
-            build_command(agy_config(), "あ" * (MAX_PROMPT_ARGUMENT_BYTES // 3 + 1), Session())
+        self.assertEqual(build_command(config, Session())[0], "/opt/my tools/agy; rm -rf /")
 
 
 class AntigravityStreamTest(unittest.TestCase):
@@ -250,12 +249,16 @@ class AntigravityStreamTest(unittest.TestCase):
             ],
         )
 
-    def test_stdin_is_closed_because_the_prompt_goes_through_argv(self):
-        runner = FakeRunner(agy_output())
+    def test_prompt_is_passed_as_one_stdin_message(self):
+        runner = SequenceRunner([agy_output()])
 
         self.run_stream(runner)
 
-        self.assertEqual(runner.calls[0]["stdin"], subprocess.DEVNULL)
+        self.assertTrue(runner.calls[0]["stdin"].closed)
+        self.assertEqual(json.loads(runner.calls[0]["input"]), {
+            "event": "user", "message": {"role": "user", "content": "やあ"}
+        })
+        self.assertEqual(runner.calls[0]["input"].count(b"\n"), 1)
         self.assertEqual(runner.calls[0]["stdout"], subprocess.PIPE)
         self.assertEqual(runner.calls[0]["stderr"], subprocess.PIPE)
 
@@ -547,29 +550,33 @@ class AntigravityPromptTest(unittest.TestCase):
 
 
 class AntigravityEndpointTest(BridgeHTTPTestCase):
-    def test_oversized_prompt_does_not_cancel_a_running_turn(self):
-        runner = HangingRunner()
-        base_url = self.start_server(agy_config(), runner)
-        self.post_and_disconnect(
-            base_url, {"model": HIGH, "input": "1問目", "prompt_cache_key": "thread-1"}
+    def test_argon_accepts_long_system_and_history_without_truncation(self):
+        runner = SequenceRunner([agy_output()])
+        base_url = self.start_server(
+            agy_config(antigravity_models=("gemini-4-argon-high",)), runner
         )
-        for _ in range(500):
-            if runner.processes:
-                break
-            time.sleep(0.01)
-        process = runner.processes[0]
-
-        status, payload = self.post(
-            base_url,
-            {"model": HIGH, "input": "a" * (MAX_PROMPT_ARGUMENT_BYTES + 1),
-             "prompt_cache_key": "thread-1"},
-        )
-
-        self.assertEqual(status, 413)
-        self.assertEqual(payload["error"]["code"], "antigravity_cli_prompt_too_large")
-        self.assertEqual(process.killed, 0)
-        self.assertEqual(len(runner.processes), 1)
-        process.kill()
+        instructions = "指示\n" * 12000
+        messages = [
+            {"role": "user", "content": "履歴" * 10000},
+            {"role": "assistant", "content": "回答"},
+            {"role": "user", "content": "はい"},
+        ]
+        for stream in (False, True):
+            request = {
+                "model": "gemini-4-argon-high", "instructions": instructions,
+                "input": messages,
+            }
+            if stream:
+                _, events = self.post_stream(base_url, request)
+                self.assertTrue(any(name == "response.completed" for name, _ in events))
+            else:
+                status, _ = self.post(base_url, request)
+                self.assertEqual(status, 200)
+            prompt = runner.prompt(len(runner.calls) - 1)
+            self.assertIn(instructions, prompt)
+            self.assertIn("履歴" * 10000, prompt)
+            self.assertTrue(prompt.endswith("はい"))
+            self.assertNotIn(prompt, runner.command(len(runner.calls) - 1))
 
     def test_non_stream_returns_the_result_response(self):
         runner = SequenceRunner([agy_output(delta_event("こんにちは"))])

@@ -9,7 +9,7 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from .antigravity_cli import stream_antigravity, validate_prompt_argument
+from .antigravity_cli import stream_antigravity
 from .app_server import TURN_METHOD, AppServerClient, AppServerError
 from .claude_cli import input_line, stream_claude
 from .cli_process import final_text
@@ -435,13 +435,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
         user_messages = tuple(m for m in request.messages if m.role == "user")
         if user_messages:
             candidates.append(user_messages[-1:])
-        smallest_input, smallest_size = min(
+        _, smallest_size = min(
             (self._cli_input(candidate, request.system_prompt, backend) for candidate in candidates),
             key=lambda item: item[1],
         )
         self._validate_body_size(smallest_size, config.max_request_bytes, "CLI へ渡す入力")
-        if backend == ANTIGRAVITY_BACKEND:
-            validate_prompt_argument(smallest_input)
 
     def _send_once(
         self, config: BridgeConfig, request: ParsedRequest, session, backend: str
