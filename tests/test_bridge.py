@@ -354,6 +354,17 @@ class BridgeHTTPTestCase(unittest.TestCase):
 
 
 class ResponsesEndpointTest(BridgeHTTPTestCase):
+    def test_fable_runs_version_5_2(self):
+        runner = FakeRunner()
+        config = build_config(["--port", "0", "--upstream-base-url", "https://upstream.example"], env={})
+        base_url = self.start_server(config, runner)
+        status, payload = self.post(base_url, {"model": "fable", "input": "やあ"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["model"], "fable")
+        command = runner.calls[0]["command"]
+        self.assertEqual(command[command.index("--model") + 1], "claude-fable-5-2")
+        self.assertEqual(config.cli_model("claude-fable-5-1"), "claude-fable-5-2")
+
     def test_returns_openai_responses_payload(self):
         runner = FakeRunner()
         base_url = self.start_server(make_config(), runner)

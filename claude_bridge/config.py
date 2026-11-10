@@ -34,8 +34,7 @@ DEFAULT_BRIDGE_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
 DEFAULT_UPSTREAM_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 # API で受け付けるモデル名。GET /v1/models に載り、中継が有効ならこれ以外は上流へ中継する。
-# ここに載せた名前はそのまま CLI の --model へ渡すため、Claude CLI が解釈できる名前
-# （`opus` などの別名、または `claude-opus-5-5` のような正式名）だけを並べる。
+# CLI の別名または正式名を並べる。fable は実行時に 5.2 へ変換する。
 # 上流に実在するモデル名を選ぶと、その名前が上流一覧から除かれてアプリで選べなくなる。
 DEFAULT_CLAUDE_MODELS = ("opus", "fable")
 
@@ -191,10 +190,12 @@ class BridgeConfig:
         Claude CLI へ回るため、そこは起動時の `--model` で実行する。
         """
 
-        if model in self.cli_models:
-            return model
-        alias = LEGACY_MODEL_ALIASES.get(model)
-        return alias if alias in self.cli_models else self.model
+        if model not in self.cli_models:
+            alias = LEGACY_MODEL_ALIASES.get(model)
+            model = alias if alias in self.cli_models else self.model
+        if model == "fable" and model in self.claude_models:
+            return "claude-fable-5-2"
+        return model
 
 
 def _env_str(env: dict, name: str, default: str) -> str:
