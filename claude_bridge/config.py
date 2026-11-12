@@ -11,8 +11,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 DEFAULT_CLAUDE_PATH = "claude"
 DEFAULT_MODEL = "opus"
-# ツールを何度も使う長い作業では 10 分では足りない。Codex 側の待機上限（60 分）に合わせる。
-DEFAULT_TIMEOUT_SECONDS = 3600.0
+# 1 ターンの上限。実装担当の完了を待ち受けるターンは 1 時間を超えるため 6 時間まで許す。
+# Codex 側の無通信の上限（60 分）は、15 秒ごとの keepalive が届くのでこの上限を縛らない。
+DEFAULT_TIMEOUT_SECONDS = 21600.0
 # CLI へ 1 回で渡す入力の上限。32MB は Claude API 側のリクエスト上限で、これを超える分を
 # 渡しても CLI 実行で失敗する。リクエスト全体ではなく、組み立てた入力そのもの（続きのターン
 # では差分の発言と system プロンプト、ツール結果の画像は parse の時点で落としたあと）に

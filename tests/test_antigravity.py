@@ -189,7 +189,7 @@ class AntigravityCommandTest(unittest.TestCase):
                 "--dangerously-skip-permissions",
                 # 既定の 5 分ではブリッジのタイムアウトより先に打ち切られる。
                 "--print-timeout",
-                "3600000ms",
+                "21600000ms",
             ],
         )
 
