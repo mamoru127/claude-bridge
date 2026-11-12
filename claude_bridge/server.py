@@ -379,12 +379,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
             # ため、後から失敗すると同じスレッドの Claude 側の会話まで開始し直しになる。
             # 実際に渡すのは全履歴の部分集合なので、ここで確かめれば組み立てでも通る。
             ensure_text_only(request.messages)
-        messages = session.prepare(request.messages, backend)
+        messages = session.prepare(request.messages, backend, request.system_sections)
+        # Claude は system の口へ毎回渡し直す。Antigravity はユーザー発言として会話へ残る
+        # ため、会話へまだ載せていない節だけを渡す。
+        system_prompt = request.system_prompt
+        if backend == ANTIGRAVITY_BACKEND:
+            system_prompt = "\n\n".join(session.unseen_system) or None
         # 上限は CLI へ渡す分にだけかける。続きのターンでは差分の発言しか渡さないため、
         # 履歴に積み上がった画像でリクエストが膨らんでも実行は妨げない。判定には渡す本体を
-        # そのまま使う。別に見積もると、JSON の枠や毎ターン渡し直す system プロンプトが
-        # 抜けて上限を素通りする。
-        payload, size = self._cli_input(messages, request.system_prompt, backend)
+        # そのまま使う。別に見積もると、JSON の枠や system プロンプトが抜けて上限を
+        # 素通りする。
+        payload, size = self._cli_input(messages, system_prompt, backend)
         self._validate_body_size(size, config.max_request_bytes, "CLI へ渡す入力")
         if backend == ANTIGRAVITY_BACKEND:
             return stream_antigravity(config, payload, session, self.server.runner)
@@ -420,6 +425,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         実行は成立しないため、ここで弾いてよい。実際に渡す本体はこれ以上に大きくなるので、
         通るはずの入力をここで落とすことはない。
 
+        system プロンプトは、毎回渡す Claude でだけ数える。Antigravity は会話へ載せ済みの
+        節を渡さないため、続きのターンでは 1 バイトも渡らないことがある。
+
         これがセッションを借りずに判定できる限界でもある。未送の発言をすべて足した
         大きさで判定できれば取りこぼしはなくなるが、その範囲は `_sent` を読まないと
         決まらず、`_sent` は実行中のターンが confirm で動かす。借りずに読むと、確定前の
@@ -435,8 +443,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         user_messages = tuple(m for m in request.messages if m.role == "user")
         if user_messages:
             candidates.append(user_messages[-1:])
+        system_prompt = None if backend == ANTIGRAVITY_BACKEND else request.system_prompt
         _, smallest_size = min(
-            (self._cli_input(candidate, request.system_prompt, backend) for candidate in candidates),
+            (self._cli_input(candidate, system_prompt, backend) for candidate in candidates),
             key=lambda item: item[1],
         )
         self._validate_body_size(smallest_size, config.max_request_bytes, "CLI へ渡す入力")

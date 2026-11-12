@@ -29,14 +29,19 @@ class Session:
         # 今回の実行を前回の続きとして走らせるか。prepare が判定する。
         self.resume = False
         # 続きに使える識別子。Claude は転記 ID、Antigravity は CLI が発行する conversation_id。
-        # 空なら続きにできない（まだ 1 度も実行を完了していない）。
+        # 空なら続きにできない（渡した発言が CLI の会話へ載ったことをまだ確かめていない）。
         self.handle = ""
+        # 今回の実行で会話へ新しく載せる system 指示の節。prepare が判定する。
+        # system の口がなく、指示をユーザー発言として会話へ残す CLI（Antigravity）だけが使う。
+        self.unseen_system: tuple[str, ...] = ()
         self.lock = threading.Lock()
-        # 直前に会話を確定させた CLI と、その CLI が把握済みの発言数・その範囲の指紋。
+        # 直前に会話を確定させた CLI と、その CLI が把握済みの発言数・その範囲の指紋・
+        # 把握済みの system 指示（節ごとの指紋）。
         self._backend = ""
         self._sent = 0
         self._digest = ""
-        self._pending = (0, "", "")
+        self._system: tuple[str, ...] = ()
+        self._pending = (0, "", "", ())
         self._process_lock = threading.Lock()
         self._process = None
         # 今の CLI を起動した時刻。指示より後に起動した実行は、その指示を受け取っている。
@@ -48,8 +53,13 @@ class Session:
         # 新しい指示に応えるため、実行中の作業を区切って Codex へ返したか。
         self._handed_back = False
 
-    def prepare(self, messages: tuple[Message, ...], backend: str) -> tuple[Message, ...]:
-        """今回 CLI へ渡す発言を決める。
+    def prepare(
+        self,
+        messages: tuple[Message, ...],
+        backend: str,
+        system: tuple[str, ...] = (),
+    ) -> tuple[Message, ...]:
+        """今回 CLI へ渡す発言を決める。system 指示の渡す分は unseen_system へ置く。
 
         渡した範囲と履歴の先頭が一致し、前回と同じ CLI なら続き。食い違う場合は Codex 側で
         履歴が置き換わっているか実行する CLI が変わっているため、会話を開始し直して全履歴を渡す。
@@ -63,8 +73,28 @@ class Session:
             and self._backend == backend
             and self._digest == _digest(messages[: self._sent])
         )
-        self._pending = (len(messages), _digest(messages), backend)
+        digests = tuple(_text_digest(section) for section in system)
+        self._pending = (len(messages), _digest(messages), backend, digests)
+        self.unseen_system = self._unseen_system(system, digests)
         return self._unseen(messages)
+
+    def _unseen_system(
+        self, system: tuple[str, ...], digests: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """会話へまだ載せていない system 指示の節。
+
+        Codex は同じ指示を毎回送り直し、途中で developer の発言を後ろへ足していく。続きの
+        実行では、把握済みの並びがそのまま先頭に残っていれば足された節だけを渡す。同じ指示を
+        渡し直すと、ターンのたびに会話へ積み上がる。
+
+        把握済みの節が書き換わったり消えたりしていれば、全体を渡し直す。会話に残る古い指示は
+        取り消せないため、今の指示の全体を後から示して上書きする。
+        """
+
+        known = self._system
+        if self.resume and digests[: len(known)] == known:
+            return system[len(known) :]
+        return system
 
     def _unseen(self, messages: tuple[Message, ...]) -> tuple[Message, ...]:
         """CLI がまだ受け取っていない発言。"""
@@ -144,12 +174,19 @@ class Session:
     def confirm(self, handle: str) -> None:
         """この会話を続けられることが確定した時点で呼ぶ。渡した範囲も同時に確定する。
 
-        確定する時点は CLI で違う。Claude は起動できれば転記が作られるので起動直後、
-        Antigravity は実行が正常に終わり `conversation_id` を受け取ったとき。
+        確定するのは、渡した発言が CLI 側の会話へ載ったと分かったとき。Claude は応答が
+        出始めたとき、Antigravity は `user_input` の step が届いたとき。それより前に止まった
+        実行は会話に何も残していないことがあり、続き扱いにすると渡した発言が抜け落ちる。
         """
 
         self.handle = handle
-        self._sent, self._digest, self._backend = self._pending
+        self._sent, self._digest, self._backend, self._system = self._pending
+
+    def reset(self) -> None:
+        """CLI 側の会話を失ったときに呼ぶ。次の実行は新しい会話として全履歴を渡す。"""
+
+        self.handle = ""
+        self._sent, self._digest, self._backend, self._system = 0, "", "", ()
 
     def finish(self) -> None:
         """実行の終了。以降この会話を止める対象はない。"""
@@ -346,3 +383,9 @@ def _digest(messages: tuple[Message, ...]) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _text_digest(text: str) -> str:
+    """system 指示 1 節の指紋。会話へ載せ済みかどうかの判定にだけ使う。"""
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

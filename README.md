@@ -79,7 +79,7 @@ ChatGPT ログイン用の音声開始 API は `/realtime/calls?intent=quicksilv
 | 引数 | 用途 |
 | --- | --- |
 | `--working-dir PATH` | CLI の作業ディレクトリ |
-| `--add-dir PATH` | 作業を許可する追加ディレクトリ |
+| `--add-dir PATH` | Claude に作業を許可する追加ディレクトリ（Antigravity には渡しません） |
 | `--port PORT` | HTTP ポート（既定: `8787`） |
 | `--claude-models NAMES` | Claude に割り当てるモデル名のカンマ区切り |
 | `--antigravity-models NAMES` | Gemini に割り当てるモデル名のカンマ区切り。空文字で無効 |
@@ -123,8 +123,11 @@ Codex CLI をインストールし、ログインしてから PowerShell で実�
 ## 注意点
 
 - Antigravity への指示と履歴は標準入力の `stream-json` で渡すため、従来の16KB制限はありません。
+- Antigravity には system 指示の専用の口がないため、指示は発言の先頭に `[system]` 節として渡し、会話に残します。同じ指示は会話ごとに一度だけ渡し、続きのターンでは足された分だけを渡します。
+- Antigravity のターンを途中で止めても、発言が会話へ載ったあとなら次のターンは同じ会話の続きになり、そこまでのツール結果を引き継ぎます。
+- Antigravity には `--add-dir` を渡しません。Antigravity の `--add-dir` はワークスペースの追加で、そのディレクトリの `AGENTS.md` と `.agents/skills` がどのスレッドのモデル呼び出しにも毎回載るためです。Antigravity に常に読ませたいルールは `--working-dir` に置いてください。
 - ブリッジはループバックアドレスでのみ待ち受けます。ブリッジ自体に HTTP 認証はありません。
-- Claude と Antigravity は非対話実行時のツール操作を自動承認します。`--working-dir` と `--add-dir` には信頼できる場所だけを指定してください。
+- Claude と Antigravity は非対話実行時のツール操作を自動承認します。`--working-dir` と `--add-dir` には信頼できる場所だけを指定してください。Antigravity は自動承認によって、指定したディレクトリの外も読み書き・実行できます（agy 1.5.6 で確認）。
 - Windows でも Codex から渡されたツール（imagegen や Browser など）と共有 app-server のスレッド操作を利用できます。
 - 画像生成・編集 API は `--upstream-base-url` を指定した場合に上流へ中継します。
 - 音声はブリッジではなく Codex のネイティブ OpenAI 経路を使います。「Codex から使う」の音声設定が必要です。

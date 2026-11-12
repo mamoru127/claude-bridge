@@ -74,6 +74,7 @@ class ParsedRequest:
     # 会話の発言列。Claude へ実際に渡す範囲はセッションの続き具合で決まるため、
     # ここでは連結せず発言のまま持つ。
     messages: tuple[Message, ...]
+    # system / developer の指示を 1 本にまとめたもの。無ければ None。
     system_prompt: str | None
     stream: bool
     # 会話を識別するキー。Codex はスレッドごとに固定の値を送る。
@@ -82,6 +83,9 @@ class ParsedRequest:
     tools: tuple[dict, ...] = ()
     # 遅延読み込みのツールを引き出すために投げる検索語。None なら投げる必要がない。
     tool_search_query: str | None = None
+    # system_prompt をまとめる前の節。instructions、続いて system / developer の発言が届いた順に並ぶ。
+    # system の口がない CLI は、会話へまだ載せていない節だけを渡すためにこの単位で見分ける。
+    system_sections: tuple[str, ...] = ()
 
 
 def requested_model(payload: object, default_model: str) -> str:
@@ -165,6 +169,7 @@ def parse_request(
         session_key=session_key,
         tools=tools,
         tool_search_query=search_query,
+        system_sections=tuple(system_sections),
     )
 
 
@@ -477,9 +482,12 @@ def ensure_text_only(messages: Sequence[Message]) -> None:
 def build_prompt(messages: Sequence[Message], system_prompt: str | None) -> str:
     """発言列を 1 本のプロンプト文字列にする。
 
-    Antigravity CLI の headless 契約は `-p <prompt>` の文字列だけで、system 指定の口も画像を
-    渡す口もない。system / developer の内容は落とさず `[system]` 節として先頭へ置く
-    （Claude CLI が毎ターン `--append-system-prompt` を付け直すのと同じ扱い）。
+    Antigravity CLI の headless 契約はユーザー発言の文字列だけで、system 指定の口も画像を
+    渡す口もない。system / developer の内容は落とさず `[system]` 節として先頭へ置く。
+
+    ここへ置いた節はユーザー発言として会話に残る。Claude CLI の `--append-system-prompt` と
+    違って毎ターン渡すと同じ指示が会話へ積み上がるため、呼び出し側は会話へまだ載せていない
+    分だけを system_prompt に渡す（`Session.unseen_system`）。
     """
 
     ensure_text_only(messages)

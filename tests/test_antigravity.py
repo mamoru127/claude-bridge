@@ -2,7 +2,8 @@
 
 擬似出力は agy 1.1.13 の実出力を写したもの。各行は `event` で種別を示し、本体を同じ名前の
 キーへ入れ子で持つ。`agent_response` の `text_delta` は本物の増分で、`ACTIVE` と最後の
-`DONE` を連結すると `result` の `response` と一致する。
+`DONE` を連結すると `result` の `response` と一致する。`user_input` の step が発言の
+受理を示すこと、存在しない会話 ID では別 ID の新しい会話が始まることは 1.5.6 で確認した。
 """
 
 import json
@@ -123,6 +124,15 @@ def agy_output(*events: dict) -> bytes:
     return agy_lines(init_event(), *events, result_event())
 
 
+def accepted(conversation_id: str = "conv-1") -> tuple[dict, dict]:
+    """発言が会話へ載るところまでの出力。agy は init に続けて user_input の step を出す。"""
+
+    return (
+        init_event(conversation_id),
+        step("user_input", index=0, conversation_id=conversation_id),
+    )
+
+
 class SequenceRunner(FakeRunner):
     """呼び出しごとに別の標準出力を返すランナー。複数ターンの検証に使う。"""
 
@@ -196,16 +206,18 @@ class AntigravityCommandTest(unittest.TestCase):
 
         self.assertEqual(command[-2:], ["--conversation", "conv-9"])
 
-    def test_add_dirs_are_passed_to_agy(self):
+    def test_add_dirs_are_not_passed_to_agy(self):
+        # agy の --add-dir はワークスペースの追加で、そこの AGENTS.md と skills がどの
+        # スレッドのモデル呼び出しにも毎回載る。操作は --dangerously-skip-permissions で
+        # 既に通るため渡さない。
         command = build_command(
             agy_config(add_dirs=("/workspace", "/Users/example/.gemini")),
             Session(),
         )
 
-        self.assertEqual(
-            command[-4:],
-            ["--add-dir", "/workspace", "--add-dir", "/Users/example/.gemini"],
-        )
+        self.assertNotIn("--add-dir", command)
+        self.assertNotIn("/workspace", command)
+        self.assertIn("--dangerously-skip-permissions", command)
 
     def test_fractional_timeout_is_not_truncated_to_zero(self):
         # 秒は小数で指定できる。切り捨てると agy 側が即時打ち切りになる。
@@ -392,6 +404,106 @@ class AntigravityStreamTest(unittest.TestCase):
         self.run_stream(runner, session=session)
 
         self.assertEqual(session.handle, "conv-42")
+
+    def test_accepted_message_confirms_the_conversation_before_the_result(self):
+        # 完了を待って確定すると、途中で止めたターンの会話を捨てて全履歴を渡し直すことになる。
+        session = Session()
+        session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
+        runner = FakeRunner(
+            agy_lines(*accepted("conv-5"), delta_event("途中", state="ACTIVE"), result_event())
+        )
+        events = stream_antigravity(agy_config(), "1問目", session, runner)
+
+        self.assertEqual(next(events), ("delta", "途中"))
+        events.close()
+
+        self.assertEqual(runner.processes[0].killed, 1)
+        self.assertEqual(session.handle, "conv-5")
+        # 止めたあとの実行は続きになり、まだ渡していない発言だけを渡す。
+        messages = conversation(("user", "1問目"), ("user", "やっぱり2問目"))
+        self.assertEqual(session.prepare(messages, ANTIGRAVITY_BACKEND), messages[-1:])
+        self.assertTrue(session.resume)
+
+    def test_stopping_before_the_message_is_accepted_does_not_confirm(self):
+        # init の時点では会話 ID だけがあり、発言はまだ載っていない。ここで確定すると、
+        # 次の実行が差分だけを渡して最初の発言が会話から抜け落ちる。
+        session = Session()
+        session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
+        runner = FakeRunner(agy_lines(init_event("conv-5")))
+
+        with self.assertRaises(BridgeError):
+            self.run_stream(runner, session=session)
+
+        self.assertEqual(session.handle, "")
+
+    def test_failure_after_the_message_is_accepted_keeps_the_conversation(self):
+        # 発言は会話へ載っている。やり直しでは直近の発言だけを渡して続きを促せばよい。
+        session = Session()
+        messages = conversation(("user", "1問目"))
+        session.prepare(messages, ANTIGRAVITY_BACKEND)
+        runner = FakeRunner(
+            agy_lines(*accepted("conv-5"), result_event("", status="ERROR", error="quota"))
+        )
+
+        with self.assertRaises(BridgeError) as raised:
+            self.run_stream(runner, session=session)
+
+        self.assertEqual(raised.exception.code, "antigravity_cli_error_result")
+        self.assertEqual(session.handle, "conv-5")
+        self.assertEqual(session.prepare(messages, ANTIGRAVITY_BACKEND), messages[-1:])
+        self.assertTrue(session.resume)
+
+    def test_resuming_into_another_conversation_is_rejected(self):
+        # agy は --conversation の会話が見つからないと、警告だけ出して別 ID の新しい会話を
+        # 始める。渡したのは差分だけなので、文脈のない会話で答えさせない。
+        session = Session()
+        session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
+        session.confirm("conv-7")
+        messages = conversation(("user", "1問目"), ("assistant", "回答"), ("user", "2問目"))
+        session.prepare(messages, ANTIGRAVITY_BACKEND)
+        runner = FakeRunner(agy_lines(*accepted("conv-other"), result_event("文脈のない回答")))
+
+        with self.assertRaises(BridgeError) as raised:
+            self.run_stream(runner, session=session)
+
+        self.assertEqual(raised.exception.status, 502)
+        self.assertEqual(raised.exception.code, "antigravity_cli_conversation_lost")
+        self.assertEqual(runner.processes[0].killed, 1)
+        # 次の実行は新しい会話として全履歴を渡す。
+        self.assertEqual(session.prepare(messages, ANTIGRAVITY_BACKEND), messages)
+        self.assertFalse(session.resume)
+
+    def test_step_of_another_conversation_does_not_confirm(self):
+        # 別の会話の ID が付いた step を、この実行の発言の受理と取り違えない。
+        session = Session()
+        session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
+        runner = FakeRunner(
+            agy_lines(init_event("conv-5"), step("user_input", index=0, conversation_id="sub-1"))
+        )
+
+        with self.assertRaises(BridgeError):
+            self.run_stream(runner, session=session)
+
+        self.assertEqual(session.handle, "")
+
+    def test_resumed_turn_keeps_the_same_conversation(self):
+        session = Session()
+        session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
+        session.confirm("conv-7")
+        session.prepare(
+            conversation(("user", "1問目"), ("assistant", "回答"), ("user", "2問目")),
+            ANTIGRAVITY_BACKEND,
+        )
+        runner = FakeRunner(
+            agy_lines(
+                init_event("conv-7"),
+                step("user_input", index=4, conversation_id="conv-7"),
+                result_event("回答2", conversation_id="conv-7"),
+            )
+        )
+
+        self.assertEqual(self.run_stream(runner, session=session), [("text", "回答2")])
+        self.assertEqual(session.handle, "conv-7")
 
     def test_error_result_becomes_a_bridge_error(self):
         runner = FakeRunner(
@@ -784,6 +896,216 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
         self.assertEqual(runner.command(1)[-2:], ["--conversation", "conv-7"])
         # 続きでは転記済みの発言を送り返さない。
         self.assertEqual(runner.prompt(1), "2問目")
+
+    def test_system_instructions_are_not_repeated_on_later_turns(self):
+        # agy には system の口がなく、指示はユーザー発言として会話に残る。毎ターン渡すと
+        # 同じ指示がターンの数だけ会話へ積み上がる。
+        runner = SequenceRunner(
+            [agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7"))]
+        )
+        base_url = self.start_server(agy_config(), runner)
+        instructions = "あなたは助手です"
+
+        self.post_turn(
+            base_url, {"model": HIGH, "instructions": instructions, "input": "1問目"}
+        )
+        self.post_turn(
+            base_url,
+            {"model": HIGH, "instructions": instructions, "input": self.second_turn_input()},
+        )
+
+        self.assertEqual(runner.prompt(0), "[system]\nあなたは助手です\n\n1問目")
+        self.assertEqual(runner.command(1)[-2:], ["--conversation", "conv-7"])
+        self.assertEqual(runner.prompt(1), "2問目")
+
+    def test_added_developer_message_is_sent_once(self):
+        # Codex は途中で developer の発言を後ろへ足す。足された節だけを、その回だけ渡す。
+        runner = SequenceRunner(
+            [agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7"))]
+        )
+        base_url = self.start_server(agy_config(), runner)
+        instructions = "あなたは助手です"
+        added = {"role": "developer", "content": "使える skill の一覧"}
+        third_turn_input = [
+            *self.second_turn_input(),
+            {"role": "assistant", "content": "回答"},
+            {"role": "user", "content": "3問目"},
+        ]
+
+        self.post_turn(
+            base_url, {"model": HIGH, "instructions": instructions, "input": "1問目"}
+        )
+        self.post_turn(
+            base_url,
+            {
+                "model": HIGH,
+                "instructions": instructions,
+                "input": [added, *self.second_turn_input()],
+            },
+        )
+        self.post_turn(
+            base_url,
+            {"model": HIGH, "instructions": instructions, "input": [added, *third_turn_input]},
+        )
+
+        self.assertEqual(runner.prompt(1), "[system]\n使える skill の一覧\n\n2問目")
+        self.assertEqual(runner.prompt(2), "3問目")
+
+    def test_changed_instructions_are_sent_again_in_full(self):
+        # 会話に残った古い指示は取り消せない。今の指示の全体を後から示して上書きする。
+        runner = SequenceRunner(
+            [agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7"))]
+        )
+        base_url = self.start_server(agy_config(), runner)
+        kept = {"role": "developer", "content": "日本語で答える"}
+
+        self.post_turn(
+            base_url, {"model": HIGH, "instructions": "計画だけを立てる", "input": [
+                kept, {"role": "user", "content": "1問目"},
+            ]},
+        )
+        self.post_turn(
+            base_url,
+            {
+                "model": HIGH,
+                "instructions": "実装まで進める",
+                "input": [kept, *self.second_turn_input()],
+            },
+        )
+
+        self.assertEqual(runner.command(1)[-2:], ["--conversation", "conv-7"])
+        self.assertEqual(
+            runner.prompt(1), "[system]\n実装まで進める\n\n日本語で答える\n\n2問目"
+        )
+
+    def test_new_conversation_receives_the_instructions_again(self):
+        # 履歴が置き換わって会話を開始し直すときは、新しい会話に指示が 1 つも載っていない。
+        runner = SequenceRunner(
+            [
+                agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7")),
+                agy_lines(*accepted("conv-9"), result_event("回答2", conversation_id="conv-9")),
+            ]
+        )
+        base_url = self.start_server(agy_config(), runner)
+        instructions = "あなたは助手です"
+
+        self.post_turn(
+            base_url, {"model": HIGH, "instructions": instructions, "input": "1問目"}
+        )
+        self.post_turn(
+            base_url,
+            {
+                "model": HIGH,
+                "instructions": instructions,
+                "input": [
+                    {"role": "user", "content": "これまでの要約"},
+                    {"role": "user", "content": "2問目"},
+                ],
+            },
+        )
+
+        self.assertNotIn("--conversation", runner.command(1))
+        self.assertTrue(runner.prompt(1).startswith("[system]\nあなたは助手です\n\n"))
+
+    def test_added_instructions_alone_decide_the_size_of_a_resumed_turn(self):
+        # 続きのターンで渡すのは足された節と新しい発言だけ。載せ済みの指示まで数えると、
+        # 通るはずの入力を 413 にする。
+        runner = SequenceRunner(
+            [agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7"))]
+        )
+        base_url = self.start_server(agy_config(max_request_bytes=400), runner)
+        instructions = "あ" * 100
+        added = {"role": "developer", "content": "い" * 100}
+
+        first, _ = self.post_turn(
+            base_url, {"model": HIGH, "instructions": instructions, "input": "1問目"}
+        )
+        second, _ = self.post_turn(
+            base_url,
+            {
+                "model": HIGH,
+                "instructions": instructions,
+                "input": [added, *self.second_turn_input()],
+            },
+        )
+
+        self.assertEqual((first, second), (200, 200))
+        self.assertEqual(runner.prompt(1), "[system]\n" + "い" * 100 + "\n\n2問目")
+
+    def test_oversized_instructions_are_rejected_on_the_first_turn(self):
+        runner = SequenceRunner([agy_output()])
+        base_url = self.start_server(agy_config(max_request_bytes=400), runner)
+
+        status, body = self.post_turn(
+            base_url, {"model": HIGH, "instructions": "あ" * 200, "input": "1問目"}
+        )
+
+        self.assertEqual(status, 413)
+        self.assertEqual(body["error"]["code"], "request_too_large")
+        self.assertEqual(runner.calls, [])
+
+    def test_turn_stopped_after_the_message_was_accepted_is_continued(self):
+        # 最初のターンが途中で止まっても、発言が会話へ載っていれば次の実行は続きになる。
+        # 新しい会話で全履歴を渡し直すと、そこまでに読んだファイルやツールの結果を失う。
+        runner = SequenceRunner(
+            [
+                agy_lines(*accepted("conv-8"), delta_event("途中", state="ACTIVE")),
+                agy_lines(*accepted("conv-8"), result_event("回答", conversation_id="conv-8")),
+            ]
+        )
+        base_url = self.start_server(agy_config(), runner)
+        instructions = "あなたは助手です"
+
+        first, _ = self.post_turn(
+            base_url, {"model": HIGH, "instructions": instructions, "input": "1問目"}
+        )
+        second, payload = self.post_turn(
+            base_url,
+            {
+                "model": HIGH,
+                "instructions": instructions,
+                "input": [
+                    {"role": "user", "content": "1問目"},
+                    {"role": "user", "content": "方針を変えて2問目"},
+                ],
+            },
+        )
+
+        self.assertEqual((first, second), (502, 200))
+        self.assertEqual(payload["output_text"], "回答")
+        self.assertEqual(runner.command(1)[-2:], ["--conversation", "conv-8"])
+        self.assertEqual(runner.prompt(1), "方針を変えて2問目")
+
+    def test_lost_conversation_is_restarted_with_the_whole_history(self):
+        runner = SequenceRunner(
+            [
+                agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7")),
+                # 会話 conv-7 が見つからず、agy が別の会話を始めた。
+                agy_lines(*accepted("conv-x"), result_event("文脈なし", conversation_id="conv-x")),
+                agy_lines(*accepted("conv-9"), result_event("回答2", conversation_id="conv-9")),
+            ]
+        )
+        base_url = self.start_server(agy_config(), runner)
+        instructions = "あなたは助手です"
+        second = {
+            "model": HIGH, "instructions": instructions, "input": self.second_turn_input(),
+        }
+
+        self.post_turn(
+            base_url, {"model": HIGH, "instructions": instructions, "input": "1問目"}
+        )
+        lost, body = self.post_turn(base_url, second)
+        retried, payload = self.post_turn(base_url, second)
+
+        self.assertEqual(lost, 502)
+        self.assertEqual(body["error"]["code"], "antigravity_cli_conversation_lost")
+        self.assertEqual(retried, 200)
+        self.assertEqual(payload["output_text"], "回答2")
+        self.assertNotIn("--conversation", runner.command(2))
+        self.assertEqual(
+            runner.prompt(2),
+            "[system]\nあなたは助手です\n\n[user]\n1問目\n\n[assistant]\n回答\n\n[user]\n2問目",
+        )
 
     def test_failed_first_turn_resends_the_whole_history(self):
         runner = SequenceRunner(

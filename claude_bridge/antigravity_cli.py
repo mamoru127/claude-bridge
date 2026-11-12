@@ -10,13 +10,24 @@ headless の契約は次のとおり（NDJSON 入力を含め実機で確認）�
 標準出力は NDJSON で、各行は `event` で種別を示し、本体を同じ名前のキーへ入れ子で持つ。
 
     {"event":"init","conversation_id":"<id>","init":{"model":...,"cwd":...,"tools":[...]}}
-    {"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE",
+    {"event":"step_update","step_update":{"conversation_id":"<id>","step_index":0,
+                                          "state":"DONE","step_type":"user_input"}}
+    {"event":"step_update","step_update":{"conversation_id":"<id>","step_index":2,"state":"ACTIVE",
                                           "step_type":"agent_response","text_delta":"こん"}}
     {"event":"result","result":{"conversation_id":"<id>","status":"SUCCESS","response":"..."}}
 
 `agent_response` の `text_delta` は本物の増分で、`ACTIVE` と最後の `DONE` を連結すると
-`result` の `response` と一致する。会話の継続は `result` の `conversation_id` を
-`--conversation` へ渡す。
+`result` の `response` と一致する。会話の継続は `conversation_id` を `--conversation` へ渡す。
+
+会話まわりの挙動（agy 1.5.6 の実機で確認）。
+
+- `user_input` の step は、渡した発言が会話へ載った合図。ここより後で止めた会話は
+  `--conversation` で続けられ、途中までのツール結果も残る。`init` の直後に止めた会話は
+  ID だけ有効で発言が載っていない。
+- `--conversation` に存在しない ID を渡すと、警告だけ出して別の ID の新しい会話を始める。
+  終了コードは 0 のまま。
+- ワークスペース（作業ディレクトリと `--add-dir`）にある `AGENTS.md` / `GEMINI.md` と
+  `.agents/skills` は、毎回のモデル呼び出しへ自動で載る。
 
 認証は Antigravity CLI 側の Google アカウントのキャッシュを使う。ブリッジは認証を代行せず、
 API キー課金の経路になる環境変数を agy へ渡さない（BILLING_ENV_KEYS）。
@@ -90,8 +101,8 @@ def _latest_flash_model(path: str, effort: str, refresh_bucket: int) -> str:
 def build_command(config: BridgeConfig, session) -> list[str]:
     """実行するコマンド配列を組み立てる。シェルは介さない。
 
-    `--conversation` は前回の実行が `conversation_id` を返したときだけ付ける。初回は付けずに
-    実行し、`result` で受け取った ID をセッションへ記録して次のターンから続きにする。
+    `--conversation` は会話 ID を確定済みのときだけ付ける。初回は付けずに実行し、発言が
+    会話へ載った時点で受け取った ID をセッションへ記録して、次の実行から続きにする。
     """
 
     command = [
@@ -105,7 +116,7 @@ def build_command(config: BridgeConfig, session) -> list[str]:
         "--output-format",
         "stream-json",
         # bridge 経由では対話承認に答えられないため、Claude と同様にツール実行を止めない。
-        # 操作範囲は working_dir と --add-dir で明示した信頼済みディレクトリに限定する。
+        # この指定でワークスペースの外も読み書き・実行できる。
         "--dangerously-skip-permissions",
         # --print-timeout の既定は 5 分で、ブリッジのタイムアウトより先に打ち切られる。
         # 長い作業が途中で切れないよう、歯止めをブリッジ側と同じ値にそろえる。
@@ -113,8 +124,9 @@ def build_command(config: BridgeConfig, session) -> list[str]:
         "--print-timeout",
         f"{math.ceil(config.timeout_seconds * 1000)}ms",
     ]
-    for path in config.add_dirs:
-        command += ["--add-dir", path]
+    # config.add_dirs は渡さない。agy の --add-dir は操作の許可ではなくワークスペースの追加で、
+    # そこにある AGENTS.md と skills がどのスレッドのモデル呼び出しにも毎回載る。操作は上の
+    # 指定で既に通り、スレッドごとの指示は Codex がプロンプトへ入れてくる。
     if session.resume:
         command += ["--conversation", session.handle]
     return command
@@ -151,6 +163,8 @@ def stream_antigravity(
     session.start(process)
 
     result = None
+    # この実行の会話 ID。init で届く。
+    conversation = ""
     # ツールの step は開始と終了で 2 回届く。開始の 1 行だけを見せるため step_index を覚える。
     started_tools: set = set()
     # 失敗したツールの最後の理由。本文が空で終わった原因を示せる唯一の手がかりになる。
@@ -158,8 +172,20 @@ def stream_antigravity(
     for line in read_lines(ANTIGRAVITY, process, stderr, config.timeout_seconds):
         if not line.strip():
             continue
-        event, payload = _decode(line)
-        if event == "step_update":
+        event, payload, conversation_id = _decode(line)
+        if event == "init":
+            conversation = _started_conversation(session, conversation_id)
+        elif event == "step_update":
+            # user_input の step は、渡した発言が会話へ載った合図。実行の完了を待たずに
+            # ここで確定する。待つと、途中で止めたターン（停止、作業中の指示の差し込み、
+            # 時間切れ）の会話を捨てることになり、次の実行が全履歴を渡し直して、そこまでに
+            # 読んだファイルやツールの結果も失う。別の会話の ID が付いた step では確定しない。
+            if (
+                conversation
+                and conversation_id == conversation
+                and payload.get("step_type") == "user_input"
+            ):
+                session.confirm(conversation)
             failure = _tool_error(payload)
             tool_error = failure or tool_error
             yield from _step_events(payload, started_tools, failure)
@@ -171,13 +197,35 @@ def stream_antigravity(
         raise ANTIGRAVITY.error("の出力に result が含まれていません", "invalid_output")
     _check_status(result)
     text = _response_text(result, tool_error)
-    # 実行が最後まで正常に終わって初めて、この会話を続きに使えるものとして確定する。
+    # 通常は user_input の step で確定済み。その step を出さない agy でも続きにできるよう、
+    # 正常に終わった実行は result の ID でも確定する。
     session.confirm(_conversation_id(result))
     yield "text", text
 
 
-def _decode(line: bytes) -> tuple[str, dict]:
-    """NDJSON の 1 行を (イベント名, 本体) にする。本体はイベント名と同じキーの下にある。"""
+def _started_conversation(session, conversation_id: str) -> str:
+    """init で届いた、この実行の会話 ID を確かめて返す。
+
+    続きのはずが別の ID で始まっていたら、agy が元の会話を見つけられず新しい会話を
+    始めている。渡したのは差分の発言だけなので、そのまま進めると文脈のない会話で答えさせる
+    ことになる。実行を止めて会話を開始し直させ、次の実行で全履歴を渡す。
+    """
+
+    if session.resume and conversation_id and conversation_id != session.handle:
+        session.reset()
+        raise ANTIGRAVITY.error(
+            "が続きの会話を見つけられませんでした。次の実行で会話を開始し直します",
+            "conversation_lost",
+        )
+    return conversation_id
+
+
+def _decode(line: bytes) -> tuple[str, dict, str]:
+    """NDJSON の 1 行を (イベント名, 本体, 会話 ID) にする。
+
+    本体はイベント名と同じキーの下にある。会話 ID は init では外側、step_update と result
+    では本体の中にあり、無ければ空文字にする。
+    """
 
     try:
         payload = json.loads(line)
@@ -191,7 +239,9 @@ def _decode(line: bytes) -> tuple[str, dict]:
             f"の出力に event がありません: {snippet(line)}", "invalid_output"
         )
     body = payload.get(event)
-    return event, body if isinstance(body, dict) else {}
+    body = body if isinstance(body, dict) else {}
+    conversation_id = payload.get("conversation_id") or body.get("conversation_id")
+    return event, body, conversation_id if isinstance(conversation_id, str) else ""
 
 
 def _step_events(step: dict, started_tools: set, failure: str) -> Iterator[tuple[str, str]]:
