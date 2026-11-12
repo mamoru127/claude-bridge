@@ -35,9 +35,9 @@ DEFAULT_BRIDGE_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
 DEFAULT_UPSTREAM_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 # API で受け付けるモデル名。GET /v1/models に載り、中継が有効ならこれ以外は上流へ中継する。
-# CLI の別名または正式名を並べる。fable は実行時に 5.2 へ変換する。
+# CLI の別名または正式名を並べる。fable は 5.2、haiku は 5.5 へ変換する。
 # 上流に実在するモデル名を選ぶと、その名前が上流一覧から除かれてアプリで選べなくなる。
-DEFAULT_CLAUDE_MODELS = ("opus", "fable")
+DEFAULT_CLAUDE_MODELS = ("opus", "fable", "haiku")
 
 # Antigravity CLI（`agy`）の実行ファイル。未インストールなら該当モデルの実行時だけ失敗する。
 DEFAULT_ANTIGRAVITY_PATH = "agy"
@@ -194,8 +194,11 @@ class BridgeConfig:
         if model not in self.cli_models:
             alias = LEGACY_MODEL_ALIASES.get(model)
             model = alias if alias in self.cli_models else self.model
-        if model == "fable" and model in self.claude_models:
-            return "claude-fable-5-2"
+        if model in self.claude_models:
+            if model == "fable":
+                return "claude-fable-5-2"
+            if model == "haiku":
+                return "claude-haiku-5-5"
         return model
 
 

@@ -1917,8 +1917,16 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.model, "opus")
         self.assertEqual(
             config.claude_models,
-            ("opus", "fable"),
+            ("opus", "fable", "haiku"),
         )
+
+    def test_haiku_is_listed_and_routed_to_claude_with_upstream_enabled(self):
+        config = build_config(["--upstream-base-url", "https://upstream.example"], env={})
+        payload = build_models(config)
+        self.assertIn("haiku", [item["id"] for item in payload["data"]])
+        self.assertIn("haiku", [item["slug"] for item in payload["models"]])
+        self.assertEqual(config.backend("haiku"), CLAUDE_BACKEND)
+        self.assertEqual(config.cli_model("haiku"), "claude-haiku-5-5")
 
     def test_previous_model_names_stay_local_after_upgrade(self):
         config = build_config(["--upstream-base-url", "https://upstream.example"], env={})

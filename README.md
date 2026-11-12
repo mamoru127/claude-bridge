@@ -72,6 +72,7 @@ ChatGPT ログイン用の音声開始 API は `/realtime/calls?intent=quicksilv
 | --- | --- |
 | `opus` | Claude CLI の同名別名（最新版） |
 | `fable` | Claude CLI の `claude-fable-5-2` |
+| `haiku` | Claude CLI の `claude-haiku-5-5` |
 | `gemini-flash-high`, `gemini-flash-medium` | `agy models` にある最新の Gemini Flash |
 | `gemini-4-argon-high`, `gemini-4-argon-medium` | Antigravity CLI の Gemini 4 Argon（アカウント側のアクセス権が必要） |
 | その他 | `--upstream-base-url` 指定時は上流。未指定時は Claude CLI |
