@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch ChatGPT with its shared connection, including after login restoration."""
+"""Launch ChatGPT with its selected connection, including after login restoration."""
 
 import argparse
 import json
@@ -16,6 +16,7 @@ from pathlib import Path
 
 APP = Path("/Applications/ChatGPT.app")
 VARIABLE = "CODEX_APP_SERVER_WS_URL"
+DAEMON_VARIABLE = "CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 TERMINAL_EVENTS = {"task_complete", "turn_aborted"}
 
 
@@ -37,7 +38,13 @@ def has_connection(pid, endpoint):
         ["ps", "eww", "-p", str(pid), "-o", "command="], check=True,
         capture_output=True, text=True, timeout=10,
     )
-    return f"{VARIABLE}={endpoint}" in result.stdout.split()
+    environment = result.stdout.split()
+    if endpoint is None:
+        return not any(
+            item.startswith(f"{VARIABLE}=") and item != f"{VARIABLE}="
+            for item in environment
+        ) and f"{DAEMON_VARIABLE}=1" not in environment
+    return f"{VARIABLE}={endpoint}" in environment
 
 
 def busy_threads(rows, pid, codex_home):
@@ -82,7 +89,7 @@ def busy_threads(rows, pid, codex_home):
     return busy
 
 
-def verify_shared_transport(started_at):
+def verify_transport(started_at, transport):
     threshold = datetime.fromtimestamp(started_at, timezone.utc).isoformat(timespec="milliseconds")[:23]
     log_root = Path.home() / "Library/Logs/com.openai.codex"
     for _ in range(60):
@@ -92,28 +99,44 @@ def verify_shared_transport(started_at):
                 log.seek(max(0, path.stat().st_size - 65536))
                 lines = log.read().decode(errors="replace").splitlines()
             if any(line[:23] >= threshold and
-                   "Starting app-server connection hostId=local transport=websocket" in line
+                   f"Starting app-server connection hostId=local transport={transport}" in line
                    for line in lines):
-                logging.info("Verified the app's local transport is the shared WebSocket")
+                logging.info("Verified the app's local transport is %s", transport)
                 return
         time.sleep(1)
-    raise RuntimeError("The app did not confirm a shared WebSocket connection in its startup log")
+    raise RuntimeError(f"The app did not confirm a {transport} connection in its startup log")
+
+
+def verify_shared_transport(started_at):
+    verify_transport(started_at, "websocket")
+
+
+def verify_native_transport(started_at):
+    verify_transport(started_at, "stdio")
 
 
 def ensure_connection(endpoint, codex_home):
     # Manual launches later in this login session must use the same endpoint too.
-    subprocess.run(["/bin/launchctl", "setenv", VARIABLE, endpoint], check=True, timeout=10)
-    codex = APP / "Contents/Resources/codex-cli/bin/codex"
-    for _ in range(60):
-        result = subprocess.run(
-            [str(codex), "app-server", "daemon", "version"],
-            capture_output=True, text=True, timeout=5,
+    if endpoint is None:
+        subprocess.run(["/bin/launchctl", "unsetenv", VARIABLE], check=True, timeout=10)
+        subprocess.run(
+            ["/bin/launchctl", "setenv", DAEMON_VARIABLE, "0"], check=True, timeout=10,
         )
-        if result.returncode == 0:
-            break
-        time.sleep(2)
     else:
-        raise RuntimeError("Shared app-server did not become ready")
+        subprocess.run(["/bin/launchctl", "setenv", VARIABLE, endpoint], check=True, timeout=10)
+        codex = APP / "Contents/Resources/codex-cli/bin/codex"
+        for _ in range(60):
+            result = subprocess.run(
+                [str(codex), "app-server", "daemon", "version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                break
+            time.sleep(2)
+        else:
+            raise RuntimeError("Shared app-server did not become ready")
+
+    connection_name = "native app-managed" if endpoint is None else "shared"
 
     previous_busy = None
     while True:
@@ -122,7 +145,7 @@ def ensure_connection(endpoint, codex_home):
         if pid is None:
             break
         if has_connection(pid, endpoint):
-            logging.info("ChatGPT already uses the shared connection (pid=%s)", pid)
+            logging.info("ChatGPT already uses the %s connection (pid=%s)", connection_name, pid)
             return
         busy = busy_threads(rows, pid, codex_home)
         if busy:
@@ -135,7 +158,7 @@ def ensure_connection(endpoint, codex_home):
         rows = processes()
         if app_pid(rows) != pid or busy_threads(rows, pid, codex_home):
             continue
-        logging.info("Restarting idle ChatGPT with the explicit shared connection (pid=%s)", pid)
+        logging.info("Restarting idle ChatGPT with the %s connection (pid=%s)", connection_name, pid)
         os.kill(pid, signal.SIGTERM)
         for _ in range(60):
             if app_pid(processes()) != pid:
@@ -146,23 +169,28 @@ def ensure_connection(endpoint, codex_home):
         break
 
     started_at = time.time()
-    subprocess.run(
-        ["/usr/bin/open", "-g", "-a", str(APP), "--env", f"{VARIABLE}={endpoint}"],
-        check=True, timeout=15,
-    )
+    arguments = ["/usr/bin/open", "-g", "-a", str(APP), "--env", f"{VARIABLE}={endpoint or ''}"]
+    if endpoint is None:
+        arguments.extend(["--env", f"{DAEMON_VARIABLE}=0"])
+    subprocess.run(arguments, check=True, timeout=15)
     for _ in range(60):
         pid = app_pid(processes())
         if pid is not None and has_connection(pid, endpoint):
-            logging.info("Verified ChatGPT launched with the shared connection (pid=%s)", pid)
-            verify_shared_transport(started_at)
+            logging.info("Verified ChatGPT launched with the %s connection (pid=%s)", connection_name, pid)
+            if endpoint is None:
+                verify_native_transport(started_at)
+            else:
+                verify_shared_transport(started_at)
             return
         time.sleep(1)
-    raise RuntimeError("ChatGPT did not launch with the requested shared connection")
+    raise RuntimeError("ChatGPT did not launch with the requested connection")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--endpoint", required=True)
+    connection = parser.add_mutually_exclusive_group(required=True)
+    connection.add_argument("--endpoint")
+    connection.add_argument("--native", action="store_true")
     parser.add_argument("--codex-home", type=Path, required=True)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

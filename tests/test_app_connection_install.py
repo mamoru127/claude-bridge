@@ -14,6 +14,42 @@ SPEC.loader.exec_module(installer)
 
 
 class AppConnectionInstallTests(unittest.TestCase):
+    def test_native_mode_is_preserved_on_reinstallation(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(installer.subprocess, "run") as run:
+            root = Path(directory)
+            codex_home = root / ".codex"
+            self.assertEqual(installer.install_connection(root, codex_home, 123, "native"), "native")
+            self.assertEqual(installer.install_connection(root, codex_home, 123), "native")
+            path = root / "Library/LaunchAgents" / f"{installer.LABEL}.plist"
+            job = plistlib.loads(path.read_bytes())
+            self.assertIn("--native", job["ProgramArguments"])
+            self.assertNotIn("--endpoint", job["ProgramArguments"])
+            calls = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(calls[0][1:], [
+                "-m", "claude_bridge.app_tools_setup", "--native", "--codex-home", str(codex_home),
+            ])
+            self.assertEqual(calls[1], ["/bin/launchctl", "unsetenv", "CODEX_APP_SERVER_WS_URL"])
+            self.assertEqual(calls[2], ["/bin/launchctl", "setenv", "CODEX_APP_SERVER_USE_LOCAL_DAEMON", "0"])
+            self.assertEqual((root / ".config/claude-bridge/app-connection-mode").read_text(), "native\n")
+
+    def test_invalid_mode_does_not_change_configuration(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(installer.subprocess, "run") as run:
+            root = Path(directory)
+            with self.assertRaisesRegex(ValueError, "mode"):
+                installer.install_connection(root, root / ".codex", 123, "invalid")
+            run.assert_not_called()
+            self.assertFalse((root / "Library").exists())
+
+    def test_native_migration_failure_does_not_install_or_save_mode(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            installer.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "setup")
+        ):
+            root = Path(directory)
+            with self.assertRaises(subprocess.CalledProcessError):
+                installer.install_connection(root, root / ".codex", 123, "native")
+            self.assertFalse((root / "Library").exists())
+            self.assertFalse((root / ".config/claude-bridge/app-connection-mode").exists())
+
     def test_persists_same_endpoint_for_current_session_and_login_without_server_restart(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             installer.subprocess, "run"
@@ -46,9 +82,10 @@ class AppConnectionInstallTests(unittest.TestCase):
             installer.subprocess, "run"
         ) as run:
             root = Path(directory)
-            for codex_home in [Path("relative"), root / "space here", root / "colon:here"]:
-                with self.subTest(codex_home=codex_home), self.assertRaises(ValueError):
-                    installer.install_connection(root, codex_home, 123)
+            for mode in ["shared", "native"]:
+                for codex_home in [Path("relative"), root / "space here", root / "colon:here"]:
+                    with self.subTest(codex_home=codex_home, mode=mode), self.assertRaises(ValueError):
+                        installer.install_connection(root, codex_home, 123, mode)
             run.assert_not_called()
             self.assertFalse((root / "Library").exists())
 

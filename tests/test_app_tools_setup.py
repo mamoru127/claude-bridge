@@ -62,3 +62,47 @@ class DisableAppToolsTests(unittest.TestCase):
         with self.assertRaisesRegex(AppServerError, "version mismatch"):
             setup.disable_tools(self.client, self.codex_home)
         self.assertNotIn("config/mcpServer/reload", self.methods())
+
+
+class NativeAppToolsTests(unittest.TestCase):
+    def test_moves_permissions_without_reusing_legacy_launcher(self):
+        home = Path("/tmp/codex-native-test")
+        plugin_name = "codex-app-tools@openai-bundled"
+        permissions = {"automation_update": {"approval_mode": "prompt"}}
+        existing_override = {"tools": {"create_thread": {"approval_mode": "prompt"}}}
+        unrelated = {"command": "/other-mcp", "enabled": True}
+        config = {
+            "mcp_servers": {"codex_app": {
+                "command": "/legacy-launcher", "enabled": False, "tools": permissions,
+                "default_tools_approval_mode": "approve",
+            }, "other": unrelated},
+            "plugins": {plugin_name: {"enabled": True, "mcp_servers": {"codex_app": existing_override}}},
+        }
+        client = Mock()
+        client.call.return_value = {"layers": [{
+            "name": {"type": "user", "file": str(home / "config.toml"), "profile": None},
+            "version": "before", "config": config,
+        }]}
+        self.assertTrue(setup.configure_native_tools(client, home))
+        write = client.call.call_args_list[1]
+        self.assertEqual(write.args[0], "config/batchWrite")
+        self.assertEqual(write.args[1]["expectedVersion"], "before")
+        servers, plugin = write.args[1]["edits"]
+        self.assertEqual(servers["value"], {"other": unrelated})
+        self.assertEqual(plugin["keyPath"], f'plugins."{plugin_name}".mcp_servers.codex_app')
+        self.assertEqual(plugin["value"], {
+            "default_tools_approval_mode": "approve", "tools": {
+                **permissions, **existing_override["tools"],
+            },
+        })
+        self.assertEqual(client.call.call_args_list[-1].args[0], "config/mcpServer/reload")
+
+    def test_native_setup_without_legacy_entry_is_idempotent(self):
+        home = Path("/tmp/codex-native-test")
+        client = Mock()
+        client.call.return_value = {"layers": [{
+            "name": {"type": "user", "file": str(home / "config.toml"), "profile": None},
+            "version": "before", "config": {"mcp_servers": {}},
+        }]}
+        self.assertFalse(setup.configure_native_tools(client, home))
+        client.call.assert_called_once_with("config/read", {"includeLayers": True})

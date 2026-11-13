@@ -20,6 +20,35 @@ ROWS = [["10", "1", str(startup.APP / "Contents/MacOS/ChatGPT")],
 
 
 class AppConnectionStartupTests(unittest.TestCase):
+    def test_native_connection_uses_app_owned_stdio_without_stopping_shared_server(self):
+        with patch.object(startup, "processes", side_effect=[ROWS, ROWS, [], ROWS]), patch.object(
+            startup, "has_connection", side_effect=[False, True]
+        ), patch.object(startup, "busy_threads", return_value=[]), patch.object(
+            startup.os, "kill"
+        ) as kill, patch.object(startup.subprocess, "run") as run, patch.object(
+            startup, "verify_native_transport"
+        ) as verify:
+            startup.ensure_connection(None, Path("/tmp/codex"))
+        kill.assert_called_once_with(10, signal.SIGTERM)
+        calls = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(calls[0], ["/bin/launchctl", "unsetenv", startup.VARIABLE])
+        self.assertEqual(calls[1], ["/bin/launchctl", "setenv", startup.DAEMON_VARIABLE, "0"])
+        self.assertIn(f"{startup.VARIABLE}=", calls[-1])
+        self.assertIn(f"{startup.DAEMON_VARIABLE}=0", calls[-1])
+        self.assertFalse(any("daemon" in command for command in calls))
+        verify.assert_called_once()
+
+    def test_native_detection_rejects_shared_websocket_and_daemon_environment(self):
+        for environment, expected in [
+            ("ChatGPT CODEX_APP_SERVER_WS_URL=ws://localhost/rpc", False),
+            ("ChatGPT CODEX_APP_SERVER_USE_LOCAL_DAEMON=1", False),
+            ("ChatGPT CODEX_APP_SERVER_WS_URL= CODEX_APP_SERVER_USE_LOCAL_DAEMON=0", True),
+            ("ChatGPT PATH=/usr/bin", True),
+        ]:
+            with self.subTest(environment=environment), patch.object(startup.subprocess, "run") as run:
+                run.return_value.stdout = environment
+                self.assertIs(startup.has_connection(10, None), expected)
+
     def test_correct_connection_leaves_running_app_untouched(self):
         with patch.object(startup, "processes", return_value=ROWS), patch.object(
             startup, "has_connection", return_value=True

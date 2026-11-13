@@ -100,6 +100,14 @@ CLAUDE_BRIDGE_WORKING_DIR=/path/to/project launchd/install.sh
 
 起動設定は `launchd/local.claude-bridge.plist` にあります。Codex が渡すツール（imagegen など）は Claude でも既定で使えます。スレッド操作用の共有 app-server もインストーラーが設定します。macOS の ChatGPT アプリを `/Applications` にインストールしてから実行してください。ログイン時のアプリ復元が先に動いても、共有接続を明示して起動し直します。実行中のタスクがある間は終了を待ち、処理を中断しません。確認ログは `~/Library/Logs/claude-bridge/app-connection.log` です。使用中の 8787 を持つ別プロセスは停止しません。
 
+ChatGPT アプリのスケジュール用ツールを使う場合は、アプリ管理の app-server に切り替えます。
+
+```bash
+python3 launchd/install-app-connection.py --mode native
+```
+
+アプリを標準の stdio 接続で起動し、アプリ用ツールの旧 MCP 登録を標準プラグインへ移します。各ツールの承認設定も移します。選択は `~/.config/claude-bridge/app-connection-mode` に保存され、再インストールと次回ログインでも使われます。bridge のモデル接続と、RPC 用の共有 app-server は継続します。PC アプリでは新しい会話から確認してください。共有サーバーで実行中のスレッドをアプリ側で開くと、実行プロセスが異なるため `already has an active writer` になることがあります。スマホ Remote から既存の共有サーバーへ接続した会話でのツール提供は別途確認が必要です。共有接続へ戻す場合は `--mode shared` を指定します。
+
 このマシンだけの設定（Claude に触らせる追加ディレクトリ、追加の MCP サーバーなど）は、リポジトリではなく `~/.config/claude-bridge/bridge.env` に `NAME=value` の形で書きます。`install.sh` が plist の環境変数へ足します。変えたら `install.sh` を実行し直してください。
 
 ```bash

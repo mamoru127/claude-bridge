@@ -12,10 +12,10 @@ if [ ! -x "$bridge_python" ]; then
   exit 1
 fi
 setup_connection() {
-  /usr/bin/python3 "$source_dir/install-app-connection.py"
+  CLAUDE_BRIDGE_PYTHON="$bridge_python" /usr/bin/python3 "$source_dir/install-app-connection.py"
   # ChatGPT アプリは自分が起動していないプロセスからのアプリ用ツール接続を拒むため、
-  # launchd の共有 app-server では codex_app が必ず失敗する。無効にしておき、
-  # スレッドの作成や送信はブリッジの codex_app_server を使う。
+  # 共有接続では明示的な codex_app を無効にする。native 接続を選択済みの場合は
+  # 権限設定をアプリ管理の標準プラグインへ移す。共有サーバーは RPC 用にも使う。
   if ! PYTHONPATH="$source_dir/.." "$bridge_python" -m claude_bridge.app_tools_setup; then
     echo "警告: codex_app を無効にできませんでした。登録は続けます。" >&2
   fi
