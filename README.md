@@ -100,11 +100,13 @@ CLAUDE_BRIDGE_WORKING_DIR=/path/to/project launchd/install.sh
 
 起動設定は `launchd/local.claude-bridge.plist` にあります。Codex が渡すツール（imagegen など）は Claude でも既定で使えます。スレッド操作用の共有 app-server もインストーラーが設定します。macOS の ChatGPT アプリを `/Applications` にインストールしてから実行してください。ログイン時のアプリ復元が先に動いても、共有接続を明示して起動し直します。実行中のタスクがある間は終了を待ち、処理を中断しません。確認ログは `~/Library/Logs/claude-bridge/app-connection.log` です。使用中の 8787 を持つ別プロセスは停止しません。
 
-ChatGPT アプリのスケジュール用ツールを使う場合は、アプリ管理の app-server に切り替えます。
+PC・スマホ Remote・アプリのスケジュール用ツールを同じ app-server で使う場合は、アプリ管理の接続へ切り替えます。
 
 ```bash
 python3 launchd/install-app-connection.py --mode native
 ```
+
+共有 app-server 側の Remote 接続を無効にし、スマホ接続もアプリ管理の app-server に統一します。共有側が先に同じホストとして接続すると、アプリ側は `Remote app server already online`（HTTP 409）で拒否され、PC とスマホが別々のタスク書き込み権を持ってしまいます。共有側の実行中タスクやスマホのペアリングは削除しません。既存の Remote 登録が有効なら、アプリ側が再接続します。切り替え前から共有側で実行中のタスクは、終了まで書き込み権が残る場合があります。
 
 アプリを標準の stdio 接続で起動し、アプリ用ツールの旧 MCP 登録を標準プラグインへ移します。各ツールの承認設定も移します。選択は `~/.config/claude-bridge/app-connection-mode` に保存され、再インストールと次回ログインでも使われます。bridge のモデル接続と、RPC 用の共有 app-server は継続します。PC アプリでは新しい会話から確認してください。共有サーバーで実行中のスレッドをアプリ側で開くと、実行プロセスが異なるため `already has an active writer` になることがあります。スマホ Remote から既存の共有サーバーへ接続した会話でのツール提供は別途確認が必要です。共有接続へ戻す場合は `--mode shared` を指定します。
 

@@ -70,6 +70,20 @@ def configure_native_tools(client, codex_home: Path) -> bool:
     return True
 
 
+def disable_shared_remote(client) -> bool:
+    """Leave the paired Remote connection to the app-owned server.
+
+    Both servers can reuse the same host enrollment. If the shared server
+    connects first, the native server receives HTTP 409 and phones keep using
+    a different writer from the desktop. Disable only the shared server's
+    persisted enrollment; this does not stop its running turns or revoke pairs.
+    """
+    if client.call("remoteControl/status/read", {}).get("status") == "disabled":
+        return False
+    client.call("remoteControl/disable", {})
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native", action="store_true")
@@ -82,6 +96,7 @@ def main():
     try:
         if native:
             changed = configure_native_tools(client, codex_home)
+            disable_shared_remote(client)
         else:
             changed = disable_tools(client, codex_home)
     finally:

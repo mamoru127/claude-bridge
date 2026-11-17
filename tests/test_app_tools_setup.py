@@ -2,7 +2,7 @@ import copy
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from claude_bridge import app_tools_setup as setup
 from claude_bridge.app_server import AppServerError
@@ -62,6 +62,36 @@ class DisableAppToolsTests(unittest.TestCase):
         with self.assertRaisesRegex(AppServerError, "version mismatch"):
             setup.disable_tools(self.client, self.codex_home)
         self.assertNotIn("config/mcpServer/reload", self.methods())
+
+
+class NativeRemoteTests(unittest.TestCase):
+    def test_disables_only_shared_remote_persistently_without_stopping_turns(self):
+        for status in ("connected", "connecting", "errored"):
+            with self.subTest(status=status):
+                client = Mock()
+                client.call.side_effect = [{"status": status}, {"status": "disabled"}]
+                self.assertTrue(setup.disable_shared_remote(client))
+                self.assertEqual(client.call.call_args_list, [
+                    unittest.mock.call("remoteControl/status/read", {}),
+                    unittest.mock.call("remoteControl/disable", {}),
+                ])
+
+    def test_already_disabled_is_left_alone(self):
+        client = Mock()
+        client.call.return_value = {"status": "disabled"}
+        self.assertFalse(setup.disable_shared_remote(client))
+        client.call.assert_called_once_with("remoteControl/status/read", {})
+
+    def test_native_setup_disables_shared_remote_and_closes_client(self):
+        with patch("sys.argv", ["app_tools_setup", "--native"]), \
+                patch.object(setup, "AppServerClient") as factory, \
+                patch.object(setup, "configure_native_tools", return_value=False) as configure, \
+                patch.object(setup, "disable_shared_remote") as disable, \
+                patch("builtins.print"):
+            setup.main()
+        configure.assert_called_once()
+        disable.assert_called_once_with(factory.return_value)
+        factory.return_value.close.assert_called_once()
 
 
 class NativeAppToolsTests(unittest.TestCase):
