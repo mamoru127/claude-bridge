@@ -41,22 +41,70 @@ DEFAULT_CLAUDE_MODELS = ("opus", "fable", "haiku")
 
 # Antigravity CLI（`agy`）の実行ファイル。未インストールなら該当モデルの実行時だけ失敗する。
 DEFAULT_ANTIGRAVITY_PATH = "agy"
-# Flash の公開名は固定し、実行時に `agy models` から最新版を選ぶ。
-# Argon は agy の正式名をそのまま渡す。利用にはアカウント側のアクセス権が必要。
+# agy の正式名をそのまま渡す。利用にはアカウント側のアクセス権が必要。
 DEFAULT_ANTIGRAVITY_MODELS = (
-    "gemini-flash-high",
-    "gemini-flash-medium",
     "gemini-4-argon-high",
     "gemini-4-argon-medium",
+    "gemini-4-hydrogen-high",
+    "gemini-3.8-flash-high",
 )
 
 # 旧版の設定を使うクライアントが上流へ誤転送されないよう、以前の公開名も受け付ける。
 LEGACY_MODEL_ALIASES = {
     "claude-opus-5-5": "opus",
     "claude-fable-5-1": "fable",
-    "gemini-3.8-flash-high": "gemini-flash-high",
-    "gemini-3.8-flash-medium": "gemini-flash-medium",
+    "gemini-4-carbon-high": "gemini-4-argon-high",
+    "gemini-4-carbon-medium": "gemini-4-argon-medium",
+    "gemini-4-carbon-low": "gemini-4-argon-low",
 }
+
+# Codex の reasoning.effort に合わせてティアを切り替えられる Antigravity のモデル系統。
+# agy models で実在を確認したティアだけを並べ、単一ティアのモデルは書き換えない。
+ANTIGRAVITY_EFFORT_FAMILIES = {
+    "gemini-4-argon": ("low", "medium", "high"),
+    "gemini-4-carbon": ("low", "medium", "high"),
+    "gemini-4-hydrogen": ("low", "medium", "high", "xhigh"),
+    "gemini-3.8-flash": ("low", "medium", "high"),
+}
+ANTIGRAVITY_EFFORT_ALIASES = {
+    "none": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+    "ultra": "xhigh",
+}
+
+
+def antigravity_family(model: str) -> str | None:
+    """ティア切り替えに対応する Antigravity モデルなら、その系統名を返す。"""
+
+    for family in ANTIGRAVITY_EFFORT_FAMILIES:
+        if model == family:
+            return family
+        prefix = f"{family}-"
+        if model.startswith(prefix) and model[len(prefix) :] in ("low", "medium", "high", "xhigh"):
+            return family
+    return None
+
+
+def _antigravity_cli_model(model: str, reasoning_effort: str | None) -> str:
+    """Antigravity のモデル名に Codex の reasoning.effort を反映した実行モデル名を返す。"""
+
+    family = antigravity_family(model)
+    if family is None:
+        return model
+    if not reasoning_effort:
+        return f"{family}-medium" if model == family else model
+    tier = ANTIGRAVITY_EFFORT_ALIASES.get(reasoning_effort.strip().lower())
+    if tier is None:
+        return f"{family}-medium" if model == family else model
+    levels = ANTIGRAVITY_EFFORT_FAMILIES[family]
+    if tier == "xhigh" and "xhigh" not in levels:
+        tier = "high"
+    return f"{family}-{tier}"
 
 # モデル名から決まる実行先。空文字は「ローカルの CLI では処理せず上流へ中継する」を表す。
 CLAUDE_BACKEND = "claude"
@@ -184,11 +232,12 @@ class BridgeConfig:
             return CLAUDE_BACKEND
         return UPSTREAM_BACKEND
 
-    def cli_model(self, model: str) -> str:
-        """リクエストのモデル名に対して CLI の --model へ渡す実行モデル名を返す。
+    def cli_model(self, model: str, reasoning_effort: str | None = None) -> str:
+        """リクエストのモデル名と推論の強さに対して CLI へ渡す実行モデル名を返す。
 
-        渡してよいのは起動時に許可した名前だけ。中継が無効なときは一覧にない名前でも
-        Claude CLI へ回るため、そこは起動時の `--model` で実行する。
+        渡してよいのは起動時に許可した名前（Antigravity の系統モデルはそのティアを含む）だけ。
+        中継が無効なときは一覧にない名前でも Claude CLI へ回るため、そこは起動時の `--model` で
+        実行する。
         """
 
         if model not in self.cli_models:
@@ -199,6 +248,9 @@ class BridgeConfig:
                 return "claude-fable-5-2"
             if model == "haiku":
                 return "claude-haiku-5-5"
+            return model
+        if model in self.antigravity_models:
+            return _antigravity_cli_model(model, reasoning_effort)
         return model
 
 

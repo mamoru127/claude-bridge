@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Sequence
@@ -10,9 +11,12 @@ from urllib.parse import urlsplit
 
 from .config import (
     ANTIGRAVITY_BACKEND,
+    ANTIGRAVITY_EFFORT_FAMILIES,
     CLAUDE_BACKEND,
+    LEGACY_MODEL_ALIASES,
     TOOL_SEARCH_LIMIT,
     BridgeConfig,
+    antigravity_family,
 )
 from .errors import BridgeError
 
@@ -33,7 +37,7 @@ CLI_METADATA = {
         "display_name": "Antigravity CLI ({slug})",
         "description": (
             "claude-bridge 経由の Antigravity CLI（agy）。入力はテキストのみ、出力はテキスト。"
-            "思考の強さはモデル名の high / medium で選ぶ。"
+            "推論の強さ（low / medium / high）を切り替えられる。"
         ),
         # agy の headless 契約に画像を渡す口がなく、画像付きリクエストは 400 で拒否する。
         # 雛形が画像対応でも、その宣言は受け継がない。
@@ -44,6 +48,26 @@ CLI_METADATA = {
         "context_window": 200000,
     },
 }
+
+# Codex アプリが既定で送る GPT 向け基本指示を Antigravity 向けに置き換える最小ルール。
+# agy 自身の `<communication_style>`（file:// リンク）と Codex アプリの描画仕様の衝突を解消し、
+# agy に存在しない Codex 専用ツール群への言及を省く。
+CODEX_APP_ANTIGRAVITY_INSTRUCTIONS = (
+    "Codex アプリ経由で実行されています。応答の表示では次の規則を優先してください。\n"
+    "- ローカルファイルへのリンクは `file://` を使わず、`[app.py](/abs/path/app.py:12)` の形式"
+    "（空白を含むパスは `[My File.md](</abs/path/My File.md:12>)`、行範囲は不可、"
+    "バッククォートで囲まない）で書く。\n"
+    "- 見出しの直後と箇条書きの直前には空行を入れる。\n"
+    "- ツール操作にはこのランタイム自身のツールを使い、Codex 専用の `functions.*`・"
+    "`exec_command`・`spawn_agent`・`tool_search` は呼ばない。"
+)
+
+_CODEX_ONLY_SYSTEM_BLOCKS = re.compile(
+    r"^<(?P<tag>tools)>"
+    r".*?"
+    r"</(?P=tag)>[ \t]*\n?",
+    re.MULTILINE | re.DOTALL,
+)
 
 SYSTEM_ROLES = ("system", "developer")
 MESSAGE_ROLES = ("user", "assistant")
@@ -86,6 +110,8 @@ class ParsedRequest:
     # system_prompt をまとめる前の節。instructions、続いて system / developer の発言が届いた順に並ぶ。
     # system の口がない CLI は、会話へまだ載せていない節だけを渡すためにこの単位で見分ける。
     system_sections: tuple[str, ...] = ()
+    # Codex が送る `reasoning.effort`（low / medium / high / xhigh など）。未指定なら None。
+    reasoning_effort: str | None = None
 
 
 def requested_model(payload: object, default_model: str) -> str:
@@ -122,6 +148,17 @@ def parse_request(
         raise _invalid(
             "prompt_cache_key は文字列で指定してください", param="prompt_cache_key"
         )
+
+    reasoning = payload.get("reasoning")
+    if reasoning is not None and not isinstance(reasoning, dict):
+        raise _invalid("reasoning はオブジェクトで指定してください", param="reasoning")
+    reasoning_effort = None
+    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
+        if not isinstance(reasoning["effort"], str):
+            raise _invalid(
+                "reasoning.effort は文字列で指定してください", param="reasoning.effort"
+            )
+        reasoning_effort = reasoning["effort"].strip().lower() or None
 
     system_sections = []
     instructions = payload.get("instructions")
@@ -170,6 +207,7 @@ def parse_request(
         tools=tools,
         tool_search_query=search_query,
         system_sections=tuple(system_sections),
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -479,6 +517,29 @@ def ensure_text_only(messages: Sequence[Message]) -> None:
         )
 
 
+def antigravity_system_sections(sections: Sequence[str]) -> tuple[str, ...]:
+    """Codex アプリが送る system / developer 節を Antigravity 向けに整える。
+
+    Antigravity は独自のシステムプロンプトとツール一式を持つため、Codex 本体の長大な行動規約や
+    未提供ツールの宣言をそのまま重ねると、入力トークンの肥大化と書式指示の衝突で思考が長引く。
+    Codex アプリの表示規則・Collaboration Mode・Memory・利用者独自の指示だけを残す。
+    節ごとの変換に留めることで、`Session` の既読判定（先頭一致）を壊さない。
+    """
+
+    return tuple(
+        normalized
+        for section in sections
+        if (normalized := _normalize_antigravity_system(section))
+    )
+
+
+def _normalize_antigravity_system(section: str) -> str:
+    normalized, removed = _CODEX_ONLY_SYSTEM_BLOCKS.subn("", section)
+    if removed:
+        return (normalized.strip() + "\n" + CODEX_APP_ANTIGRAVITY_INSTRUCTIONS).strip()
+    return section
+
+
 def build_prompt(messages: Sequence[Message], system_prompt: str | None) -> str:
     """発言列を 1 本のプロンプト文字列にする。
 
@@ -555,6 +616,14 @@ def _dict_items(payload: dict, name: str) -> list[dict]:
     return [item for item in value if isinstance(item, dict)]
 
 
+def _reasoning_levels(slug: str, backend: str) -> tuple[str, ...]:
+    if backend == ANTIGRAVITY_BACKEND:
+        family = antigravity_family(LEGACY_MODEL_ALIASES.get(slug, slug))
+        if family is not None:
+            return ANTIGRAVITY_EFFORT_FAMILIES[family]
+    return REASONING_LEVELS
+
+
 def _codex_model(config: BridgeConfig, slug: str, template: dict) -> dict:
     """Codex が読むモデルメタデータ。ブリッジが実装していない機能を打ち消した値で埋める。
 
@@ -563,7 +632,9 @@ def _codex_model(config: BridgeConfig, slug: str, template: dict) -> dict:
     受け継ぎ、ブリッジが実装していない機能だけを下の値で打ち消す。
     """
 
-    metadata = CLI_METADATA[config.backend(slug)]
+    backend = config.backend(slug)
+    metadata = CLI_METADATA[backend]
+    levels = _reasoning_levels(slug, backend)
     return {
         **template,
         "slug": slug,
@@ -583,7 +654,7 @@ def _codex_model(config: BridgeConfig, slug: str, template: dict) -> dict:
         "supported_in_api": True,
         "default_reasoning_level": "medium",
         "supported_reasoning_levels": [
-            {"effort": effort, "description": effort} for effort in REASONING_LEVELS
+            {"effort": effort, "description": effort} for effort in levels
         ],
         # ここはリクエストの reasoning summary パラメータをどう送るかの宣言。
         # ブリッジはリクエストのパラメータを読まず、実行中のツール使用を常に reasoning として

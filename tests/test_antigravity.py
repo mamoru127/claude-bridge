@@ -1,23 +1,24 @@
-"""Antigravity CLI（agy）を受け持つモデルの実行・会話継続・モデル一覧の検証。
+"""Antigravity CLI（`agy acp`）を受け持つモデルの実行・常駐多重化・会話継続・モデル一覧の検証。
 
-擬似出力は agy 1.1.13 の実出力を写したもの。各行は `event` で種別を示し、本体を同じ名前の
-キーへ入れ子で持つ。`agent_response` の `text_delta` は本物の増分で、`ACTIVE` と最後の
-`DONE` を連結すると `result` の `response` と一致する。`user_input` の step が発言の
-受理を示すこと、存在しない会話 ID では別 ID の新しい会話が始まることは 1.5.6 で確認した。
+擬似応答は agy 1.5.11 の `agy acp --dangerously-skip-permissions` 実出力を写したもの。
+起動時に 1 回だけ `initialize` を行い、会話の開始に `session/new`、再起動後の引き継ぎに
+`session/resume`、モデル選択に `session/set_model`、各ターンに `session/prompt` を使う。
+途中経過は `session/update` 通知で届き、中断は `session/cancel` 通知で行う。
 """
 
+import io
 import json
+import queue
 import subprocess
+import threading
 import time
 import unittest
-from unittest import mock
 
 from claude_bridge.antigravity_cli import (
     BILLING_ENV_KEYS,
-    _latest_flash_model,
+    AntigravityClient,
     agy_env,
     build_command,
-    resolve_model,
     stream_antigravity,
 )
 from claude_bridge.claude_cli import transcript_id
@@ -30,8 +31,10 @@ from claude_bridge.config import (
 )
 from claude_bridge.errors import BridgeError
 from claude_bridge.responses import Message, build_models, build_prompt
+from claude_bridge.server import BridgeServer
 from claude_bridge.sessions import Session
 
+from tests.test_app_server_mcp import FakeAppServer
 from tests.test_bridge import (
     PNG_DATA_URL,
     BridgeHTTPTestCase,
@@ -48,117 +51,352 @@ from tests.test_bridge import result_event as claude_result
 HIGH = "gemini-3.8-flash-high"
 MEDIUM = "gemini-3.8-flash-medium"
 
-
-def agy_lines(*events: dict) -> bytes:
-    """headless の NDJSON 出力を組み立てる。"""
-
-    return b"".join(json.dumps(event).encode("utf-8") + b"\n" for event in events)
+_STREAM_END = object()
 
 
-def init_event(conversation_id: str = "conv-1") -> dict:
+def update_notice(session_id: str, session_update: str, **fields) -> dict:
+    """`session/update` 通知 1 件。"""
+
     return {
-        "event": "init",
-        "conversation_id": conversation_id,
-        "init": {
-            "model": HIGH,
-            "cwd": "/tmp",
-            "tools": ["run_command", "view_file"],
-            "permission_mode": "request-review",
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": session_update,
+                **fields,
+            },
         },
     }
 
 
-def step(step_type: str, index: int = 2, state: str = "DONE", **fields) -> dict:
-    return {
-        "event": "step_update",
-        "step_update": {
-            "conversation_id": "conv-1",
-            "step_index": index,
-            "state": state,
-            "step_type": step_type,
-            **fields,
-        },
-    }
-
-
-def delta_event(text: str, state: str = "DONE") -> dict:
-    return step("agent_response", index=2, state=state, text_delta=text)
-
-
-def tool_event(
-    name: str,
-    parameters: dict | None = None,
-    index: int = 3,
-    state: str = "ACTIVE",
-    error: str | None = None,
-) -> dict:
-    info = {"name": name, "parameters": parameters or {}}
-    if error is not None:
-        info["error"] = {"type": "TOOL_ERROR", "message": error}
-    return step("tool", index=index, state=state, tool_name=name, tool_info=info)
-
-
-def result_event(
-    response: str = "こんにちは",
-    conversation_id: str = "conv-1",
-    status: str = "SUCCESS",
-    error: object = None,
-) -> dict:
-    return {
-        "event": "result",
-        "result": {
-            "conversation_id": conversation_id,
-            "status": status,
-            "response": response,
-            "duration_seconds": 3.2,
-            "num_turns": 1,
-            "error": error,
-            "usage": {"input_tokens": 10, "output_tokens": 3},
-        },
-    }
-
-
-def agy_output(*events: dict) -> bytes:
-    """init と result を含む、いちばん普通の 1 ターン分の出力。"""
-
-    return agy_lines(init_event(), *events, result_event())
-
-
-def accepted(conversation_id: str = "conv-1") -> tuple[dict, dict]:
-    """発言が会話へ載るところまでの出力。agy は init に続けて user_input の step を出す。"""
-
-    return (
-        init_event(conversation_id),
-        step("user_input", index=0, conversation_id=conversation_id),
+def message_chunk(text: str, session_id: str = "conv-1") -> dict:
+    return update_notice(
+        session_id, "agent_message_chunk", content={"type": "text", "text": text}
     )
 
 
-class SequenceRunner(FakeRunner):
-    """呼び出しごとに別の標準出力を返すランナー。複数ターンの検証に使う。"""
+def thought_chunk(text: str, session_id: str = "conv-1") -> dict:
+    return update_notice(
+        session_id, "agent_thought_chunk", content={"type": "text", "text": text}
+    )
 
-    def __init__(self, outputs: list[bytes]):
-        super().__init__(stdout=outputs[0])
-        self._outputs = outputs
 
-    def make_process(self) -> FakeProcess:
-        index = min(len(self.processes), len(self._outputs) - 1)
-        return FakeProcess(self._outputs[index])
+def usage_update(used: int = 0, session_id: str = "conv-1") -> dict:
+    return update_notice(session_id, "usage_update", used=used, size=1048576)
+
+
+def tool_call_notice(
+    name: str,
+    args: dict | None = None,
+    call_id: str = "call_1",
+    session_id: str = "conv-1",
+) -> dict:
+    payload = args or {}
+    return update_notice(
+        session_id,
+        "tool_call",
+        toolCallId=call_id,
+        name=name,
+        args=payload,
+        rawInput=payload,
+        status="in_progress",
+    )
+
+
+def tool_update_notice(
+    name: str = "",
+    status: str = "completed",
+    call_id: str = "call_1",
+    session_id: str = "conv-1",
+    args: dict | None = None,
+    error: object = None,
+    raw_output: object = None,
+    title: str | None = None,
+) -> dict:
+    fields: dict = {"toolCallId": call_id, "status": status}
+    if name:
+        fields["name"] = name
+    if args is not None:
+        fields["args"] = args
+    if error is not None:
+        fields["error"] = error
+    if raw_output is not None:
+        fields["rawOutput"] = raw_output
+    if title is not None:
+        fields["title"] = title
+    return update_notice(session_id, "tool_call_update", **fields)
+
+
+def prompt_turn(
+    response: str = "こんにちは",
+    *updates: dict,
+    stop_reason: str = "end_turn",
+    error: object = None,
+    hold: bool = False,
+    ignore_cancel: bool = False,
+) -> dict:
+    """FakeAcpRunner に積む 1 回分の `session/prompt` の振る舞い。"""
+
+    return {
+        "updates": list(updates),
+        "response": response,
+        "stop_reason": stop_reason,
+        "error": error,
+        "hold": hold,
+        "ignore_cancel": ignore_cancel,
+    }
+
+
+class FakeAcpProcess:
+    """`agy acp` の JSON-RPC 会話を模倣する擬似子プロセス。"""
+
+    class _Stdin:
+        def __init__(self, owner: "FakeAcpProcess") -> None:
+            self._owner = owner
+            self._buffer = b""
+            self.closed = False
+
+        def write(self, data: bytes) -> int:
+            if self.closed:
+                raise BrokenPipeError("stdin closed")
+            self._buffer += data
+            while b"\n" in self._buffer:
+                line, self._buffer = self._buffer.split(b"\n", 1)
+                if line.strip():
+                    self._owner._on_stdin_line(line)
+            return len(data)
+
+        def flush(self) -> None:
+            if self.closed:
+                raise BrokenPipeError("stdin closed")
+
+        def close(self) -> None:
+            if not self.closed:
+                self.closed = True
+                self._owner._on_stdin_closed()
+
+    class _Stdout:
+        def __init__(self, out_queue: queue.Queue) -> None:
+            self._queue = out_queue
+
+        def __iter__(self):
+            while True:
+                item = self._queue.get()
+                if item is _STREAM_END:
+                    return
+                yield item
+
+    def __init__(self, runner: "FakeAcpRunner", returncode: int = 0, stderr: bytes = b"") -> None:
+        self._runner = runner
+        self._out: queue.Queue = queue.Queue()
+        self.stdin = self._Stdin(self)
+        self.stdout = self._Stdout(self._out)
+        self.stderr = io.BytesIO(stderr)
+        self.returncode = returncode
+        self.killed = 0
+        self.waited = 0
+        self.requests: list[dict] = []
+        self._held_prompts: dict[str, tuple[int, bool]] = {}
+        self._lock = threading.Lock()
+
+    def emit(self, message: dict | bytes) -> None:
+        raw = message if isinstance(message, bytes) else (
+            json.dumps(message, ensure_ascii=False).encode("utf-8") + b"\n"
+        )
+        self._out.put(raw)
+
+    def close_stdout(self, returncode: int | None = None) -> None:
+        if returncode is not None:
+            self.returncode = returncode
+        self._out.put(_STREAM_END)
+
+    def wait(self) -> int:
+        self.waited += 1
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed += 1
+        self._out.put(_STREAM_END)
+
+    def _on_stdin_closed(self) -> None:
+        if not self._held_prompts:
+            self._out.put(_STREAM_END)
+
+    def _on_stdin_line(self, line: bytes) -> None:
+        message = json.loads(line.decode("utf-8"))
+        self.requests.append(message)
+        self._runner.all_requests.append(message)
+        self._runner.handle(self, message)
+
+    def hold_prompt(self, session_id: str, request_id: int, ignore_cancel: bool) -> None:
+        with self._lock:
+            self._held_prompts[session_id] = (request_id, ignore_cancel)
+        self._runner.held_event.set()
+
+    def cancel_held_prompt(self, session_id: str) -> None:
+        with self._lock:
+            held = self._held_prompts.get(session_id)
+            if held is None or held[1]:
+                return
+            del self._held_prompts[session_id]
+        self.emit({"jsonrpc": "2.0", "id": held[0], "result": {"stopReason": "cancelled"}})
+
+
+class FakeAcpRunner:
+    """`agy acp` を模倣するランナー。1 プロセスで複数セッション・複数ターンに応答する。"""
+
+    def __init__(
+        self,
+        turns: list[dict] | None = None,
+        session_ids: list[str] | None = None,
+        resumable: dict[str, str] | set[str] | None = None,
+        init_error: object = None,
+        init_result: object = None,
+        set_model_error: object = None,
+        new_session_error: object = None,
+    ) -> None:
+        self._turns = list(turns) if turns is not None else [prompt_turn()]
+        self._session_ids = list(session_ids or [])
+        self._next_num = 1
+        self._resumable = resumable
+        self._init_error = init_error
+        self._init_result = (
+            {"protocolVersion": 1, "agentInfo": {"name": "Antigravity ACP", "version": "1.5.11"}}
+            if init_result is None
+            else init_result
+        )
+        self._set_model_error = set_model_error
+        self._new_session_error = new_session_error
+        self.calls: list[dict] = []
+        self.processes: list[FakeAcpProcess] = []
+        self.all_requests: list[dict] = []
+        self.known_sessions: set[str] = set()
+        self.held_event = threading.Event()
+        self._lock = threading.Lock()
+
+    def __call__(self, command, **kwargs) -> FakeAcpProcess:
+        self.calls.append({"command": command, **kwargs})
+        process = FakeAcpProcess(self)
+        self.processes.append(process)
+        return process
 
     def command(self, index: int = 0) -> list[str]:
         return self.calls[index]["command"]
 
-    def __call__(self, command, **kwargs):
-        stdin = kwargs["stdin"]
-        payload = b""
-        if hasattr(stdin, "read"):
-            payload = stdin.read()
-            stdin.seek(0)
-        process = super().__call__(command, **kwargs)
-        self.calls[-1]["input"] = payload
-        return process
+    def methods(self) -> list[str]:
+        return [req["method"] for req in self.all_requests if "method" in req]
+
+    def requests_for(self, method: str) -> list[dict]:
+        return [req for req in self.all_requests if req.get("method") == method]
 
     def prompt(self, index: int = 0) -> str:
-        return json.loads(self.calls[index]["input"])["message"]["content"]
+        prompts = self.requests_for("session/prompt")
+        blocks = prompts[index]["params"]["prompt"]
+        return "".join(block["text"] for block in blocks if block.get("type") == "text")
+
+    def models_set(self) -> list[str]:
+        return [req["params"]["modelId"] for req in self.requests_for("session/set_model")]
+
+    def handle(self, process: FakeAcpProcess, message: dict) -> None:
+        method = message.get("method")
+        request_id = message.get("id")
+        params = message.get("params") or {}
+
+        if method == "session/cancel":
+            process.cancel_held_prompt(params.get("sessionId", ""))
+            return
+
+        if method == "initialize":
+            if self._init_error is not None:
+                process.emit({"jsonrpc": "2.0", "id": request_id, "error": self._init_error})
+            else:
+                process.emit({"jsonrpc": "2.0", "id": request_id, "result": self._init_result})
+            return
+
+        if method == "session/new":
+            if self._new_session_error is not None:
+                process.emit(
+                    {"jsonrpc": "2.0", "id": request_id, "error": self._new_session_error}
+                )
+                return
+            with self._lock:
+                if self._session_ids:
+                    session_id = self._session_ids.pop(0)
+                else:
+                    session_id = f"conv-{self._next_num}"
+                    self._next_num += 1
+                self.known_sessions.add(session_id)
+            process.emit({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": session_id}})
+            return
+
+        if method == "session/resume":
+            target = params.get("sessionId", "")
+            resolved = self._resolve_resume(target)
+            if resolved is None:
+                process.emit(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32603, "message": f"Failed to read session {target}"},
+                    }
+                )
+                return
+            self.known_sessions.add(resolved)
+            process.emit({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": resolved}})
+            return
+
+        if method == "session/set_model":
+            if self._set_model_error is not None:
+                process.emit({"jsonrpc": "2.0", "id": request_id, "error": self._set_model_error})
+            else:
+                process.emit({"jsonrpc": "2.0", "id": request_id, "result": {}})
+            return
+
+        if method == "session/prompt":
+            session_id = params["sessionId"]
+            with self._lock:
+                turn = self._turns.pop(0) if len(self._turns) > 1 else self._turns[0]
+            for raw_notice in turn["updates"]:
+                notice = _rebind_session(raw_notice, session_id)
+                process.emit(notice)
+            if turn["hold"]:
+                process.hold_prompt(session_id, request_id, turn["ignore_cancel"])
+                return
+            if turn["error"] is not None:
+                process.emit({"jsonrpc": "2.0", "id": request_id, "error": turn["error"]})
+                return
+            if turn["response"] and not any(
+                (item.get("params") or {}).get("update", {}).get("sessionUpdate")
+                == "agent_message_chunk"
+                for item in turn["updates"]
+            ):
+                process.emit(message_chunk(turn["response"], session_id=session_id))
+            process.emit(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"stopReason": turn["stop_reason"]},
+                }
+            )
+
+    def _resolve_resume(self, target: str) -> str | None:
+        if isinstance(self._resumable, dict):
+            return self._resumable.get(target)
+        if isinstance(self._resumable, set):
+            return target if target in self._resumable else None
+        if target in self.known_sessions:
+            return target
+        return target
+
+
+def _rebind_session(notice: dict, session_id: str) -> dict:
+    """テストで session_id を省略した通知だけ、今回のセッション ID へ揃える。"""
+
+    params = notice.get("params")
+    if not isinstance(params, dict) or params.get("sessionId") != "conv-1":
+        return notice
+    return {**notice, "params": {**params, "sessionId": session_id}}
 
 
 def agy_config(**overrides):
@@ -168,43 +406,17 @@ def agy_config(**overrides):
 
 
 class AntigravityCommandTest(unittest.TestCase):
-    def test_first_turn_has_no_conversation_flag(self):
-        session = Session()
-        session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
-
-        command = build_command(agy_config(antigravity_path="/opt/bin/agy"), session)
+    def test_acp_command_uses_stdio_server_with_skip_permissions(self):
+        command = build_command(agy_config(antigravity_path="/opt/bin/agy"), Session())
 
         self.assertEqual(
             command,
             [
                 "/opt/bin/agy",
-                "-p",
-                "",
-                "--input-format",
-                "stream-json",
-                "--model",
-                HIGH,
-                "--output-format",
-                "stream-json",
+                "acp",
                 "--dangerously-skip-permissions",
-                # 既定の 5 分ではブリッジのタイムアウトより先に打ち切られる。
-                "--print-timeout",
-                "21600000ms",
             ],
         )
-
-    def test_resumed_turn_passes_the_conversation_id(self):
-        session = Session()
-        session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
-        session.confirm("conv-9")
-        session.prepare(
-            conversation(("user", "1問目"), ("assistant", "回答"), ("user", "2問目")),
-            ANTIGRAVITY_BACKEND,
-        )
-
-        command = build_command(agy_config(), session)
-
-        self.assertEqual(command[-2:], ["--conversation", "conv-9"])
 
     def test_add_dirs_are_not_passed_to_agy(self):
         # agy の --add-dir はワークスペースの追加で、そこの AGENTS.md と skills がどの
@@ -219,12 +431,6 @@ class AntigravityCommandTest(unittest.TestCase):
         self.assertNotIn("/workspace", command)
         self.assertIn("--dangerously-skip-permissions", command)
 
-    def test_fractional_timeout_is_not_truncated_to_zero(self):
-        # 秒は小数で指定できる。切り捨てると agy 側が即時打ち切りになる。
-        command = build_command(agy_config(timeout_seconds=0.5), Session())
-
-        self.assertEqual(command[command.index("--print-timeout") + 1], "500ms")
-
     def test_executable_path_is_not_shell_interpreted(self):
         config = agy_config(antigravity_path="/opt/my tools/agy; rm -rf /")
         self.assertEqual(build_command(config, Session())[0], "/opt/my tools/agy; rm -rf /")
@@ -236,83 +442,90 @@ class AntigravityStreamTest(unittest.TestCase):
             stream_antigravity(config or agy_config(), "やあ", session or Session(), runner)
         )
 
-    def test_deltas_and_tools_are_reported_in_order(self):
-        runner = FakeRunner(
-            agy_lines(
-                init_event(),
-                step("user_input", index=0),
-                delta_event("こん", state="ACTIVE"),
-                tool_event("view_file", {"AbsolutePath": "/tmp/app.py"}),
-                tool_event("view_file", {"AbsolutePath": "/tmp/app.py"}, state="DONE"),
-                delta_event("にちは"),
-                step("checkpoint", index=4),
-                result_event("こんにちは"),
-            )
+    def test_deltas_thoughts_and_tools_are_reported_in_order(self):
+        runner = FakeAcpRunner(
+            [
+                prompt_turn(
+                    "",
+                    thought_chunk("まずファイルを"),
+                    thought_chunk("確認する"),
+                    tool_call_notice("read_file", {"EndLine": 50, "Path": "/tmp/app.py"}, "c1"),
+                    tool_update_notice("read_file", status="completed", call_id="c1"),
+                    message_chunk("こん"),
+                    message_chunk("にちは"),
+                )
+            ]
         )
 
         self.assertEqual(
             self.run_stream(runner),
             [
+                ("reasoning", "まずファイルを確認する"),
+                # 開始と完了が両方届いても、開始表示は 1 回だけ。引数は EndLine より Path を優先。
+                ("reasoning", "**read_file を実行中**\n/tmp/app.py"),
                 ("delta", "こん"),
-                # ツールの step は開始と終了で 2 回届くが、見せるのは開始の 1 回だけ。
-                ("reasoning", "**view_file を実行中**\n/tmp/app.py"),
                 ("delta", "にちは"),
                 ("text", "こんにちは"),
             ],
         )
 
-    def test_prompt_is_passed_as_one_stdin_message(self):
-        runner = SequenceRunner([agy_output()])
+    def test_acp_handshake_session_model_and_prompt_are_sent(self):
+        runner = FakeAcpRunner([prompt_turn("応答")], session_ids=["conv-10"])
 
         self.run_stream(runner)
 
-        self.assertTrue(runner.calls[0]["stdin"].closed)
-        self.assertEqual(json.loads(runner.calls[0]["input"]), {
-            "event": "user", "message": {"role": "user", "content": "やあ"}
-        })
-        self.assertEqual(runner.calls[0]["input"].count(b"\n"), 1)
+        self.assertEqual(
+            runner.methods(),
+            ["initialize", "session/new", "session/set_model", "session/prompt"],
+        )
+        self.assertEqual(runner.models_set(), [HIGH])
+        self.assertEqual(runner.prompt(0), "やあ")
+        self.assertEqual(runner.calls[0]["stdin"], subprocess.PIPE)
         self.assertEqual(runner.calls[0]["stdout"], subprocess.PIPE)
         self.assertEqual(runner.calls[0]["stderr"], subprocess.PIPE)
 
     def test_api_key_env_is_not_passed_to_the_cli(self):
         # 月額枠だけを使う。API キー課金の経路になる変数は子へ渡さない。
-        runner = FakeRunner(agy_output())
+        runner = FakeAcpRunner()
 
         self.run_stream(runner)
 
         passed = runner.calls[0]["env"]
         for name in BILLING_ENV_KEYS:
             self.assertNotIn(name, passed)
-        # 認証のキャッシュ探索に要る HOME などは残す。
         self.assertIn("PATH", passed)
 
     def test_billing_env_keys_are_removed_from_a_polluted_environment(self):
         cleaned = agy_env(
-            {"PATH": "/usr/bin", "HOME": "/Users/x", "GEMINI_API_KEY": "sk-test",
-             "GOOGLE_API_KEY": "sk-test", "GOOGLE_GENAI_API_KEY": "sk-test"}
+            {
+                "PATH": "/usr/bin",
+                "HOME": "/Users/x",
+                "GEMINI_API_KEY": "sk-test",
+                "GOOGLE_API_KEY": "sk-test",
+                "GOOGLE_GENAI_API_KEY": "sk-test",
+            }
         )
 
         self.assertEqual(cleaned, {"PATH": "/usr/bin", "HOME": "/Users/x"})
 
     def test_tool_without_arguments_shows_only_the_name(self):
-        runner = FakeRunner(agy_lines(tool_event("list_dir"), result_event()))
+        runner = FakeAcpRunner([prompt_turn("done", tool_call_notice("list_dir", {}))])
 
         self.assertEqual(self.run_stream(runner)[0], ("reasoning", "**list_dir を実行中**"))
 
-    def test_denied_tool_is_shown_as_a_failure(self):
-        # headless では権限を対話で確認できず自動拒否される。原因が見えないと本文が
-        # 空になった理由が分からない。
-        runner = FakeRunner(
-            agy_lines(
-                tool_event("run_command", {"CommandLine": "ls -la"}),
-                tool_event(
-                    "run_command",
-                    {"CommandLine": "ls -la"},
-                    state="ERROR",
-                    error="User denied permission to run command:\nls -la",
-                ),
-                result_event("できませんでした"),
-            )
+    def test_failed_tool_is_shown_as_a_failure(self):
+        runner = FakeAcpRunner(
+            [
+                prompt_turn(
+                    "できませんでした",
+                    tool_call_notice("run_command", {"CommandLine": "ls -la"}, call_id="c1"),
+                    tool_update_notice(
+                        call_id="c1",
+                        status="failed",
+                        error="User denied permission to run command:\nls -la",
+                    ),
+                )
+            ]
         )
 
         self.assertEqual(
@@ -320,56 +533,98 @@ class AntigravityStreamTest(unittest.TestCase):
             [
                 ("reasoning", "**run_command を実行中**\nls -la"),
                 ("reasoning", "**run_command が失敗**\nUser denied permission to run command:\nls -la"),
+                ("delta", "できませんでした"),
                 ("text", "できませんでした"),
             ],
         )
 
+    def test_failed_tool_falls_back_to_title_when_error_detail_is_absent(self):
+        # agy acp の read_file 失敗は error や rawOutput を持たず title だけを返すことがある。
+        runner = FakeAcpRunner(
+            [
+                prompt_turn(
+                    "",
+                    tool_call_notice("read_file", {"Path": "/tmp/missing.txt"}, call_id="c1"),
+                    tool_update_notice(
+                        "read_file", call_id="c1", status="failed", title="File missing.txt"
+                    ),
+                )
+            ]
+        )
+
+        with self.assertRaises(BridgeError) as raised:
+            self.run_stream(runner)
+
+        self.assertEqual(raised.exception.code, "antigravity_cli_tool_failed")
+        self.assertIn("File missing.txt", raised.exception.message)
+
     def test_tool_detail_is_truncated(self):
-        runner = FakeRunner(
-            agy_lines(tool_event("run_command", {"CommandLine": "x" * 5000}), result_event())
+        runner = FakeAcpRunner(
+            [prompt_turn("done", tool_call_notice("run_command", {"CommandLine": "x" * 5000}))]
         )
 
         self.assertLess(len(self.run_stream(runner)[0][1]), 300)
 
-    def test_empty_delta_is_skipped(self):
-        runner = FakeRunner(agy_lines(delta_event(""), result_event("done")))
-
-        self.assertEqual(self.run_stream(runner), [("text", "done")])
-
-    def test_unknown_step_kinds_are_skipped(self):
-        runner = FakeRunner(
-            agy_lines(step("unknown", index=1), step("user_input", index=0), result_event("done"))
+    def test_empty_delta_and_unknown_updates_are_skipped(self):
+        runner = FakeAcpRunner(
+            [
+                prompt_turn(
+                    "",
+                    usage_update(100),
+                    update_notice("conv-1", "available_commands_update", availableCommands=[]),
+                    message_chunk(""),
+                    message_chunk("done"),
+                )
+            ]
         )
 
-        self.assertEqual(self.run_stream(runner), [("text", "done")])
+        self.assertEqual(self.run_stream(runner), [("delta", "done"), ("text", "done")])
 
-    def test_unknown_event_kinds_are_skipped(self):
-        runner = FakeRunner(agy_lines({"event": "telemetry", "telemetry": {}}, result_event("done")))
+    def test_server_originated_rpc_request_is_rejected_without_blocking(self):
+        runner = FakeAcpRunner([prompt_turn("done")])
+        original_handle = runner.handle
 
-        self.assertEqual(self.run_stream(runner), [("text", "done")])
+        def handle_with_client_request(process, message):
+            if message.get("method") == "session/prompt":
+                process.emit(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "srv-1",
+                        "method": "fs/read_text_file",
+                        "params": {"path": "/tmp/a"},
+                    }
+                )
+            original_handle(process, message)
 
-    def test_line_without_event_is_rejected(self):
+        runner.handle = handle_with_client_request
+
+        self.assertEqual(self.run_stream(runner), [("delta", "done"), ("text", "done")])
+        replies = [req for req in runner.all_requests if req.get("id") == "srv-1"]
+        self.assertEqual(replies[0]["error"]["code"], -32601)
+
+    def test_line_without_jsonrpc_shape_is_rejected(self):
         runner = FakeRunner(b'{"step_update": {}}\n')
 
         with self.assertRaises(BridgeError) as raised:
             self.run_stream(runner)
 
         self.assertEqual(raised.exception.code, "antigravity_cli_invalid_output")
+        self.assertEqual(runner.processes[0].killed, 1)
 
     def test_denied_tool_with_no_answer_is_reported_as_a_failure(self):
-        # ツール権限の自動拒否では status が SUCCESS のまま本文だけが空になる。
-        # 空の回答をそのまま Codex へ渡すと、実行できなかった理由が分からない。
-        runner = FakeRunner(
-            agy_lines(
-                tool_event("run_command", {"CommandLine": "ls -la"}),
-                tool_event(
-                    "run_command",
-                    {"CommandLine": "ls -la"},
-                    state="ERROR",
-                    error="User denied permission to run command",
-                ),
-                result_event(""),
-            )
+        runner = FakeAcpRunner(
+            [
+                prompt_turn(
+                    "",
+                    tool_call_notice("run_command", {"CommandLine": "ls -la"}, call_id="c1"),
+                    tool_update_notice(
+                        "run_command",
+                        call_id="c1",
+                        status="failed",
+                        error="User denied permission to run command",
+                    ),
+                )
+            ]
         )
 
         with self.assertRaises(BridgeError) as raised:
@@ -380,56 +635,46 @@ class AntigravityStreamTest(unittest.TestCase):
         self.assertIn("User denied permission", raised.exception.message)
 
     def test_empty_answer_without_a_tool_failure_is_returned_as_is(self):
-        # 失敗していないのに本文が空なら、それが CLI の答え。エラーへ作り替えない。
-        runner = FakeRunner(agy_lines(result_event("")))
+        runner = FakeAcpRunner([prompt_turn("")])
 
         self.assertEqual(self.run_stream(runner), [("text", "")])
-
-    def test_failed_tool_does_not_hide_a_normal_answer(self):
-        # ツールが拒否されても本文が返っていれば、そのまま最終回答として扱う。
-        runner = FakeRunner(
-            agy_lines(
-                tool_event("run_command", {"CommandLine": "ls"}, state="ERROR", error="denied"),
-                result_event("できませんでした"),
-            )
-        )
-
-        self.assertEqual(self.run_stream(runner)[-1], ("text", "できませんでした"))
 
     def test_result_confirms_the_conversation_id(self):
         session = Session()
         session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
-        runner = FakeRunner(agy_lines(result_event("done", conversation_id="conv-42")))
+        runner = FakeAcpRunner([prompt_turn("done")], session_ids=["conv-42"])
 
         self.run_stream(runner, session=session)
 
         self.assertEqual(session.handle, "conv-42")
 
-    def test_accepted_message_confirms_the_conversation_before_the_result(self):
-        # 完了を待って確定すると、途中で止めたターンの会話を捨てて全履歴を渡し直すことになる。
+    def test_accepted_message_confirms_and_cancels_cleanly_before_the_result(self):
+        # 最初の session/update が届いた時点で発言は会話へ載っている。
+        # 中断時はプロセスを殺さず session/cancel を送り、同じ会話を次へ引き継ぐ。
         session = Session()
         session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
-        runner = FakeRunner(
-            agy_lines(*accepted("conv-5"), delta_event("途中", state="ACTIVE"), result_event())
+        runner = FakeAcpRunner(
+            [prompt_turn("", message_chunk("途中"), hold=True)], session_ids=["conv-5"]
         )
-        events = stream_antigravity(agy_config(), "1問目", session, runner)
+        client = AntigravityClient(agy_config(), runner)
+        self.addCleanup(client.close)
+        events = client.stream(agy_config(), "1問目", session)
 
         self.assertEqual(next(events), ("delta", "途中"))
         events.close()
 
-        self.assertEqual(runner.processes[0].killed, 1)
+        self.assertIn("session/cancel", runner.methods())
+        self.assertEqual(runner.processes[0].killed, 0)
         self.assertEqual(session.handle, "conv-5")
-        # 止めたあとの実行は続きになり、まだ渡していない発言だけを渡す。
         messages = conversation(("user", "1問目"), ("user", "やっぱり2問目"))
         self.assertEqual(session.prepare(messages, ANTIGRAVITY_BACKEND), messages[-1:])
         self.assertTrue(session.resume)
 
     def test_stopping_before_the_message_is_accepted_does_not_confirm(self):
-        # init の時点では会話 ID だけがあり、発言はまだ載っていない。ここで確定すると、
-        # 次の実行が差分だけを渡して最初の発言が会話から抜け落ちる。
+        # session/new 完了直後に接続が切れ、session/prompt の受理前に終わった場合は未確定のまま。
         session = Session()
         session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
-        runner = FakeRunner(agy_lines(init_event("conv-5")))
+        runner = FakeAcpRunner(new_session_error={"code": -32603, "message": "auth failed"})
 
         with self.assertRaises(BridgeError):
             self.run_stream(runner, session=session)
@@ -437,12 +682,12 @@ class AntigravityStreamTest(unittest.TestCase):
         self.assertEqual(session.handle, "")
 
     def test_failure_after_the_message_is_accepted_keeps_the_conversation(self):
-        # 発言は会話へ載っている。やり直しでは直近の発言だけを渡して続きを促せばよい。
         session = Session()
         messages = conversation(("user", "1問目"))
         session.prepare(messages, ANTIGRAVITY_BACKEND)
-        runner = FakeRunner(
-            agy_lines(*accepted("conv-5"), result_event("", status="ERROR", error="quota"))
+        runner = FakeAcpRunner(
+            [prompt_turn("", usage_update(0), error={"code": -32603, "message": "quota"})],
+            session_ids=["conv-5"],
         )
 
         with self.assertRaises(BridgeError) as raised:
@@ -453,32 +698,50 @@ class AntigravityStreamTest(unittest.TestCase):
         self.assertEqual(session.prepare(messages, ANTIGRAVITY_BACKEND), messages[-1:])
         self.assertTrue(session.resume)
 
-    def test_resuming_into_another_conversation_is_rejected(self):
-        # agy は --conversation の会話が見つからないと、警告だけ出して別 ID の新しい会話を
-        # 始める。渡したのは差分だけなので、文脈のない会話で答えさせない。
+    def test_resuming_missing_conversation_is_rejected_and_resets_session(self):
         session = Session()
         session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
-        session.confirm("conv-7")
+        session.confirm("conv-missing")
         messages = conversation(("user", "1問目"), ("assistant", "回答"), ("user", "2問目"))
         session.prepare(messages, ANTIGRAVITY_BACKEND)
-        runner = FakeRunner(agy_lines(*accepted("conv-other"), result_event("文脈のない回答")))
+        runner = FakeAcpRunner(resumable=set())
 
         with self.assertRaises(BridgeError) as raised:
             self.run_stream(runner, session=session)
 
         self.assertEqual(raised.exception.status, 502)
         self.assertEqual(raised.exception.code, "antigravity_cli_conversation_lost")
-        self.assertEqual(runner.processes[0].killed, 1)
-        # 次の実行は新しい会話として全履歴を渡す。
         self.assertEqual(session.prepare(messages, ANTIGRAVITY_BACKEND), messages)
         self.assertFalse(session.resume)
 
-    def test_step_of_another_conversation_does_not_confirm(self):
-        # 別の会話の ID が付いた step を、この実行の発言の受理と取り違えない。
+    def test_resuming_into_another_conversation_id_is_rejected(self):
         session = Session()
         session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
-        runner = FakeRunner(
-            agy_lines(init_event("conv-5"), step("user_input", index=0, conversation_id="sub-1"))
+        session.confirm("conv-7")
+        messages = conversation(("user", "1問目"), ("assistant", "回答"), ("user", "2問目"))
+        session.prepare(messages, ANTIGRAVITY_BACKEND)
+        runner = FakeAcpRunner(resumable={"conv-7": "conv-other"})
+
+        with self.assertRaises(BridgeError) as raised:
+            self.run_stream(runner, session=session)
+
+        self.assertEqual(raised.exception.status, 502)
+        self.assertEqual(raised.exception.code, "antigravity_cli_conversation_lost")
+        self.assertEqual(session.prepare(messages, ANTIGRAVITY_BACKEND), messages)
+        self.assertFalse(session.resume)
+
+    def test_update_of_another_conversation_does_not_confirm(self):
+        session = Session()
+        session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
+        runner = FakeAcpRunner(
+            [
+                prompt_turn(
+                    "",
+                    update_notice("sub-1", "usage_update", used=10, size=100),
+                    error={"code": -32603, "message": "boom"},
+                )
+            ],
+            session_ids=["conv-5"],
         )
 
         with self.assertRaises(BridgeError):
@@ -486,7 +749,7 @@ class AntigravityStreamTest(unittest.TestCase):
 
         self.assertEqual(session.handle, "")
 
-    def test_resumed_turn_keeps_the_same_conversation(self):
+    def test_resumed_turn_on_new_acp_process_calls_session_resume(self):
         session = Session()
         session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
         session.confirm("conv-7")
@@ -494,75 +757,57 @@ class AntigravityStreamTest(unittest.TestCase):
             conversation(("user", "1問目"), ("assistant", "回答"), ("user", "2問目")),
             ANTIGRAVITY_BACKEND,
         )
-        runner = FakeRunner(
-            agy_lines(
-                init_event("conv-7"),
-                step("user_input", index=4, conversation_id="conv-7"),
-                result_event("回答2", conversation_id="conv-7"),
-            )
-        )
+        runner = FakeAcpRunner([prompt_turn("回答2")], resumable={"conv-7": "conv-7"})
 
-        self.assertEqual(self.run_stream(runner, session=session), [("text", "回答2")])
+        self.assertEqual(
+            self.run_stream(runner, session=session),
+            [("delta", "回答2"), ("text", "回答2")],
+        )
+        self.assertEqual(
+            runner.methods(),
+            ["initialize", "session/resume", "session/set_model", "session/prompt"],
+        )
         self.assertEqual(session.handle, "conv-7")
 
-    def test_error_result_becomes_a_bridge_error(self):
-        runner = FakeRunner(
-            agy_lines(result_event("", status="ERROR", error={"message": "quota exhausted"}))
-        )
+    def test_error_result_does_not_confirm_the_conversation(self):
+        session = Session()
+        session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
+        runner = FakeAcpRunner([prompt_turn("", error={"message": "quota exhausted"})])
 
         with self.assertRaises(BridgeError) as raised:
-            self.run_stream(runner)
+            self.run_stream(runner, session=session)
 
         self.assertEqual(raised.exception.status, 502)
         self.assertEqual(raised.exception.code, "antigravity_cli_error_result")
         self.assertIn("quota exhausted", raised.exception.message)
-
-    def test_non_zero_exit_after_result_does_not_confirm_the_conversation(self):
-        # result まで届いても終了コードが異常なら、そのターンは失敗として返す。
-        # 続き扱いにすると、次の再送で直近の発言だけを送り直す状態になる。
-        session = Session()
-        session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
-        runner = FakeRunner(
-            agy_lines(result_event("done", conversation_id="conv-3")), returncode=1
-        )
-
-        with self.assertRaises(BridgeError) as raised:
-            self.run_stream(runner, session=session)
-
-        self.assertEqual(raised.exception.code, "antigravity_cli_failed")
         self.assertEqual(session.handle, "")
 
-    def test_error_result_does_not_confirm_the_conversation(self):
-        # 失敗したターンを続きにすると、届かなかった発言が会話から抜け落ちる。
-        session = Session()
-        session.prepare(conversation(("user", "1問目")), ANTIGRAVITY_BACKEND)
-        runner = FakeRunner(agy_lines(result_event("", status="ERROR", error="boom")))
-
-        with self.assertRaises(BridgeError):
-            self.run_stream(runner, session=session)
-
-        self.assertEqual(session.handle, "")
-
-    def test_missing_conversation_id_is_rejected(self):
-        runner = FakeRunner(agy_lines(result_event("done", conversation_id="")))
+    def test_missing_session_id_is_rejected(self):
+        runner = FakeAcpRunner(session_ids=[""])
 
         with self.assertRaises(BridgeError) as raised:
             self.run_stream(runner)
 
         self.assertEqual(raised.exception.code, "antigravity_cli_invalid_output")
 
-    def test_non_string_response_is_rejected(self):
-        runner = FakeRunner(
-            agy_lines({"event": "result", "result": {"conversation_id": "c", "status": "SUCCESS"}})
-        )
+    def test_missing_stop_reason_is_rejected(self):
+        runner = FakeAcpRunner([prompt_turn("done", stop_reason="")])
 
         with self.assertRaises(BridgeError) as raised:
             self.run_stream(runner)
 
         self.assertEqual(raised.exception.code, "antigravity_cli_invalid_output")
 
-    def test_missing_result_is_rejected(self):
-        runner = FakeRunner(agy_lines(init_event(), delta_event("途中")))
+    def test_eof_during_prompt_is_rejected(self):
+        runner = FakeAcpRunner([prompt_turn("途中", hold=True)])
+        original_handle = runner.handle
+
+        def close_mid_prompt(process, message):
+            original_handle(process, message)
+            if message.get("method") == "session/prompt":
+                process.close_stdout(returncode=0)
+
+        runner.handle = close_mid_prompt
 
         with self.assertRaises(BridgeError) as raised:
             self.run_stream(runner)
@@ -607,17 +852,19 @@ class AntigravityStreamTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, "antigravity_cli_timeout")
         self.assertEqual(runner.processes[0].killed, 1)
 
-    def test_closing_the_stream_terminates_the_cli_process(self):
-        # クライアント切断でジェネレータが破棄されても、CLI を裏で走らせ続けない。
-        runner = FakeRunner(agy_lines(delta_event("途中"), result_event("done")))
-        events = stream_antigravity(agy_config(), "やあ", Session(), runner)
+    def test_closing_the_stream_kills_wedged_process_that_ignores_cancel(self):
+        # session/cancel に応答せず固まっているプロセスは、猶予後に強制終了する。
+        runner = FakeAcpRunner(
+            [prompt_turn("", message_chunk("途中"), hold=True, ignore_cancel=True)]
+        )
+        events = stream_antigravity(agy_config(timeout_seconds=0.05), "やあ", Session(), runner)
         next(events)
         events.close()
 
-        self.assertEqual(runner.processes[0].killed, 1)
+        self.assertGreaterEqual(runner.processes[0].killed, 1)
 
     def test_normal_completion_does_not_kill_the_cli_process(self):
-        runner = FakeRunner(agy_output())
+        runner = FakeAcpRunner([prompt_turn("こんにちは")])
 
         final_text(stream_antigravity(agy_config(), "やあ", Session(), runner))
 
@@ -663,7 +910,7 @@ class AntigravityPromptTest(unittest.TestCase):
 
 class AntigravityEndpointTest(BridgeHTTPTestCase):
     def test_argon_accepts_long_system_and_history_without_truncation(self):
-        runner = SequenceRunner([agy_output()])
+        runner = FakeAcpRunner([prompt_turn("こんにちは"), prompt_turn("こんにちは")])
         base_url = self.start_server(
             agy_config(antigravity_models=("gemini-4-argon-high",)), runner
         )
@@ -673,9 +920,10 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
             {"role": "assistant", "content": "回答"},
             {"role": "user", "content": "はい"},
         ]
-        for stream in (False, True):
+        for index, stream in enumerate((False, True)):
             request = {
-                "model": "gemini-4-argon-high", "instructions": instructions,
+                "model": "gemini-4-argon-high",
+                "instructions": instructions,
                 "input": messages,
             }
             if stream:
@@ -684,14 +932,16 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
             else:
                 status, _ = self.post(base_url, request)
                 self.assertEqual(status, 200)
-            prompt = runner.prompt(len(runner.calls) - 1)
+            prompt = runner.prompt(index)
             self.assertIn(instructions, prompt)
             self.assertIn("履歴" * 10000, prompt)
             self.assertTrue(prompt.endswith("はい"))
-            self.assertNotIn(prompt, runner.command(len(runner.calls) - 1))
+            self.assertNotIn(prompt, runner.command(0))
+        # 常駐 ACP なので 2 リクエストでも起動したプロセスは 1 本だけ。
+        self.assertEqual(len(runner.processes), 1)
 
     def test_non_stream_returns_the_result_response(self):
-        runner = SequenceRunner([agy_output(delta_event("こんにちは"))])
+        runner = FakeAcpRunner([prompt_turn("こんにちは")])
         base_url = self.start_server(agy_config(), runner)
 
         status, payload = self.post(base_url, {"model": HIGH, "input": "やあ"})
@@ -700,26 +950,24 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
         self.assertEqual(payload["output_text"], "こんにちは")
         self.assertEqual(payload["model"], HIGH)
         self.assertEqual(runner.prompt(), "やあ")
-        # アプリが選んだモデルがそのまま agy へ届く。
-        self.assertEqual(runner.command()[runner.command().index("--model") + 1], HIGH)
+        self.assertEqual(runner.models_set(), [HIGH])
 
-    def test_medium_model_reaches_the_cli(self):
-        runner = SequenceRunner([agy_output()])
+    def test_medium_model_reaches_the_acp_session(self):
+        runner = FakeAcpRunner([prompt_turn("こんにちは")])
         base_url = self.start_server(make_config(model=MEDIUM), runner)
 
         self.post(base_url, {"model": MEDIUM, "input": "やあ"})
 
-        self.assertEqual(runner.command()[runner.command().index("--model") + 1], MEDIUM)
+        self.assertEqual(runner.models_set(), [MEDIUM])
 
     def test_stream_sends_increments_then_the_final_text(self):
-        runner = SequenceRunner(
+        runner = FakeAcpRunner(
             [
-                agy_lines(
-                    init_event(),
-                    delta_event("こん"),
-                    tool_event("read_file", {"file_path": "app.py"}),
-                    delta_event("にちは"),
-                    result_event("こんにちは"),
+                prompt_turn(
+                    "",
+                    message_chunk("こん"),
+                    tool_call_notice("read_file", {"Path": "app.py"}),
+                    message_chunk("にちは"),
                 )
             ]
         )
@@ -733,7 +981,6 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
             [data["delta"] for name, data in events if name == "response.output_text.delta"],
             ["こん", "にちは"],
         )
-        # 増分をいくら送っても本文アイテムは 1 個だけ開く。
         self.assertEqual(types.count("response.output_item.added"), 1)
         done = next(data for name, data in events if name == "response.output_text.done")
         self.assertEqual(done["text"], "こんにちは")
@@ -741,7 +988,9 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
         self.assertEqual(completed["response"]["output_text"], "こんにちは")
 
     def test_stream_shows_tool_progress_as_reasoning(self):
-        runner = SequenceRunner([agy_output(tool_event("run_command", {"command": "ls -la"}))])
+        runner = FakeAcpRunner(
+            [prompt_turn("完了", tool_call_notice("run_command", {"CommandLine": "ls -la"}))]
+        )
         base_url = self.start_server(agy_config(), runner)
 
         _, events = self.post_stream(base_url, {"model": HIGH, "input": "やあ"})
@@ -754,7 +1003,7 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
         self.assertEqual(summaries, ["**run_command を実行中**\nls -la"])
 
     def test_stream_failure_is_reported_as_response_failed(self):
-        runner = SequenceRunner([agy_lines(result_event("", status="error", error="quota"))])
+        runner = FakeAcpRunner([prompt_turn("", error={"message": "quota"})])
         base_url = self.start_server(agy_config(), runner)
 
         _, events = self.post_stream(base_url, {"model": HIGH, "input": "やあ"})
@@ -763,7 +1012,7 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
         self.assertEqual(failed["response"]["error"]["code"], "antigravity_cli_error_result")
 
     def test_system_instructions_reach_the_prompt(self):
-        runner = SequenceRunner([agy_output()])
+        runner = FakeAcpRunner()
         base_url = self.start_server(agy_config(), runner)
 
         self.post(
@@ -774,7 +1023,7 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
         self.assertEqual(runner.prompt(), "[system]\nあなたは助手です\n\nやあ")
 
     def test_image_input_is_rejected_with_400(self):
-        runner = SequenceRunner([agy_output()])
+        runner = FakeAcpRunner()
         base_url = self.start_server(agy_config(), runner)
 
         status, payload = self.post(
@@ -795,14 +1044,11 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
 
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"]["code"], "unsupported_content_part")
-        # 実行できないと分かった時点で止め、CLI は起動しない。
         self.assertEqual(runner.calls, [])
 
     def test_rejected_image_keeps_the_claude_conversation(self):
-        # 拒否されるリクエストで会話の続き具合を壊すと、同じスレッドの Claude が
-        # 転記を引き継げなくなる。
-        runner = SequenceRunner([cli_lines(claude_result("回答")), agy_output()])
-        base_url = self.start_server(make_config(), runner)
+        claude_runner = FakeRunner(cli_lines(claude_result("回答")))
+        base_url = self.start_server(make_config(), claude_runner)
 
         self.post(
             base_url,
@@ -830,13 +1076,11 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
         )
 
         self.assertEqual(status, 400)
-        self.assertEqual(len(runner.calls), 2)
-        self.assertIn("--resume", runner.command(1))
+        self.assertEqual(len(claude_runner.calls), 2)
+        self.assertIn("--resume", claude_runner.calls[1]["command"])
 
     def test_codex_tools_are_not_offered(self):
-        # agy の headless 契約にはリクエスト単位のツール登録の口がないため、
-        # 受け渡しも tool_search も行わずそのまま実行する。
-        runner = SequenceRunner([agy_output()])
+        runner = FakeAcpRunner([prompt_turn("こんにちは")])
         base_url = self.start_server(agy_config(), runner)
 
         status, payload = self.post(
@@ -868,7 +1112,7 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
 
 
 class AntigravityConversationTest(BridgeHTTPTestCase):
-    """会話キーごとの継続。Claude の --session-id / --resume と混ざらないこと。"""
+    """常駐 ACP 上での会話継続・モデル切り替え・中断・再接続。"""
 
     def post_turn(self, base_url: str, payload: dict, key: str = "thread-1"):
         return self.post(base_url, {**payload, "prompt_cache_key": key})
@@ -880,28 +1124,137 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
             {"role": "user", "content": "2問目"},
         ]
 
-    def test_second_turn_continues_with_the_conversation_id(self):
-        runner = SequenceRunner(
-            [
-                agy_lines(result_event("回答", conversation_id="conv-7")),
-                agy_lines(result_event("回答2", conversation_id="conv-7")),
-            ]
+    def test_second_turn_reuses_resident_acp_process_and_session(self):
+        runner = FakeAcpRunner(
+            [prompt_turn("回答"), prompt_turn("回答2")], session_ids=["conv-7"]
         )
         base_url = self.start_server(agy_config(), runner)
 
         self.post_turn(base_url, {"model": HIGH, "input": "1問目"})
         self.post_turn(base_url, {"model": HIGH, "input": self.second_turn_input()})
 
-        self.assertNotIn("--conversation", runner.command(0))
-        self.assertEqual(runner.command(1)[-2:], ["--conversation", "conv-7"])
-        # 続きでは転記済みの発言を送り返さない。
+        # 同じ常駐プロセス・同じモデルなら 2 ターン目は session/prompt だけが飛ぶ。
+        self.assertEqual(len(runner.processes), 1)
+        self.assertEqual(
+            runner.methods(),
+            [
+                "initialize",
+                "session/new",
+                "session/set_model",
+                "session/prompt",
+                "session/prompt",
+            ],
+        )
+        prompts = runner.requests_for("session/prompt")
+        self.assertEqual(prompts[0]["params"]["sessionId"], "conv-7")
+        self.assertEqual(prompts[1]["params"]["sessionId"], "conv-7")
         self.assertEqual(runner.prompt(1), "2問目")
 
+    def test_switching_antigravity_model_mid_thread_updates_session_model(self):
+        runner = FakeAcpRunner(
+            [prompt_turn("回答"), prompt_turn("回答2")], session_ids=["conv-7"]
+        )
+        base_url = self.start_server(agy_config(), runner)
+
+        self.post_turn(base_url, {"model": HIGH, "input": "1問目"})
+        self.post_turn(base_url, {"model": MEDIUM, "input": self.second_turn_input()})
+
+        self.assertEqual(len(runner.processes), 1)
+        self.assertEqual(runner.models_set(), [HIGH, MEDIUM])
+        self.assertEqual(runner.prompt(1), "2問目")
+
+    def test_idle_acp_disconnect_reconnects_and_resumes_conversation(self):
+        runner = FakeAcpRunner(
+            [prompt_turn("回答"), prompt_turn("回答2")], session_ids=["conv-7"]
+        )
+        base_url = self.start_server(agy_config(), runner)
+
+        self.post_turn(base_url, {"model": HIGH, "input": "1問目"})
+        # アイドル中に常駐プロセスが終了した場合でも、次のターンで再起動して session/resume する。
+        runner.processes[0].close_stdout(returncode=0)
+        for _ in range(100):
+            if runner.processes[0].waited:
+                break
+            time.sleep(0.01)
+
+        status, payload = self.post_turn(
+            base_url, {"model": HIGH, "input": self.second_turn_input()}
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["output_text"], "回答2")
+        self.assertEqual(len(runner.processes), 2)
+        self.assertIn("session/resume", [r["method"] for r in runner.processes[1].requests])
+        self.assertEqual(runner.prompt(1), "2問目")
+
+    def test_midturn_steer_cancels_only_target_session_and_keeps_server_alive(self):
+        runner = FakeAcpRunner(
+            [
+                prompt_turn("", usage_update(0), hold=True),
+                prompt_turn("他スレッドの回答"),
+                prompt_turn("差し込み後の回答"),
+            ],
+            session_ids=["conv-a", "conv-b"],
+        )
+        server = BridgeServer(agy_config(), runner=runner)
+        server.app_server = FakeAppServer()
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
+        thread.daemon = True
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        host, port = server.server_address[:2]
+        base_url = f"http://{host}:{port}"
+
+        steered_result = []
+        t1 = threading.Thread(
+            target=lambda: steered_result.append(
+                self.post_stream(
+                    base_url,
+                    {"model": HIGH, "input": "1問目", "prompt_cache_key": "thread-a"},
+                )
+            ),
+            daemon=True,
+        )
+        t1.start()
+        self.assertTrue(runner.held_event.wait(5))
+
+        # 別スレッドのターンは同じ常駐 ACP プロセスのまま完走する。
+        status_b, body_b = self.post_turn(
+            base_url, {"model": HIGH, "input": "別の質問"}, key="thread-b"
+        )
+        self.assertEqual(status_b, 200)
+        self.assertEqual(body_b["output_text"], "他スレッドの回答")
+
+        # thread-a だけ hand_back で区切る。プロセスは殺さず session/cancel が送られる。
+        self.assertTrue(server.sessions.hand_back("thread-a"))
+        t1.join(5)
+        names = [name for name, _ in steered_result[0][1]]
+        self.assertIn("response.completed", names)
+        self.assertNotIn("response.failed", names)
+        self.assertEqual(runner.processes[0].killed, 0)
+        self.assertEqual(len(runner.processes), 1)
+
+        # 差し込み後のリクエストは同じ conv-a の続きとして処理される。
+        status_a2, body_a2 = self.post_turn(
+            base_url,
+            {
+                "model": HIGH,
+                "input": [
+                    {"role": "user", "content": "1問目"},
+                    {"role": "user", "content": "英語で続けて"},
+                ],
+            },
+            key="thread-a",
+        )
+        self.assertEqual(status_a2, 200)
+        self.assertEqual(body_a2["output_text"], "差し込み後の回答")
+        self.assertEqual(runner.prompt(2), "英語で続けて")
+
     def test_system_instructions_are_not_repeated_on_later_turns(self):
-        # agy には system の口がなく、指示はユーザー発言として会話に残る。毎ターン渡すと
-        # 同じ指示がターンの数だけ会話へ積み上がる。
-        runner = SequenceRunner(
-            [agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7"))]
+        runner = FakeAcpRunner(
+            [prompt_turn("回答"), prompt_turn("回答")], session_ids=["conv-7"]
         )
         base_url = self.start_server(agy_config(), runner)
         instructions = "あなたは助手です"
@@ -915,14 +1268,10 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
         )
 
         self.assertEqual(runner.prompt(0), "[system]\nあなたは助手です\n\n1問目")
-        self.assertEqual(runner.command(1)[-2:], ["--conversation", "conv-7"])
         self.assertEqual(runner.prompt(1), "2問目")
 
     def test_added_developer_message_is_sent_once(self):
-        # Codex は途中で developer の発言を後ろへ足す。足された節だけを、その回だけ渡す。
-        runner = SequenceRunner(
-            [agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7"))]
-        )
+        runner = FakeAcpRunner([prompt_turn("回答")] * 3, session_ids=["conv-7"])
         base_url = self.start_server(agy_config(), runner)
         instructions = "あなたは助手です"
         added = {"role": "developer", "content": "使える skill の一覧"}
@@ -952,17 +1301,17 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
         self.assertEqual(runner.prompt(2), "3問目")
 
     def test_changed_instructions_are_sent_again_in_full(self):
-        # 会話に残った古い指示は取り消せない。今の指示の全体を後から示して上書きする。
-        runner = SequenceRunner(
-            [agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7"))]
-        )
+        runner = FakeAcpRunner([prompt_turn("回答")] * 2, session_ids=["conv-7"])
         base_url = self.start_server(agy_config(), runner)
         kept = {"role": "developer", "content": "日本語で答える"}
 
         self.post_turn(
-            base_url, {"model": HIGH, "instructions": "計画だけを立てる", "input": [
-                kept, {"role": "user", "content": "1問目"},
-            ]},
+            base_url,
+            {
+                "model": HIGH,
+                "instructions": "計画だけを立てる",
+                "input": [kept, {"role": "user", "content": "1問目"}],
+            },
         )
         self.post_turn(
             base_url,
@@ -973,18 +1322,13 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
             },
         )
 
-        self.assertEqual(runner.command(1)[-2:], ["--conversation", "conv-7"])
         self.assertEqual(
             runner.prompt(1), "[system]\n実装まで進める\n\n日本語で答える\n\n2問目"
         )
 
     def test_new_conversation_receives_the_instructions_again(self):
-        # 履歴が置き換わって会話を開始し直すときは、新しい会話に指示が 1 つも載っていない。
-        runner = SequenceRunner(
-            [
-                agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7")),
-                agy_lines(*accepted("conv-9"), result_event("回答2", conversation_id="conv-9")),
-            ]
+        runner = FakeAcpRunner(
+            [prompt_turn("回答"), prompt_turn("回答2")], session_ids=["conv-7", "conv-9"]
         )
         base_url = self.start_server(agy_config(), runner)
         instructions = "あなたは助手です"
@@ -1004,15 +1348,11 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
             },
         )
 
-        self.assertNotIn("--conversation", runner.command(1))
+        self.assertEqual(len(runner.requests_for("session/new")), 2)
         self.assertTrue(runner.prompt(1).startswith("[system]\nあなたは助手です\n\n"))
 
     def test_added_instructions_alone_decide_the_size_of_a_resumed_turn(self):
-        # 続きのターンで渡すのは足された節と新しい発言だけ。載せ済みの指示まで数えると、
-        # 通るはずの入力を 413 にする。
-        runner = SequenceRunner(
-            [agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7"))]
-        )
+        runner = FakeAcpRunner([prompt_turn("回答")] * 2, session_ids=["conv-7"])
         base_url = self.start_server(agy_config(max_request_bytes=400), runner)
         instructions = "あ" * 100
         added = {"role": "developer", "content": "い" * 100}
@@ -1033,7 +1373,7 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
         self.assertEqual(runner.prompt(1), "[system]\n" + "い" * 100 + "\n\n2問目")
 
     def test_oversized_instructions_are_rejected_on_the_first_turn(self):
-        runner = SequenceRunner([agy_output()])
+        runner = FakeAcpRunner()
         base_url = self.start_server(agy_config(max_request_bytes=400), runner)
 
         status, body = self.post_turn(
@@ -1045,13 +1385,12 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
         self.assertEqual(runner.calls, [])
 
     def test_turn_stopped_after_the_message_was_accepted_is_continued(self):
-        # 最初のターンが途中で止まっても、発言が会話へ載っていれば次の実行は続きになる。
-        # 新しい会話で全履歴を渡し直すと、そこまでに読んだファイルやツールの結果を失う。
-        runner = SequenceRunner(
+        runner = FakeAcpRunner(
             [
-                agy_lines(*accepted("conv-8"), delta_event("途中", state="ACTIVE")),
-                agy_lines(*accepted("conv-8"), result_event("回答", conversation_id="conv-8")),
-            ]
+                prompt_turn("", message_chunk("途中"), error={"message": "interrupted"}),
+                prompt_turn("回答"),
+            ],
+            session_ids=["conv-8"],
         )
         base_url = self.start_server(agy_config(), runner)
         instructions = "あなたは助手です"
@@ -1073,27 +1412,32 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
 
         self.assertEqual((first, second), (502, 200))
         self.assertEqual(payload["output_text"], "回答")
-        self.assertEqual(runner.command(1)[-2:], ["--conversation", "conv-8"])
         self.assertEqual(runner.prompt(1), "方針を変えて2問目")
 
-    def test_lost_conversation_is_restarted_with_the_whole_history(self):
-        runner = SequenceRunner(
-            [
-                agy_lines(*accepted("conv-7"), result_event("回答", conversation_id="conv-7")),
-                # 会話 conv-7 が見つからず、agy が別の会話を始めた。
-                agy_lines(*accepted("conv-x"), result_event("文脈なし", conversation_id="conv-x")),
-                agy_lines(*accepted("conv-9"), result_event("回答2", conversation_id="conv-9")),
-            ]
+    def test_lost_conversation_after_restart_is_restarted_with_the_whole_history(self):
+        runner = FakeAcpRunner(
+            [prompt_turn("回答"), prompt_turn("回答2")],
+            session_ids=["conv-7", "conv-9"],
+            resumable=set(),
         )
         base_url = self.start_server(agy_config(), runner)
         instructions = "あなたは助手です"
         second = {
-            "model": HIGH, "instructions": instructions, "input": self.second_turn_input(),
+            "model": HIGH,
+            "instructions": instructions,
+            "input": self.second_turn_input(),
         }
 
         self.post_turn(
             base_url, {"model": HIGH, "instructions": instructions, "input": "1問目"}
         )
+        # プロセス再起動後に conv-7 がディスクから消えていた状況を再現する。
+        runner.processes[0].close_stdout(returncode=0)
+        for _ in range(100):
+            if runner.processes[0].waited:
+                break
+            time.sleep(0.01)
+
         lost, body = self.post_turn(base_url, second)
         retried, payload = self.post_turn(base_url, second)
 
@@ -1101,35 +1445,31 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
         self.assertEqual(body["error"]["code"], "antigravity_cli_conversation_lost")
         self.assertEqual(retried, 200)
         self.assertEqual(payload["output_text"], "回答2")
-        self.assertNotIn("--conversation", runner.command(2))
+        # やり直しでは同じ常駐プロセス（2 代目）のまま session/new で全履歴を送る。
+        self.assertEqual(len(runner.processes), 2)
         self.assertEqual(
-            runner.prompt(2),
+            runner.prompt(1),
             "[system]\nあなたは助手です\n\n[user]\n1問目\n\n[assistant]\n回答\n\n[user]\n2問目",
         )
 
     def test_failed_first_turn_resends_the_whole_history(self):
-        runner = SequenceRunner(
-            [
-                agy_lines(result_event("", status="error", error="boom")),
-                agy_lines(result_event("回答", conversation_id="conv-8")),
-            ]
+        runner = FakeAcpRunner(
+            [prompt_turn("", error={"message": "boom"}), prompt_turn("回答")],
+            session_ids=["conv-7", "conv-8"],
         )
         base_url = self.start_server(agy_config(), runner)
 
         self.post_turn(base_url, {"model": HIGH, "input": "1問目"})
         self.post_turn(base_url, {"model": HIGH, "input": self.second_turn_input()})
 
-        self.assertNotIn("--conversation", runner.command(1))
+        self.assertEqual(len(runner.requests_for("session/new")), 2)
         self.assertEqual(
             runner.prompt(1), "[user]\n1問目\n\n[assistant]\n回答\n\n[user]\n2問目"
         )
 
     def test_rewritten_history_starts_a_new_conversation(self):
-        runner = SequenceRunner(
-            [
-                agy_lines(result_event("回答", conversation_id="conv-7")),
-                agy_lines(result_event("回答2", conversation_id="conv-9")),
-            ]
+        runner = FakeAcpRunner(
+            [prompt_turn("回答"), prompt_turn("回答2")], session_ids=["conv-7", "conv-9"]
         )
         base_url = self.start_server(agy_config(), runner)
 
@@ -1145,16 +1485,17 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
             },
         )
 
-        self.assertNotIn("--conversation", runner.command(1))
+        self.assertEqual(len(runner.requests_for("session/new")), 2)
 
     def test_resent_request_repeats_the_latest_message(self):
-        runner = SequenceRunner([agy_lines(result_event("回答", conversation_id="conv-7"))] * 2)
+        runner = FakeAcpRunner([prompt_turn("回答")] * 2, session_ids=["conv-7"])
         base_url = self.start_server(agy_config(), runner)
 
         self.post_turn(base_url, {"model": HIGH, "input": "1問目"})
         self.post_turn(base_url, {"model": HIGH, "input": "1問目"})
 
-        self.assertEqual(runner.command(1)[-2:], ["--conversation", "conv-7"])
+        prompts = runner.requests_for("session/prompt")
+        self.assertEqual(prompts[1]["params"]["sessionId"], "conv-7")
         self.assertEqual(runner.prompt(1), "1問目")
 
     def test_switching_backend_restarts_the_conversation(self):
@@ -1168,7 +1509,6 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
         unseen = session.prepare(messages, CLAUDE_BACKEND)
 
         self.assertFalse(session.resume)
-        # 続きにできないので全履歴を渡し、転記 ID も新しく発行する。
         self.assertEqual(unseen, messages)
         self.assertNotEqual(transcript_id(session), "conv-7")
 
@@ -1179,14 +1519,12 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
         session.prepare(conversation(("user", "1問目")), CLAUDE_BACKEND)
         session.confirm("claude-transcript")
 
-        # Antigravity を選んだが agy が入っておらず起動に失敗した。
         runner = FakeRunner(raises=FileNotFoundError("agy"))
         messages = conversation(("user", "1問目"), ("assistant", "回答"), ("user", "2問目"))
         session.prepare(messages, ANTIGRAVITY_BACKEND)
         with self.assertRaises(BridgeError):
             list(stream_antigravity(agy_config(), "2問目", session, runner))
 
-        # 同じスレッドで Claude へ戻せば、元の転記の続きから実行できる。
         unseen = session.prepare(messages, CLAUDE_BACKEND)
 
         self.assertTrue(session.resume)
@@ -1195,27 +1533,45 @@ class AntigravityConversationTest(BridgeHTTPTestCase):
 
 
 class AntigravityModelsTest(BridgeHTTPTestCase):
-    def test_argon_is_published_and_runs_through_antigravity(self):
+    def test_default_models_are_published_and_run_through_antigravity(self):
         config = build_config(["--port", "0"], env={})
-        runner = SequenceRunner([agy_output()])
+        runner = FakeAcpRunner([prompt_turn("こんにちは") for _ in DEFAULT_ANTIGRAVITY_MODELS])
         base_url = self.start_server(config, runner)
         status, catalog = self.get_json(base_url, "/v1/models")
         self.assertEqual(status, 200)
         entries = {item["id"]: item for item in catalog["data"]}
-        for model in ("gemini-4-argon-high", "gemini-4-argon-medium"):
+        self.assertNotIn("gemini-4-carbon-high", entries)
+        self.assertNotIn("gemini-4-carbon-medium", entries)
+        for model in DEFAULT_ANTIGRAVITY_MODELS:
             self.assertEqual(entries[model]["owned_by"], "google")
             self.assertEqual(config.backend(model), ANTIGRAVITY_BACKEND)
 
-        status, payload = self.post(
-            base_url, {"model": "gemini-4-argon-high", "input": "やあ"}
+        for model in DEFAULT_ANTIGRAVITY_MODELS:
+            status, payload = self.post(base_url, {"model": model, "input": "やあ"})
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["model"], model)
+        self.assertEqual(runner.models_set(), list(DEFAULT_ANTIGRAVITY_MODELS))
+        self.assertEqual(len(runner.processes), 1)
+
+    def test_legacy_carbon_requests_run_argon(self):
+        config = build_config(
+            ["--port", "0", "--upstream-base-url", "https://upstream.example"], env={}
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["model"], "gemini-4-argon-high")
-        command = runner.command()
-        self.assertEqual(command[command.index("--model") + 1], "gemini-4-argon-high")
+        runner = FakeAcpRunner([prompt_turn("こんにちは"), prompt_turn("こんにちは")])
+        base_url = self.start_server(config, runner)
+
+        for effort in ("high", "medium"):
+            old_model = f"gemini-4-carbon-{effort}"
+            status, _ = self.post(base_url, {"model": old_model, "input": "やあ"})
+            self.assertEqual(status, 200)
+        self.assertEqual(
+            runner.models_set(), ["gemini-4-argon-high", "gemini-4-argon-medium"]
+        )
 
     def test_models_include_both_clis(self):
-        base_url = self.start_server(make_config(claude_models=("claude-opus-5-5",)), FakeRunner())
+        base_url = self.start_server(
+            make_config(claude_models=("claude-opus-5-5",)), FakeRunner()
+        )
 
         status, payload = self.get_json(base_url, "/v1/models")
 
@@ -1234,12 +1590,12 @@ class AntigravityModelsTest(BridgeHTTPTestCase):
         self.assertEqual(entries[HIGH]["display_name"], f"Antigravity CLI ({HIGH})")
         self.assertIn("Antigravity", entries[HIGH]["description"])
         self.assertIn("テキストのみ", entries[HIGH]["description"])
-        # Claude 側の表示は変えない。
-        self.assertEqual(entries["claude-opus-5-5"]["display_name"], "Claude CLI (claude-opus-5-5)")
+        self.assertEqual(
+            entries["claude-opus-5-5"]["display_name"], "Claude CLI (claude-opus-5-5)"
+        )
         self.assertIn("画像", entries["claude-opus-5-5"]["description"])
 
     def test_antigravity_entries_keep_the_upstream_template_fields(self):
-        # Codex は必須項目が欠けたエントリを 1 つ見つけるだけで一覧全体の解釈に失敗する。
         upstream = {
             "data": [{"id": "gpt-5.5", "object": "model"}],
             "models": [{"slug": "gpt-5.5", "priority": 1, "supports_vision": True}],
@@ -1252,12 +1608,10 @@ class AntigravityModelsTest(BridgeHTTPTestCase):
         )
         entries = {item["slug"]: item for item in payload["models"]}
 
-        # 画像を扱えるのは Claude だけ。雛形の宣言をそのまま受け継がない。
         self.assertFalse(entries[HIGH]["supports_vision"])
         self.assertTrue(entries["claude-opus-5-5"]["supports_vision"])
         self.assertFalse(entries[HIGH]["prefer_websockets"])
         self.assertIsNone(entries[HIGH]["tool_mode"])
-        # priority は上流と重複しないよう並べ直す。
         self.assertEqual([item["priority"] for item in payload["models"]], [1, 2, 3, 4])
 
     def test_antigravity_models_can_be_disabled(self):
@@ -1273,68 +1627,21 @@ class AntigravityModelsTest(BridgeHTTPTestCase):
         self.assertEqual(config.backend("claude-opus-5-5"), CLAUDE_BACKEND)
 
 
-class AntigravityModelAliasTest(BridgeHTTPTestCase):
-    def setUp(self):
-        _latest_flash_model.cache_clear()
-
-    @mock.patch("claude_bridge.antigravity_cli.subprocess.run")
-    def test_alias_selects_newest_matching_model(self, run):
-        run.return_value = subprocess.CompletedProcess(
-            ["agy", "models"], 0,
-            "gemini-3.9-flash-medium\tMedium\n"
-            "gemini-3.8-flash-high\tHigh\n"
-            "gemini-3.10-flash-high\tNew high\n"
-            "gemini-3.9-pro-high\tPro\n",
-            "",
-        )
-
-        self.assertEqual(resolve_model("agy", "gemini-flash-high"), "gemini-3.10-flash-high")
-        self.assertEqual(resolve_model("agy", "gemini-flash-medium"), "gemini-3.9-flash-medium")
-        self.assertEqual(resolve_model("agy", "gemini-flash-high"), "gemini-3.10-flash-high")
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args.args[0], ["agy", "models"])
-        self.assertNotIn("GEMINI_API_KEY", run.call_args.kwargs["env"])
-
-    @mock.patch("claude_bridge.antigravity_cli.subprocess.run")
-    def test_explicit_model_does_not_fetch_catalog(self, run):
-        self.assertEqual(resolve_model("agy", HIGH), HIGH)
-        run.assert_not_called()
-
-    @mock.patch("claude_bridge.antigravity_cli.subprocess.run")
-    def test_missing_matching_model_is_an_error(self, run):
-        run.return_value = subprocess.CompletedProcess(["agy", "models"], 0, "other\tOther\n", "")
-        with self.assertRaises(BridgeError) as raised:
-            resolve_model("agy", "gemini-flash-high")
-        self.assertEqual(raised.exception.code, "antigravity_cli_model_not_found")
-
-    @mock.patch("claude_bridge.antigravity_cli.subprocess.run")
-    def test_public_alias_runs_the_resolved_model(self, run):
-        run.return_value = subprocess.CompletedProcess(
-            ["agy", "models"], 0, "gemini-4.0-flash-high\tHigh\n", ""
-        )
-        runner = SequenceRunner([agy_output()])
-        base_url = self.start_server(
-            make_config(antigravity_models=("gemini-flash-high",)), runner
-        )
-
-        status, payload = self.post(base_url, {"model": "gemini-flash-high", "input": "やあ"})
-
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["model"], "gemini-flash-high")
-        command = runner.command()
-        self.assertEqual(command[command.index("--model") + 1], "gemini-4.0-flash-high")
-
-
 class AntigravityConfigTest(unittest.TestCase):
     def test_defaults(self):
         config = build_config([], env={})
 
         self.assertEqual(config.antigravity_path, "agy")
         self.assertEqual(config.antigravity_models, DEFAULT_ANTIGRAVITY_MODELS)
-        self.assertEqual(config.antigravity_models, (
-            "gemini-flash-high", "gemini-flash-medium",
-            "gemini-4-argon-high", "gemini-4-argon-medium",
-        ))
+        self.assertEqual(
+            config.antigravity_models,
+            (
+                "gemini-4-argon-high",
+                "gemini-4-argon-medium",
+                "gemini-4-hydrogen-high",
+                "gemini-3.8-flash-high",
+            ),
+        )
 
     def test_env_overrides(self):
         config = build_config(
@@ -1349,8 +1656,6 @@ class AntigravityConfigTest(unittest.TestCase):
         self.assertEqual(config.antigravity_models, ("gemini-3.8-flash-high",))
 
     def test_empty_models_disable_antigravity(self):
-        # 空の環境変数は既定値として扱われる（--passthrough-tools と同じ扱い）ため、
-        # 無効化は引数で明示する。
         config = build_config(["--antigravity-models", ""], env={})
 
         self.assertEqual(config.antigravity_models, ())
@@ -1372,7 +1677,7 @@ class AntigravityConfigTest(unittest.TestCase):
 
 
 class ClaudeRegressionTest(BridgeHTTPTestCase):
-    """Antigravity を足しても Claude 側の経路が変わらないこと。"""
+    """Antigravity を ACP 常駐に変えても Claude 側の経路が変わらないこと。"""
 
     def test_claude_still_uses_session_flags(self):
         runner = FakeRunner(cli_lines(claude_result("こんにちは")))
@@ -1385,7 +1690,7 @@ class ClaudeRegressionTest(BridgeHTTPTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["output_text"], "こんにちは")
         self.assertIn("--session-id", runner.calls[0]["command"])
-        self.assertNotIn("--conversation", runner.calls[0]["command"])
+        self.assertNotIn("acp", runner.calls[0]["command"])
 
     def test_claude_stream_sends_the_whole_text_as_one_delta(self):
         runner = FakeRunner(cli_lines(claude_result("こんにちは")))

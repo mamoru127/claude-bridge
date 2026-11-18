@@ -1,65 +1,83 @@
-"""Antigravity CLI（`agy`）を headless で実行し、途中経過と最終テキストを逐次取り出す。
+"""Antigravity CLI（`agy`）を常駐 ACP（Agent Client Protocol）サーバーとして動かし、
+複数スレッド・複数ターンの実行を 1 本の stdio JSON-RPC 接続で捌く。
 
-headless の契約は次のとおり（NDJSON 入力を含め実機で確認）。
+ACP の契約は次のとおり（agy 1.5.11 の実機で確認）。
 
-    agy -p "" --input-format stream-json --model gemini-3.8-flash-high --output-format stream-json
+    agy acp --dangerously-skip-permissions
 
-標準入力へ {"event":"user","message":{"role":"user","content":"<prompt>"}} を1行渡す。
-入力形式は agy 1.1.15 以降で対応し、長いプロンプトも OS の引数長制限を受けない。
+起動直後に 1 回だけ `initialize` を送り、以降は会話ごとに `session/new` または `session/resume`、
+モデルの切り替えに `session/set_model`、各ターンに `session/prompt` を送る。
 
-標準出力は NDJSON で、各行は `event` で種別を示し、本体を同じ名前のキーへ入れ子で持つ。
+経過は `session/update` 通知で届き、`sessionUpdate` が種別を示す。
+- `agent_message_chunk`: 最終回答の増分（`content.text`）
+- `agent_thought_chunk`: 思考の増分（`content.text`）
+- `tool_call` / `tool_call_update`: ツール実行の開始と成否
+ターンの完了は `session/prompt` の応答（`result.stopReason`）で確定する。
 
-    {"event":"init","conversation_id":"<id>","init":{"model":...,"cwd":...,"tools":[...]}}
-    {"event":"step_update","step_update":{"conversation_id":"<id>","step_index":0,
-                                          "state":"DONE","step_type":"user_input"}}
-    {"event":"step_update","step_update":{"conversation_id":"<id>","step_index":2,"state":"ACTIVE",
-                                          "step_type":"agent_response","text_delta":"こん"}}
-    {"event":"result","result":{"conversation_id":"<id>","status":"SUCCESS","response":"..."}}
-
-`agent_response` の `text_delta` は本物の増分で、`ACTIVE` と最後の `DONE` を連結すると
-`result` の `response` と一致する。会話の継続は `conversation_id` を `--conversation` へ渡す。
-
-会話まわりの挙動（agy 1.5.6 の実機で確認）。
-
-- `user_input` の step は、渡した発言が会話へ載った合図。ここより後で止めた会話は
-  `--conversation` で続けられ、途中までのツール結果も残る。`init` の直後に止めた会話は
-  ID だけ有効で発言が載っていない。
-- `--conversation` に存在しない ID を渡すと、警告だけ出して別の ID の新しい会話を始める。
-  終了コードは 0 のまま。
-- ワークスペース（作業ディレクトリと `--add-dir`）にある `AGENTS.md` / `GEMINI.md` と
-  `.agents/skills` は、毎回のモデル呼び出しへ自動で載る。
+会話まわりの挙動（agy 1.5.11 の実機で確認）。
+- 初回の `session/new` だけが認証とモデル一覧の取得を伴い、同じ `agy acp` プロセス上の
+  2 本目以降の `session/new` や続きの `session/prompt` はコールドスタートなしで即座に始まる。
+- `session/prompt` が最初の `session/update` を出した時点で、発言は会話へ記録されている。
+  途中で中断するときはプロセスを落とさず `session/cancel` 通知を送ると、その会話のターンだけが
+  `stopReason="cancelled"` で止まり、他のスレッドの実行や常駐プロセスはそのまま保たれる。
+- `agy acp` が再起動したあとでも、確定済みの会話 ID は `session/resume` で引き継げる。
+  存在しない ID を `session/resume` に渡すと JSON-RPC エラーが返る（`session/load` は空で通るため
+  使わない）。
 
 認証は Antigravity CLI 側の Google アカウントのキャッシュを使う。ブリッジは認証を代行せず、
 API キー課金の経路になる環境変数を agy へ渡さない（BILLING_ENV_KEYS）。
 """
 
+import contextlib
 import json
-import math
 import os
-import re
+import queue
 import subprocess
-import tempfile
+import threading
 import time
 from collections.abc import Iterator, Mapping
-from functools import lru_cache
 
-from .cli_process import STDERR_SNIPPET_BYTES, CliKind, launch, read_lines, snippet
+from .cli_process import STDERR_SNIPPET_BYTES, CliKind, StderrReader, kill_tree, launch, snippet
 from .config import BridgeConfig
+from .errors import BridgeError
 
 ANTIGRAVITY = CliKind("Antigravity CLI", "antigravity_cli")
 
-# result の status がこの値のときだけ、応答が確定したものとして扱う。
-# 実際に返る値は SUCCESS / ERROR / CANCELED / INTERRUPTED / INVALID などの大文字。
-RESULT_SUCCESS = "SUCCESS"
-
 # agy を API キー経路（従量課金）へ切り替えうる環境変数。Google アカウントの月額枠だけを
-# 使うため、ブリッジから起動する agy の環境からは必ず取り除く。agy 側は設定の
-# modelProvider を gemini にしない限りこれらを使わないが、課金経路の判断を設定ファイルの
-# 状態に依存させない。API キーで使いたい場合はブリッジを経由せず agy を直接実行する。
+# 使うため、ブリッジから起動する agy の環境からは必ず取り除く。
 BILLING_ENV_KEYS = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY")
+
+CLIENT_INFO = {"name": "claude-bridge", "version": "0.1.0"}
+PROTOCOL_VERSION = 1
+
+# `session/cancel` や `stdin` クローズに対して、プロセス強制終了へ切り替えるまでの猶予。
+# 正常な `agy acp` は数ミリ秒で応答するため、無応答で固まったときだけここを使い切る。
+CANCEL_GRACE_SECONDS = 0.2
 
 # ツール進捗の 1 行説明に載せる引数の長さ。
 TOOL_DETAIL_CHARS = 200
+TOOL_ARGUMENT_KEYS = (
+    "CommandLine",
+    "Path",
+    "AbsolutePath",
+    "command",
+    "file_path",
+    "pattern",
+    "path",
+    "url",
+    "query",
+)
+
+_EOF = object()
+_CANCEL = object()
+
+
+class _TurnCancelled(Exception):
+    """クライアント切断や途中の指示差し込みで、このターンが中断された。"""
+
+
+class _TurnTimeout(Exception):
+    """このターンが制限時間内に終わらなかった。"""
 
 
 def agy_env(env: Mapping[str, str] | None = None) -> dict:
@@ -69,67 +87,565 @@ def agy_env(env: Mapping[str, str] | None = None) -> dict:
     return {name: value for name, value in env.items() if name not in BILLING_ENV_KEYS}
 
 
-def resolve_model(path: str, model: str) -> str:
-    """固定の公開名を、agy が現在提供する最新の Flash モデルへ解決する。"""
+def build_command(config: BridgeConfig, session=None) -> list[str]:
+    """常駐させる `agy acp` のコマンド配列を組み立てる。シェルは介さない。
 
-    if model not in ("gemini-flash-high", "gemini-flash-medium"):
-        return model
-    return _latest_flash_model(path, model.rsplit("-", 1)[1], int(time.monotonic() // 600))
-
-
-@lru_cache(maxsize=16)
-def _latest_flash_model(path: str, effort: str, refresh_bucket: int) -> str:
-    try:
-        result = subprocess.run(
-            [path, "models"], capture_output=True, text=True, timeout=20, env=agy_env()
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise ANTIGRAVITY.error(f"のモデル一覧を取得できません: {error}", "models_failed") from error
-    if result.returncode:
-        raise ANTIGRAVITY.error("のモデル一覧を取得できません", "models_failed")
-    candidates = []
-    for line in result.stdout.splitlines():
-        name = line.split("\t", 1)[0]
-        match = re.fullmatch(rf"gemini-(\d+(?:\.\d+)*)-flash-{effort}", name)
-        if match:
-            candidates.append((tuple(int(part) for part in match.group(1).split(".")), name))
-    if not candidates:
-        raise ANTIGRAVITY.error(f"に Flash ({effort}) のモデルがありません", "model_not_found")
-    return max(candidates)[1]
-
-
-def build_command(config: BridgeConfig, session) -> list[str]:
-    """実行するコマンド配列を組み立てる。シェルは介さない。
-
-    `--conversation` は会話 ID を確定済みのときだけ付ける。初回は付けずに実行し、発言が
-    会話へ載った時点で受け取った ID をセッションへ記録して、次の実行から続きにする。
+    モデルと会話 ID は起動引数ではなくセッションごとの RPC で指定する。
+    `config.add_dirs` は渡さない。agy の `--add-dir` はワークスペースの追加で、そこにある
+    `AGENTS.md` と skills が全スレッドへ毎回載る。操作は自動承認で既に通る。
     """
 
-    command = [
+    del session
+    return [
         config.antigravity_path,
-        "-p",
-        "",
-        "--input-format",
-        "stream-json",
-        "--model",
-        resolve_model(config.antigravity_path, config.model),
-        "--output-format",
-        "stream-json",
-        # bridge 経由では対話承認に答えられないため、Claude と同様にツール実行を止めない。
-        # この指定でワークスペースの外も読み書き・実行できる。
+        "acp",
         "--dangerously-skip-permissions",
-        # --print-timeout の既定は 5 分で、ブリッジのタイムアウトより先に打ち切られる。
-        # 長い作業が途中で切れないよう、歯止めをブリッジ側と同じ値にそろえる。
-        # 秒は小数で指定できるため、切り捨てで 0 にならないようミリ秒へ切り上げて渡す。
-        "--print-timeout",
-        f"{math.ceil(config.timeout_seconds * 1000)}ms",
     ]
-    # config.add_dirs は渡さない。agy の --add-dir は操作の許可ではなくワークスペースの追加で、
-    # そこにある AGENTS.md と skills がどのスレッドのモデル呼び出しにも毎回載る。操作は上の
-    # 指定で既に通り、スレッドごとの指示は Codex がプロンプトへ入れてくる。
-    if session.resume:
-        command += ["--conversation", session.handle]
-    return command
+
+
+class _Waiter:
+    """1 ターンの待機口。切断や `hand_back` が届いたら、今待っている箱を即座に起こす。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._box: queue.Queue | None = None
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            box = self._box
+        if box is not None:
+            box.put(_CANCEL)
+
+    def take(self, conn: "_AcpConnection", box: queue.Queue, deadline: float) -> dict:
+        with self._lock:
+            if self._cancelled:
+                raise _TurnCancelled()
+            self._box = box
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _TurnTimeout()
+            try:
+                item = box.get(timeout=remaining)
+            except queue.Empty as error:
+                raise _TurnTimeout() from error
+        finally:
+            with self._lock:
+                if self._box is box:
+                    self._box = None
+
+        if item is _CANCEL:
+            raise _TurnCancelled()
+        if item is _EOF:
+            assert conn.failure is not None
+            raise conn.failure
+        return item
+
+
+class _AcpConnection:
+    """1 つの `agy acp` 子プロセスと、その JSON-RPC 振り分けスレッド。"""
+
+    def __init__(self, process, stderr: StderrReader, key: tuple[str, str]) -> None:
+        self.process = process
+        self.stderr = stderr
+        self.key = key
+        self.failure: BridgeError | None = None
+        self._closing = False
+        self._killed = False
+        self._last_id = 0
+        self._responses: dict[int, queue.Queue] = {}
+        self._turns: dict[str, queue.Queue] = {}
+        # このプロセス上で開いた会話 ID と、最後に設定したモデル名。
+        self._sessions: dict[str, str] = {}
+        self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._pump_done = threading.Event()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def has_session(self, session_id: str) -> bool:
+        with self._lock:
+            return session_id in self._sessions
+
+    def mark_session(self, session_id: str) -> None:
+        with self._lock:
+            self._sessions.setdefault(session_id, "")
+
+    def model_of(self, session_id: str) -> str:
+        with self._lock:
+            return self._sessions.get(session_id, "")
+
+    def set_session_model(self, session_id: str, model: str) -> None:
+        with self._lock:
+            self._sessions[session_id] = model
+
+    def begin_prompt(self, session_id: str) -> queue.Queue:
+        box: queue.Queue = queue.Queue()
+        with self._lock:
+            self._turns[session_id] = box
+            if self.failure is not None:
+                box.put(_EOF)
+        return box
+
+    def end_prompt(self, session_id: str, request_id: int | None) -> None:
+        with self._lock:
+            self._turns.pop(session_id, None)
+            if request_id is not None:
+                self._responses.pop(request_id, None)
+
+    def forget_response(self, request_id: int) -> None:
+        with self._lock:
+            self._responses.pop(request_id, None)
+
+    def send_request(
+        self, method: str, params: dict, box: queue.Queue | None = None
+    ) -> tuple[int, queue.Queue]:
+        if box is None:
+            box = queue.Queue()
+        with self._lock:
+            self._last_id += 1
+            request_id = self._last_id
+            self._responses[request_id] = box
+            if self.failure is not None:
+                box.put(_EOF)
+                return request_id, box
+        self._write_json({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        return request_id, box
+
+    def notify(self, method: str, params: dict) -> None:
+        with contextlib.suppress(BridgeError):
+            self._write_json({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def call(
+        self,
+        method: str,
+        params: dict,
+        waiter: _Waiter,
+        deadline: float,
+        grace_seconds: float,
+    ) -> dict:
+        """単発 RPC を送り、応答メッセージ（`result` または `error` を持つ辞書）を返す。"""
+
+        request_id, box = self.send_request(method, params)
+        answered = False
+        try:
+            message = waiter.take(self, box, deadline)
+            answered = True
+            return message
+        finally:
+            if not answered and self.failure is None:
+                if grace_seconds > 0 and self._drain_response(box, request_id, grace_seconds):
+                    answered = True
+                if not answered and self.failure is None:
+                    self.kill()
+            self.forget_response(request_id)
+
+    def close(self) -> None:
+        """常駐プロセスを終了させる。待機中のターンがなければ標準入力 EOF で穏やかに閉じる。"""
+
+        with self._lock:
+            if self._closing:
+                return
+            self._closing = True
+            has_active = bool(self._turns or self._responses)
+        with self._write_lock, contextlib.suppress(OSError, ValueError):
+            self.process.stdin.close()
+        if has_active:
+            self.kill()
+        elif not self._pump_done.wait(CANCEL_GRACE_SECONDS):
+            self.kill()
+        self._pump_done.wait(1.0)
+
+    def kill(self) -> None:
+        """無応答またはプロトコル違反の子プロセスを子孫ごと強制終了する。"""
+
+        with self._lock:
+            if self._killed:
+                return
+            self._killed = True
+        with self._write_lock, contextlib.suppress(OSError, ValueError):
+            self.process.stdin.close()
+        kill_tree(self.process)
+
+    def _drain_response(self, box: queue.Queue, request_id: int, grace_seconds: float) -> bool:
+        end = time.monotonic() + grace_seconds
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                item = box.get(timeout=remaining)
+            except queue.Empty:
+                return False
+            if item is _EOF:
+                return True
+            if isinstance(item, dict) and item.get("id") == request_id:
+                return True
+
+    def _write_json(self, payload: dict) -> None:
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        try:
+            with self._write_lock:
+                self.process.stdin.write(data)
+                self.process.stdin.flush()
+        except (OSError, ValueError) as error:
+            failure = ANTIGRAVITY.error(f"へ書き込めません: {error}", "failed")
+            self._fail(failure)
+            self.kill()
+            raise failure from error
+
+    def _pump(self) -> None:
+        failure: BridgeError | None = None
+        try:
+            for line in self.process.stdout:
+                if not line.strip():
+                    continue
+                self._route(_decode_line(line))
+        except BridgeError as error:
+            failure = error
+            self.kill()
+        except OSError as error:
+            if not self._closing:
+                failure = ANTIGRAVITY.error(f"の出力を読み取れません: {error}", "failed")
+        finally:
+            returncode = self.process.wait()
+            if failure is None and not self._closing:
+                if returncode not in (0, None):
+                    failure = ANTIGRAVITY.error(
+                        f"が異常終了しました (exit={returncode}): {snippet(self.stderr.read())}",
+                        "failed",
+                    )
+                else:
+                    failure = ANTIGRAVITY.error("との接続が途中で切れました", "invalid_output")
+            self._fail(failure or ANTIGRAVITY.error("との接続を閉じました", "cancelled"))
+            self._pump_done.set()
+
+    def _route(self, message: dict) -> None:
+        # サーバー起点の要求に無応答だと相手が詰まる。未対応を即座に返して先へ進めさせる。
+        if "method" in message and "id" in message:
+            with contextlib.suppress(BridgeError):
+                self._write_json(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "error": {
+                            "code": -32601,
+                            "message": f"Unsupported client method: {message['method']}",
+                        },
+                    }
+                )
+            return
+
+        box = None
+        with self._lock:
+            if "method" in message:
+                if message.get("method") == "session/update":
+                    params = message.get("params")
+                    session_id = params.get("sessionId") if isinstance(params, dict) else None
+                    if isinstance(session_id, str):
+                        box = self._turns.get(session_id)
+            else:
+                box = self._responses.pop(message.get("id"), None)
+        if box is not None:
+            box.put(message)
+
+    def _fail(self, error: BridgeError) -> None:
+        with self._lock:
+            if self.failure is not None:
+                return
+            self.failure = error
+            boxes = [*self._responses.values(), *self._turns.values()]
+            self._responses.clear()
+            self._turns.clear()
+        for box in boxes:
+            box.put(_EOF)
+
+
+class AntigravityClient:
+    """常駐する `agy acp` への接続を保持し、複数スレッドのターンを多重化する。"""
+
+    def __init__(self, config: BridgeConfig, runner=subprocess.Popen) -> None:
+        self._default_config = config
+        self._runner = runner
+        self._conn: _AcpConnection | None = None
+        self._lock = threading.RLock()
+
+    def close(self) -> None:
+        with self._lock:
+            conn, self._conn = self._conn, None
+        if conn is not None:
+            conn.close()
+
+    def stream(
+        self, config: BridgeConfig, prompt: str, session
+    ) -> Iterator[tuple[str, str]]:
+        """1 ターンを実行し、`reasoning`・`delta`・最終 `text` を発生順に返す。"""
+
+        waiter = _Waiter()
+        deadline = time.monotonic() + config.timeout_seconds
+        grace = min(CANCEL_GRACE_SECONDS, max(0.02, config.timeout_seconds))
+        session.start(None, stop=waiter.cancel)
+
+        try:
+            conn, reused = self._connect(config, waiter, deadline)
+            try:
+                session_id = self._prepare_session(conn, config, session, waiter, deadline, grace)
+            except BridgeError as error:
+                # 長時間アイドル後に常駐プロセスが切れていた場合だけ、1 回だけ繋ぎ直す。
+                # session/prompt 送信前なので二重実行にはならない。
+                if (
+                    not reused
+                    or conn.failure is None
+                    or error.code == "antigravity_cli_conversation_lost"
+                ):
+                    raise
+                conn, _ = self._connect(config, waiter, deadline)
+                session_id = self._prepare_session(conn, config, session, waiter, deadline, grace)
+            yield from self._run_prompt(
+                conn, session_id, prompt, session, waiter, deadline, grace
+            )
+        except _TurnTimeout as error:
+            raise ANTIGRAVITY.error(
+                f"が {config.timeout_seconds} 秒以内に終了しませんでした",
+                "timeout",
+                status=504,
+                error_type="timeout_error",
+            ) from error
+        except _TurnCancelled as error:
+            raise ANTIGRAVITY.error("の実行が中断されました", "cancelled") from error
+
+    def _connect(
+        self, config: BridgeConfig, waiter: _Waiter, deadline: float
+    ) -> tuple[_AcpConnection, bool]:
+        key = (config.antigravity_path, config.working_dir)
+        with self._lock:
+            conn = self._conn
+            if conn is not None and conn.failure is None and conn.key == key:
+                return conn, True
+            if conn is not None:
+                self._conn = None
+                conn.close()
+
+            process, stderr = launch(
+                ANTIGRAVITY,
+                build_command(config),
+                config.working_dir,
+                self._runner,
+                env=agy_env(),
+            )
+            conn = _AcpConnection(process, stderr, key)
+            try:
+                response = conn.call(
+                    "initialize",
+                    {
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "clientCapabilities": {},
+                        "clientInfo": CLIENT_INFO,
+                    },
+                    waiter,
+                    deadline,
+                    grace_seconds=0.0,
+                )
+                if "error" in response:
+                    raise ANTIGRAVITY.error(
+                        f"の初期化が失敗しました: {_error_text(response['error'])}",
+                        "error_result",
+                    )
+                if not isinstance(response.get("result"), dict):
+                    raise ANTIGRAVITY.error(
+                        "の initialize 応答にオブジェクトの result がありません",
+                        "invalid_output",
+                    )
+            except BaseException:
+                conn.kill()
+                raise
+            self._conn = conn
+            return conn, False
+
+    def _prepare_session(
+        self,
+        conn: _AcpConnection,
+        config: BridgeConfig,
+        session,
+        waiter: _Waiter,
+        deadline: float,
+        grace: float,
+    ) -> str:
+        if session.resume:
+            session_id = self._resume_session(conn, config, session, waiter, deadline, grace)
+        else:
+            session_id = self._new_session(conn, config, waiter, deadline, grace)
+
+        if conn.model_of(session_id) != config.model:
+            response = conn.call(
+                "session/set_model",
+                {"sessionId": session_id, "modelId": config.model},
+                waiter,
+                deadline,
+                grace,
+            )
+            if "error" in response:
+                raise ANTIGRAVITY.error(
+                    f"がエラーを返しました: {_error_text(response['error'])}",
+                    "error_result",
+                )
+            conn.set_session_model(session_id, config.model)
+        return session_id
+
+    def _new_session(
+        self,
+        conn: _AcpConnection,
+        config: BridgeConfig,
+        waiter: _Waiter,
+        deadline: float,
+        grace: float,
+    ) -> str:
+        response = conn.call(
+            "session/new",
+            {"cwd": config.working_dir, "mcpServers": []},
+            waiter,
+            deadline,
+            grace,
+        )
+        if "error" in response:
+            raise ANTIGRAVITY.error(
+                f"がエラーを返しました: {_error_text(response['error'])}", "error_result"
+            )
+        result = response.get("result")
+        session_id = result.get("sessionId") if isinstance(result, dict) else None
+        if not isinstance(session_id, str) or not session_id:
+            raise ANTIGRAVITY.error("の出力に sessionId がありません", "invalid_output")
+        conn.mark_session(session_id)
+        return session_id
+
+    def _resume_session(
+        self,
+        conn: _AcpConnection,
+        config: BridgeConfig,
+        session,
+        waiter: _Waiter,
+        deadline: float,
+        grace: float,
+    ) -> str:
+        target_id = session.handle
+        if conn.has_session(target_id):
+            return target_id
+        response = conn.call(
+            "session/resume",
+            {"sessionId": target_id, "cwd": config.working_dir, "mcpServers": []},
+            waiter,
+            deadline,
+            grace,
+        )
+        if "error" in response:
+            session.reset()
+            raise ANTIGRAVITY.error(
+                "が続きの会話を見つけられませんでした。次の実行で会話を開始し直します",
+                "conversation_lost",
+            )
+        result = response.get("result")
+        resumed_id = result.get("sessionId") if isinstance(result, dict) else None
+        if not isinstance(resumed_id, str) or not resumed_id:
+            raise ANTIGRAVITY.error("の出力に sessionId がありません", "invalid_output")
+        if resumed_id != target_id:
+            session.reset()
+            raise ANTIGRAVITY.error(
+                "が続きの会話を見つけられませんでした。次の実行で会話を開始し直します",
+                "conversation_lost",
+            )
+        conn.mark_session(target_id)
+        return target_id
+
+    def _run_prompt(
+        self,
+        conn: _AcpConnection,
+        session_id: str,
+        prompt: str,
+        session,
+        waiter: _Waiter,
+        deadline: float,
+        grace: float,
+    ) -> Iterator[tuple[str, str]]:
+        turn_box = conn.begin_prompt(session_id)
+        prompt_id: int | None = None
+        prompt_done = False
+        confirmed = False
+        chunks: list[str] = []
+        thoughts: list[str] = []
+        started_tools: set[str] = set()
+        tool_names: dict[str, str] = {}
+        tool_error = ""
+
+        try:
+            prompt_id, _ = conn.send_request(
+                "session/prompt",
+                {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": prompt}],
+                },
+                turn_box,
+            )
+            while True:
+                item = waiter.take(conn, turn_box, deadline)
+                if item.get("method") == "session/update":
+                    params = item.get("params")
+                    if not isinstance(params, dict) or params.get("sessionId") != session_id:
+                        continue
+                    update = params.get("update")
+                    if not isinstance(update, dict):
+                        continue
+                    if not confirmed:
+                        session.confirm(session_id)
+                        confirmed = True
+                    events, failure = _collect_update_events(
+                        update, chunks, thoughts, started_tools, tool_names
+                    )
+                    tool_error = failure or tool_error
+                    yield from events
+                    continue
+
+                if item.get("id") != prompt_id:
+                    continue
+                prompt_done = True
+                if "error" in item:
+                    raise ANTIGRAVITY.error(
+                        f"がエラーを返しました: {_error_text(item['error'])}",
+                        "error_result",
+                    )
+                result = item.get("result")
+                if not isinstance(result, dict):
+                    raise ANTIGRAVITY.error("の出力に result がありません", "invalid_output")
+                stop_reason = result.get("stopReason")
+                if not isinstance(stop_reason, str) or not stop_reason:
+                    raise ANTIGRAVITY.error("の出力に stopReason がありません", "invalid_output")
+                if stop_reason == "cancelled":
+                    raise _TurnCancelled()
+
+                yield from _flush_thoughts(thoughts)
+                text = "".join(chunks)
+                if not text.strip() and tool_error:
+                    raise ANTIGRAVITY.error(
+                        f"がツールを実行できず本文を返しませんでした: {tool_error}",
+                        "tool_failed",
+                    )
+                session.confirm(session_id)
+                yield "text", text
+                return
+        finally:
+            if prompt_id is not None and not prompt_done and conn.failure is None:
+                conn.notify("session/cancel", {"sessionId": session_id})
+                prompt_done = _drain_cancelled_prompt(
+                    turn_box, prompt_id, session_id, session, confirmed, grace
+                )
+                if not prompt_done and conn.failure is None:
+                    conn.kill()
+            conn.end_prompt(session_id, prompt_id)
 
 
 def stream_antigravity(
@@ -138,94 +654,53 @@ def stream_antigravity(
     session,
     runner=subprocess.Popen,
 ) -> Iterator[tuple[str, str]]:
-    """agy を headless で起動し、途中経過と最終テキストを発生順に返す。
+    """単発で ACP クライアントを起動して 1 ターン実行する。サーバー常駐時は AntigravityClient を使う。"""
 
-    種別は表示だけの `reasoning`（ツール進捗）、最終回答の増分 `delta`、確定した最終テキストの
-    `text`。`text` は `result` の `response` で、増分と食い違った場合もこちらが正となる。
-    """
+    client = AntigravityClient(config, runner)
+    try:
+        yield from client.stream(config, prompt, session)
+    finally:
+        client.close()
 
-    command = build_command(config, session)
-    # agy 1.1.15 以降の NDJSON 入力。引数へ載せず、長い system 指示や履歴も省略せず渡す。
-    # パイプへ同期書き込みすると、起動時の stdout と相互に詰まり得るため一時ファイルを
-    # stdin にする。子は起動時に複製したハンドルから読み、親のファイルは直ちに閉じる。
-    message = {"event": "user", "message": {"role": "user", "content": prompt}}
-    with tempfile.TemporaryFile() as stdin:
-        stdin.write((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
-        stdin.seek(0)
-        process, stderr = launch(
-            ANTIGRAVITY,
-            command,
-            config.working_dir,
-            runner,
-            stdin=stdin,
-            env=agy_env(),
-        )
-    session.start(process)
 
-    result = None
-    # この実行の会話 ID。init で届く。
-    conversation = ""
-    # ツールの step は開始と終了で 2 回届く。開始の 1 行だけを見せるため step_index を覚える。
-    started_tools: set = set()
-    # 失敗したツールの最後の理由。本文が空で終わった原因を示せる唯一の手がかりになる。
-    tool_error = ""
-    for line in read_lines(ANTIGRAVITY, process, stderr, config.timeout_seconds):
-        if not line.strip():
+def _drain_cancelled_prompt(
+    turn_box: queue.Queue,
+    prompt_id: int,
+    session_id: str,
+    session,
+    confirmed: bool,
+    grace_seconds: float,
+) -> bool:
+    """`session/cancel` 送信後、そのターンの完了応答が返るのを短時間だけ引き取る。"""
+
+    end = time.monotonic() + grace_seconds
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            item = turn_box.get(timeout=remaining)
+        except queue.Empty:
+            return False
+        if item is _EOF:
+            return True
+        if not isinstance(item, dict):
             continue
-        event, payload, conversation_id = _decode(line)
-        if event == "init":
-            conversation = _started_conversation(session, conversation_id)
-        elif event == "step_update":
-            # user_input の step は、渡した発言が会話へ載った合図。実行の完了を待たずに
-            # ここで確定する。待つと、途中で止めたターン（停止、作業中の指示の差し込み、
-            # 時間切れ）の会話を捨てることになり、次の実行が全履歴を渡し直して、そこまでに
-            # 読んだファイルやツールの結果も失う。別の会話の ID が付いた step では確定しない。
+        if item.get("method") == "session/update" and not confirmed:
+            params = item.get("params")
             if (
-                conversation
-                and conversation_id == conversation
-                and payload.get("step_type") == "user_input"
+                isinstance(params, dict)
+                and params.get("sessionId") == session_id
+                and isinstance(params.get("update"), dict)
             ):
-                session.confirm(conversation)
-            failure = _tool_error(payload)
-            tool_error = failure or tool_error
-            yield from _step_events(payload, started_tools, failure)
-        elif event == "result":
-            result = payload
-
-    # ここまで来れば read_lines が終了コードまで検査済み。
-    if result is None:
-        raise ANTIGRAVITY.error("の出力に result が含まれていません", "invalid_output")
-    _check_status(result)
-    text = _response_text(result, tool_error)
-    # 通常は user_input の step で確定済み。その step を出さない agy でも続きにできるよう、
-    # 正常に終わった実行は result の ID でも確定する。
-    session.confirm(_conversation_id(result))
-    yield "text", text
+                session.confirm(session_id)
+                confirmed = True
+        elif item.get("id") == prompt_id:
+            return True
 
 
-def _started_conversation(session, conversation_id: str) -> str:
-    """init で届いた、この実行の会話 ID を確かめて返す。
-
-    続きのはずが別の ID で始まっていたら、agy が元の会話を見つけられず新しい会話を
-    始めている。渡したのは差分の発言だけなので、そのまま進めると文脈のない会話で答えさせる
-    ことになる。実行を止めて会話を開始し直させ、次の実行で全履歴を渡す。
-    """
-
-    if session.resume and conversation_id and conversation_id != session.handle:
-        session.reset()
-        raise ANTIGRAVITY.error(
-            "が続きの会話を見つけられませんでした。次の実行で会話を開始し直します",
-            "conversation_lost",
-        )
-    return conversation_id
-
-
-def _decode(line: bytes) -> tuple[str, dict, str]:
-    """NDJSON の 1 行を (イベント名, 本体, 会話 ID) にする。
-
-    本体はイベント名と同じキーの下にある。会話 ID は init では外側、step_update と result
-    では本体の中にあり、無ければ空文字にする。
-    """
+def _decode_line(line: bytes) -> dict:
+    """標準出力 1 行を JSON-RPC メッセージ辞書として検証する。"""
 
     try:
         payload = json.loads(line)
@@ -233,110 +708,145 @@ def _decode(line: bytes) -> tuple[str, dict, str]:
         raise ANTIGRAVITY.error(
             f"の出力が JSON ではありません: {snippet(line)}", "invalid_output"
         ) from error
-    event = payload.get("event") if isinstance(payload, dict) else None
-    if not isinstance(event, str) or not event:
+    if not isinstance(payload, dict) or ("method" not in payload and "id" not in payload):
         raise ANTIGRAVITY.error(
-            f"の出力に event がありません: {snippet(line)}", "invalid_output"
+            f"の出力が JSON-RPC ではありません: {snippet(line)}", "invalid_output"
         )
-    body = payload.get(event)
-    body = body if isinstance(body, dict) else {}
-    conversation_id = payload.get("conversation_id") or body.get("conversation_id")
-    return event, body, conversation_id if isinstance(conversation_id, str) else ""
+    return payload
 
 
-def _step_events(step: dict, started_tools: set, failure: str) -> Iterator[tuple[str, str]]:
-    """step_update から、最終回答の増分とツール進捗を取り出す。
+def _collect_update_events(
+    update: dict,
+    chunks: list[str],
+    thoughts: list[str],
+    started_tools: set[str],
+    tool_names: dict[str, str],
+) -> tuple[list[tuple[str, str]], str]:
+    """`session/update` 1 件から、クライアントへ流すイベント列とツール失敗理由を作る。"""
 
-    `step_type` が種別で、`agent_response` は `text_delta`、`tool` は `tool_name` と
-    `tool_info` を持つ。`user_input` や `checkpoint` など、Codex へ見せる内容がない step は
-    読み飛ばす。
-    """
+    kind = update.get("sessionUpdate")
+    if kind == "agent_thought_chunk":
+        text = _content_text(update.get("content"))
+        if text:
+            thoughts.append(text)
+            if "\n" in text:
+                paragraphs = "".join(thoughts).split("\n\n")
+                thoughts[:] = [paragraphs.pop()]
+                return [("reasoning", p.strip()) for p in paragraphs if p.strip()], ""
+        return [], ""
 
-    step_type = step.get("step_type")
-    if step_type == "agent_response":
-        delta = step.get("text_delta")
+    if kind == "agent_message_chunk":
+        events = list(_flush_thoughts(thoughts))
+        delta = _content_text(update.get("content"))
         if delta:
-            yield "delta", str(delta)
+            chunks.append(delta)
+            events.append(("delta", delta))
+        return events, ""
+
+    if kind not in ("tool_call", "tool_call_update"):
+        return [], ""
+
+    events = list(_flush_thoughts(thoughts))
+    raw_id = update.get("toolCallId")
+    call_id = raw_id if isinstance(raw_id, str) and raw_id else ""
+    raw_name = update.get("name")
+    name = raw_name if isinstance(raw_name, str) and raw_name else ""
+    if call_id and name:
+        tool_names[call_id] = name
+    elif call_id and not name:
+        name = tool_names.get(call_id, "")
+    if not name:
+        return events, ""
+
+    key = call_id or f"anon_{len(started_tools)}"
+    if key not in started_tools:
+        started_tools.add(key)
+        events.append(("reasoning", f"**{name} を実行中**\n{_tool_detail(update)}".rstrip()))
+
+    failure = ""
+    if update.get("status") == "failed":
+        failure = _tool_failure(update)
+        events.append(("reasoning", f"**{name} が失敗**\n{failure}"))
+    return events, failure
+
+
+def _flush_thoughts(thoughts: list[str]) -> Iterator[tuple[str, str]]:
+    if not thoughts:
         return
-    if step_type != "tool" or not step.get("tool_name"):
-        return
-
-    if step.get("step_index") not in started_tools:
-        started_tools.add(step.get("step_index"))
-        yield "reasoning", f"**{step['tool_name']} を実行中**\n{_tool_detail(step)}".rstrip()
-    if failure:
-        yield "reasoning", f"**{step['tool_name']} が失敗**\n{failure}"
+    text = "".join(thoughts).strip()
+    thoughts.clear()
+    if text:
+        yield "reasoning", text
 
 
-def _tool_info(step: dict) -> dict:
-    parameters = step.get("tool_info")
-    return parameters if isinstance(parameters, dict) else {}
+def _content_text(content: object) -> str:
+    if isinstance(content, dict) and isinstance(content.get("text"), str):
+        return content["text"]
+    return ""
 
 
-def _tool_error(step: dict) -> str:
-    """失敗したツールの理由。失敗していなければ空文字。"""
-
-    error = _tool_info(step).get("error")
-    message = error.get("message") if isinstance(error, dict) else None
-    return str(message)[:TOOL_DETAIL_CHARS] if message else ""
-
-
-def _tool_detail(step: dict) -> str:
-    """ツール進捗に添える引数。引数名はツールごとに違うため、先頭の値だけを見せる。"""
-
-    parameters = _tool_info(step).get("parameters")
-    if not isinstance(parameters, dict) or not parameters:
+def _tool_detail(update: dict) -> str:
+    args = update.get("args")
+    if not isinstance(args, dict) or not args:
+        args = update.get("rawInput")
+    if not isinstance(args, dict) or not args:
         return ""
-    return str(next(iter(parameters.values())))[:TOOL_DETAIL_CHARS]
+    for key in TOOL_ARGUMENT_KEYS:
+        if key in args and args[key] is not None:
+            return str(args[key])[:TOOL_DETAIL_CHARS]
+    return str(next(iter(args.values())))[:TOOL_DETAIL_CHARS]
 
 
-def _check_status(result: dict) -> None:
-    """status が SUCCESS 以外なら実行の失敗として扱う。"""
-
-    if result.get("status") != RESULT_SUCCESS:
-        raise ANTIGRAVITY.error(
-            f"がエラーを返しました (status={result.get('status')}): {_error_text(result)}",
-            "error_result",
-        )
-
-
-def _response_text(result: dict, tool_error: str) -> str:
-    """result から最終テキストを取り出す。
-
-    headless ではツール権限を対話で確認できず自動拒否される。そのとき agy は status を
-    SUCCESS のままにして本文だけを空で返すため、失敗したツールがあって本文も無い場合だけ、
-    そのツールの理由を添えて失敗として返す。空の応答そのものを失敗の根拠にはしない。
-    """
-
-    response = result.get("response")
-    if not isinstance(response, str):
-        raise ANTIGRAVITY.error("の出力に文字列の response がありません", "invalid_output")
-    if not response.strip() and tool_error:
-        raise ANTIGRAVITY.error(
-            f"がツールを実行できず本文を返しませんでした: {tool_error}", "tool_failed"
-        )
-    return response
+def _tool_failure(update: dict) -> str:
+    for candidate in (
+        _nested_message(update.get("error")),
+        _raw_output_error(update.get("rawOutput")),
+        _content_list_text(update.get("content")),
+        update.get("title"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()[:TOOL_DETAIL_CHARS]
+    return "failed"
 
 
-def _error_text(result: dict) -> str:
-    """result の error。文字列でもオブジェクトでも届くため、どちらも読める形にする。"""
+def _nested_message(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and isinstance(value.get("message"), str):
+        return value["message"]
+    return ""
 
-    error = result.get("error")
+
+def _raw_output_error(raw: object) -> str:
+    if isinstance(raw, str):
+        return raw
+    if not isinstance(raw, dict):
+        return ""
+    for field in ("error", "message", "output"):
+        text = _nested_message(raw.get(field))
+        if text.strip():
+            return text
+    return ""
+
+
+def _content_list_text(content: object) -> str:
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = _content_text(item) or _content_text(item.get("content"))
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _error_text(error: object) -> str:
+    """JSON-RPC の `error` を読める文字列にする。"""
+
+    if isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"]:
+        return error["message"][:STDERR_SNIPPET_BYTES]
     if not isinstance(error, str):
         error = json.dumps(error, ensure_ascii=False)
     return error[:STDERR_SNIPPET_BYTES]
-
-
-def _conversation_id(result: dict) -> str:
-    """継続に使う会話 ID。
-
-    無いと次のターンを `--conversation` で続けられず、毎回新しい会話として全履歴を送り直す
-    状態に黙って落ちる。契約違反として扱い、ターンを失敗させる。
-    """
-
-    conversation_id = result.get("conversation_id")
-    if not isinstance(conversation_id, str) or not conversation_id:
-        raise ANTIGRAVITY.error(
-            "の result に conversation_id がありません", "invalid_output"
-        )
-    return conversation_id

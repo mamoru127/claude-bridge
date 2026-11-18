@@ -9,7 +9,7 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from .antigravity_cli import stream_antigravity
+from .antigravity_cli import AntigravityClient
 from .app_server import TURN_METHOD, AppServerClient, AppServerError
 from .claude_cli import input_line, stream_claude
 from .cli_process import final_text
@@ -29,6 +29,7 @@ from .errors import BridgeError
 from .responses import (
     ParsedRequest,
     ResponseStream,
+    antigravity_system_sections,
     build_content,
     build_models,
     build_prompt,
@@ -216,7 +217,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 config.tool_search_query if claude else "",
             )
             # アプリが選んだモデルで実行する。CLI へ届くのは一覧に載せた名前だけ。
-            config = replace(config, model=config.cli_model(request.model))
+            config = replace(config, model=config.cli_model(request.model, request.reasoning_effort))
             # 実行できない入力は、会話の状態を触る前に弾く。この後の acquire は相手の
             # いなくなった実行を止めて会話を引き継ぐため、ここを通さないと、実行できない
             # 入力のために同じ会話の中断済みターンまで落としてしまう。
@@ -379,7 +380,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
             # ため、後から失敗すると同じスレッドの Claude 側の会話まで開始し直しになる。
             # 実際に渡すのは全履歴の部分集合なので、ここで確かめれば組み立てでも通る。
             ensure_text_only(request.messages)
-        messages = session.prepare(request.messages, backend, request.system_sections)
+        sections = request.system_sections
+        if backend == ANTIGRAVITY_BACKEND:
+            sections = antigravity_system_sections(sections)
+        messages = session.prepare(request.messages, backend, sections)
         # Claude は system の口へ毎回渡し直す。Antigravity はユーザー発言として会話へ残る
         # ため、会話へまだ載せていない節だけを渡す。
         system_prompt = request.system_prompt
@@ -392,7 +396,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         payload, size = self._cli_input(messages, system_prompt, backend)
         self._validate_body_size(size, config.max_request_bytes, "CLI へ渡す入力")
         if backend == ANTIGRAVITY_BACKEND:
-            return stream_antigravity(config, payload, session, self.server.runner)
+            return self.server.antigravity.stream(config, payload, session)
         return stream_claude(
             config,
             payload,
@@ -687,6 +691,8 @@ class BridgeServer(ThreadingHTTPServer):
         self.sessions = SessionRegistry()
         # 受け渡しアダプタは別プロセスなので、預かった呼び出しはサーバー側で保持する。
         self.pending = PendingCalls()
+        # Antigravity は ACP サーバー 1 本を常駐させ、会話とモデルを RPC で切り替える。
+        self.antigravity = AntigravityClient(config, runner)
         # app-server はここで持つ。実行中のターンをアダプタの再起動から切り離すための要。
         self.app_server = AppServerClient(socket_path=config.app_server_socket)
         self.steer_log = None
@@ -703,5 +709,6 @@ class BridgeServer(ThreadingHTTPServer):
     def server_close(self) -> None:
         if self.steer_log is not None:
             self.steer_log.stop()
+        self.antigravity.close()
         self.app_server.close()
         super().server_close()

@@ -73,8 +73,8 @@ ChatGPT ログイン用の音声開始 API は `/realtime/calls?intent=quicksilv
 | `opus` | Claude CLI の同名別名（最新版） |
 | `fable` | Claude CLI の `claude-fable-5-2` |
 | `haiku` | Claude CLI の `claude-haiku-5-5` |
-| `gemini-flash-high`, `gemini-flash-medium` | `agy models` にある最新の Gemini Flash |
 | `gemini-4-argon-high`, `gemini-4-argon-medium` | Antigravity CLI の Gemini 4 Argon（アカウント側のアクセス権が必要） |
+| `gemini-4-hydrogen-high` | Antigravity CLI の Gemini 4 Hydrogen（アカウント側のアクセス権が必要） |
 | その他 | `--upstream-base-url` 指定時は上流。未指定時は Claude CLI |
 
 | 引数 | 用途 |
@@ -88,7 +88,7 @@ ChatGPT ログイン用の音声開始 API は `/realtime/calls?intent=quicksilv
 | `--enable-codex-mcp` | Claude から Codex app-server のスレッド操作を使う |
 | `--mcp-config-file PATH` | Claude に追加する MCP サーバーの設定 |
 
-Gemini Flash の公開名は固定です。実行時に `agy models` を参照して対応する最新バージョンへ変換し、結果は最大 10 分保持します。Argon は正式なモデル名をそのまま CLI へ渡します。`--antigravity-models` に実際のモデル名を指定して、バージョンや公開するモデルを選べます。macOS の常駐設定では Flash High と Argon High を公開します。
+Gemini のモデル名は、`agy models` に出る正式な名前をそのまま CLI へ渡します。`--antigravity-models` で公開するモデルを選べます。macOS の常駐設定では Argon High / Medium、Hydrogen High、Flash High を公開します。
 
 その他の引数は `python3 -m claude_bridge --help`（Windows は `py -3 -m claude_bridge --help`）で確認できます。
 
@@ -133,7 +133,7 @@ Codex CLI をインストールし、ログインしてから PowerShell で実�
 
 ## 注意点
 
-- Antigravity への指示と履歴は標準入力の `stream-json` で渡すため、従来の16KB制限はありません。
+- Antigravity は常駐する `agy acp` サーバーへ標準入出力の JSON-RPC で指示と履歴を渡すため、引数長の制限はありません。
 - Antigravity には system 指示の専用の口がないため、指示は発言の先頭に `[system]` 節として渡し、会話に残します。同じ指示は会話ごとに一度だけ渡し、続きのターンでは足された分だけを渡します。
 - Antigravity のターンを途中で止めても、発言が会話へ載ったあとなら次のターンは同じ会話の続きになり、そこまでのツール結果を引き継ぎます。
 - Antigravity には `--add-dir` を渡しません。Antigravity の `--add-dir` はワークスペースの追加で、そのディレクトリの `AGENTS.md` と `.agents/skills` がどのスレッドのモデル呼び出しにも毎回載るためです。Antigravity に常に読ませたいルールは `--working-dir` に置いてください。

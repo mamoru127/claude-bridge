@@ -2,8 +2,8 @@
 
 Codex はスレッドごとに固定の `prompt_cache_key` を送る。これを CLI 側の会話 ID へ対応づけると、
 2 回目以降は差分の発言だけを渡して続きから実行できる（Claude は `--resume`、Antigravity は
-`--conversation`）。CLI 側の転記には読み込んだファイルの中身やツールの実行結果も残るため、
-中断されたターンの続きから動く。
+常駐 ACP セッションまたは `session/resume`）。CLI 側の転記には読み込んだファイルの中身やツールの
+実行結果も残るため、中断されたターンの続きから動く。
 """
 
 import hashlib
@@ -44,6 +44,7 @@ class Session:
         self._pending = (0, "", "", ())
         self._process_lock = threading.Lock()
         self._process = None
+        self._stop = None
         # 今の CLI を起動した時刻。指示より後に起動した実行は、その指示を受け取っている。
         self._started_at = 0.0
         # 今の実行の結果を待っている相手。take_over が生死を見るためだけに持つ。
@@ -105,19 +106,21 @@ class Session:
         # では、直近の発言をもう一度渡して続きを促す。
         return tuple(m for m in messages[self._sent :] if m.role == "user") or messages[-1:]
 
-    def start(self, process) -> None:
-        """CLI が起動した時点で呼ぶ。中断できるようプロセスを保持する。"""
+    def start(self, process, stop=None) -> None:
+        """CLI の実行が始まった時点で呼ぶ。中断できるよう停止手段を保持する。"""
 
         with self._process_lock:
             self._process = process
+            self._stop = stop or (lambda: kill_tree(process))
             self._started_at = time.time()
 
     def abort(self) -> None:
-        """相手が切断した実行の CLI を、子孫ごと止める。会話の後片付けは finish が行う。"""
+        """相手が切断した実行の CLI を止める。会話の後片付けは finish が行う。"""
 
         with self._process_lock:
-            if self._process is not None:
-                kill_tree(self._process)
+            stop = self._stop
+        if stop is not None:
+            stop()
 
     def hand_back(self, steered_at: float | None = None) -> bool:
         """作業をここで区切って Codex へ返す。CLI を止められたかを返す。
@@ -132,13 +135,14 @@ class Session:
         """
 
         with self._process_lock:
-            if self._process is None:
+            if self._stop is None:
                 return False
             if steered_at is not None and self._started_at >= steered_at:
                 return False
             self._handed_back = True
-            kill_tree(self._process)
-            return True
+            stop = self._stop
+        stop()
+        return True
 
     def handed_back(self) -> bool:
         with self._process_lock:
@@ -175,7 +179,7 @@ class Session:
         """この会話を続けられることが確定した時点で呼ぶ。渡した範囲も同時に確定する。
 
         確定するのは、渡した発言が CLI 側の会話へ載ったと分かったとき。Claude は応答が
-        出始めたとき、Antigravity は `user_input` の step が届いたとき。それより前に止まった
+        出始めたとき、Antigravity は `session/update` が届いたとき。それより前に止まった
         実行は会話に何も残していないことがあり、続き扱いにすると渡した発言が抜け落ちる。
         """
 
@@ -193,6 +197,7 @@ class Session:
 
         with self._process_lock:
             self._process = None
+            self._stop = None
             self._client = None
             self._handed_back = False
 
@@ -219,11 +224,13 @@ class Session:
         with self._process_lock:
             if self._handed_over or connected(self._client):
                 return False
-            if self._process is not None:
-                kill_tree(self._process)
-                self._process = None
+            stop = self._stop
+            self._process = None
+            self._stop = None
             self._handed_over = True
-            return True
+        if stop is not None:
+            stop()
+        return True
 
 
 class PendingCalls:

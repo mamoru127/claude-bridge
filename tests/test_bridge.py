@@ -1932,8 +1932,6 @@ class ConfigTest(unittest.TestCase):
         config = build_config(["--upstream-base-url", "https://upstream.example"], env={})
         self.assertEqual(config.backend("claude-opus-5-5"), CLAUDE_BACKEND)
         self.assertEqual(config.cli_model("claude-opus-5-5"), "opus")
-        self.assertEqual(config.backend("gemini-3.8-flash-high"), ANTIGRAVITY_BACKEND)
-        self.assertEqual(config.cli_model("gemini-3.8-flash-high"), "gemini-flash-high")
 
     def test_empty_claude_models_is_rejected(self):
         # model 省略時の既定に先頭を使うため、1 件以上あることを起動時に保証する。
