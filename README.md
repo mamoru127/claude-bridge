@@ -73,10 +73,13 @@ ChatGPT ログイン用の音声開始 API は `/realtime/calls?intent=quicksilv
 | `opus` | Claude CLI の同名別名（最新版） |
 | `fable` | Claude CLI の `claude-fable-5-2` |
 | `haiku` | Claude CLI の `claude-haiku-5-5` |
-| `gemini-4-argon-high`, `gemini-4-argon-medium` | Antigravity CLI の Gemini 4 Argon（アカウント側のアクセス権が必要） |
-| `gemini-4-neon-high` | Antigravity CLI の Gemini 4 Neon（推論レベルは Low・Medium・High・XHigh） |
-| `gemini-4-hydrogen-high` | Antigravity CLI の Gemini 4 Hydrogen（アカウント側のアクセス権が必要） |
+| `gemini-4-argon` | Antigravity CLI の Gemini 4 Argon（Low・Medium・High） |
+| `gemini-4-neon` | Antigravity CLI の Gemini 4 Neon（Low・Medium・High・XHigh） |
+| `gemini-4-hydrogen` | Antigravity CLI の Gemini 4 Hydrogen（Low・Medium・High・XHigh） |
+| `gemini-3.8-flash` | Antigravity CLI の Gemini 3.8 Flash（Low・Medium・High） |
 | その他 | `--upstream-base-url` 指定時は上流。未指定時は Claude CLI |
+
+Antigravity の推論レベルは Codex の設定または API の `reasoning.effort` で指定します。系統名で推論レベルを省略した場合は Medium を使います。
 
 | 引数 | 用途 |
 | --- | --- |

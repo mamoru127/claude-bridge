@@ -41,13 +41,12 @@ DEFAULT_CLAUDE_MODELS = ("opus", "fable", "haiku")
 
 # Antigravity CLI（`agy`）の実行ファイル。未インストールなら該当モデルの実行時だけ失敗する。
 DEFAULT_ANTIGRAVITY_PATH = "agy"
-# agy の正式名をそのまま渡す。利用にはアカウント側のアクセス権が必要。
+# モデル系統ごとに公開し、推論レベルに応じて agy の正式名へ変換する。
 DEFAULT_ANTIGRAVITY_MODELS = (
-    "gemini-4-argon-high",
-    "gemini-4-argon-medium",
-    "gemini-4-neon-high",
-    "gemini-4-hydrogen-high",
-    "gemini-3.8-flash-high",
+    "gemini-4-argon",
+    "gemini-4-neon",
+    "gemini-4-hydrogen",
+    "gemini-3.8-flash",
 )
 
 # 旧版の設定を使うクライアントが上流へ誤転送されないよう、以前の公開名も受け付ける。
@@ -215,6 +214,20 @@ class BridgeConfig:
 
         return self.claude_models + self.antigravity_models
 
+    def _antigravity_model(self, model: str) -> str | None:
+        if model in self.antigravity_models:
+            return model
+        if model in self.claude_models:
+            return None
+        target = LEGACY_MODEL_ALIASES.get(model, model)
+        if target in self.antigravity_models:
+            return target
+        family, _, tier = target.rpartition("-")
+        levels = ANTIGRAVITY_EFFORT_FAMILIES.get(family, ())
+        if family in self.antigravity_models and tier in levels:
+            return target
+        return None
+
     def backend(self, model: str) -> str:
         """このモデルを実行する CLI。中継しない場合は空文字を返す。
 
@@ -223,13 +236,11 @@ class BridgeConfig:
         別名を解釈できないため、既定の受け皿にはできない）。
         """
 
-        if model in self.antigravity_models:
+        if self._antigravity_model(model) is not None:
             return ANTIGRAVITY_BACKEND
         if model in self.claude_models:
             return CLAUDE_BACKEND
         alias = LEGACY_MODEL_ALIASES.get(model)
-        if alias in self.antigravity_models:
-            return ANTIGRAVITY_BACKEND
         if alias in self.claude_models or not self.upstream_base_url:
             return CLAUDE_BACKEND
         return UPSTREAM_BACKEND
@@ -242,6 +253,9 @@ class BridgeConfig:
         実行する。
         """
 
+        antigravity_model = self._antigravity_model(model)
+        if antigravity_model is not None:
+            return _antigravity_cli_model(antigravity_model, reasoning_effort)
         if model not in self.cli_models:
             alias = LEGACY_MODEL_ALIASES.get(model)
             model = alias if alias in self.cli_models else self.model

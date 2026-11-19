@@ -1542,6 +1542,9 @@ class AntigravityModelsTest(BridgeHTTPTestCase):
         entries = {item["id"]: item for item in catalog["data"]}
         self.assertNotIn("gemini-4-carbon-high", entries)
         self.assertNotIn("gemini-4-carbon-medium", entries)
+        self.assertNotIn("gemini-4-argon-high", entries)
+        self.assertNotIn("gemini-4-argon-medium", entries)
+        self.assertNotIn("gemini-4-neon-high", entries)
         for model in DEFAULT_ANTIGRAVITY_MODELS:
             self.assertEqual(entries[model]["owned_by"], "google")
             self.assertEqual(config.backend(model), ANTIGRAVITY_BACKEND)
@@ -1550,7 +1553,9 @@ class AntigravityModelsTest(BridgeHTTPTestCase):
             status, payload = self.post(base_url, {"model": model, "input": "やあ"})
             self.assertEqual(status, 200)
             self.assertEqual(payload["model"], model)
-        self.assertEqual(runner.models_set(), list(DEFAULT_ANTIGRAVITY_MODELS))
+        self.assertEqual(
+            runner.models_set(), [f"{model}-medium" for model in DEFAULT_ANTIGRAVITY_MODELS]
+        )
         self.assertEqual(len(runner.processes), 1)
 
     def test_legacy_carbon_requests_run_argon(self):
@@ -1567,6 +1572,20 @@ class AntigravityModelsTest(BridgeHTTPTestCase):
         self.assertEqual(
             runner.models_set(), ["gemini-4-argon-high", "gemini-4-argon-medium"]
         )
+
+    def test_family_and_explicit_tier_requests_select_the_expected_model(self):
+        config = build_config([], env={})
+        for name, effort, expected in (
+            ("gemini-4-neon", "xhigh", "gemini-4-neon-xhigh"),
+            ("gemini-4-argon", "high", "gemini-4-argon-high"),
+            ("gemini-4-argon-medium", None, "gemini-4-argon-medium"),
+            ("gemini-4-neon-high", None, "gemini-4-neon-high"),
+            ("gemini-4-hydrogen-high", None, "gemini-4-hydrogen-high"),
+            ("gemini-3.8-flash-high", "low", "gemini-3.8-flash-low"),
+        ):
+            with self.subTest(model=name, effort=effort):
+                self.assertEqual(config.backend(name), ANTIGRAVITY_BACKEND)
+                self.assertEqual(config.cli_model(name, effort), expected)
 
     def test_models_include_both_clis(self):
         base_url = self.start_server(
@@ -1636,11 +1655,10 @@ class AntigravityConfigTest(unittest.TestCase):
         self.assertEqual(
             config.antigravity_models,
             (
-                "gemini-4-argon-high",
-                "gemini-4-argon-medium",
-                "gemini-4-neon-high",
-                "gemini-4-hydrogen-high",
-                "gemini-3.8-flash-high",
+                "gemini-4-argon",
+                "gemini-4-neon",
+                "gemini-4-hydrogen",
+                "gemini-3.8-flash",
             ),
         )
 
