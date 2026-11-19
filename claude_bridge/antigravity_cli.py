@@ -73,6 +73,9 @@ DEFAULT_BRAIN_DIR = os.path.join(
 _SUBAGENT_ID_RE = re.compile(r'"conversationId"\s*:\s*"([^"\s]+)"')
 _SENT_TO_RE = re.compile(r'Message sent to "([^"\s]+)"')
 _SENDER_RE = re.compile(r"\[Message\]\s+timestamp=\S+\s+sender=([^\s/]+)(?:\s|$)")
+_BG_TASK_ID_RE = re.compile(r"Tool is running as a background task with task id:\s*([^\s]+)")
+_TASK_DESC_RE = re.compile(r"^Task Description:\s*(.+)$", re.MULTILINE)
+_TASK_SENDER_RE = re.compile(r"\[Message\]\s+timestamp=\S+\s+sender=([^\s]+)(?:\s|$)")
 
 # ツール進捗の 1 行説明に載せる引数の長さ。
 TOOL_DETAIL_CHARS = 200
@@ -631,6 +634,7 @@ class AntigravityClient:
         started_tools: set[str] = set()
         tool_names: dict[str, str] = {}
         pending_tools: set[str] = set()
+        async_tool_used = False
         subagent_used = False
         subagent_marked_at = 0.0
         initial_root_steps = _count_transcript_lines(self._brain_dir, session_id)
@@ -660,7 +664,11 @@ class AntigravityClient:
                     events, failure = _collect_update_events(
                         update, chunks, thoughts, started_tools, tool_names
                     )
-                    _, used_subagent = _track_async_tool(update, tool_names, pending_tools)
+                    _, used_async, used_subagent = _track_async_tool(
+                        update, tool_names, pending_tools
+                    )
+                    if used_async:
+                        async_tool_used = True
                     if used_subagent:
                         subagent_used = True
                         subagent_marked_at = time.monotonic()
@@ -686,8 +694,8 @@ class AntigravityClient:
                     raise _TurnCancelled()
 
                 if pending_tools or (
-                    subagent_used
-                    and _has_pending_subagent(
+                    (async_tool_used or subagent_used)
+                    and _has_pending_transcript_work(
                         self._brain_dir, session_id, initial_root_steps, subagent_marked_at
                     )
                 ):
@@ -704,7 +712,6 @@ class AntigravityClient:
                             started_tools,
                             tool_names,
                             pending_tools,
-                            subagent_used,
                             subagent_marked_at,
                             initial_root_steps,
                             tool_error,
@@ -746,7 +753,6 @@ class AntigravityClient:
         started_tools: set[str],
         tool_names: dict[str, str],
         pending_tools: set[str],
-        subagent_used: bool,
         subagent_marked_at: float,
         initial_root_steps: int,
         tool_error: str,
@@ -755,36 +761,36 @@ class AntigravityClient:
 
         awaiting_wakeup = False
         settled_since: float | None = None
-        subagent_idle_since: float | None = None
+        idle_since: float | None = None
 
         while True:
             now = time.monotonic()
             if pending_tools:
                 settled_since = None
-                subagent_idle_since = None
+                idle_since = None
                 wait_until = deadline
             elif settled_since is not None:
                 wait_until = settled_since + self._wakeup_settle_seconds
                 if now >= wait_until:
-                    if subagent_used and _has_pending_subagent(
+                    if _has_pending_transcript_work(
                         self._brain_dir, session_id, initial_root_steps, subagent_marked_at
                     ):
                         settled_since = None
-                        subagent_idle_since = None
+                        idle_since = None
                         continue
                     return tool_error
             elif awaiting_wakeup:
                 wait_until = deadline
             else:
-                if subagent_used and _has_pending_subagent(
+                if _has_pending_transcript_work(
                     self._brain_dir, session_id, initial_root_steps, subagent_marked_at
                 ):
-                    subagent_idle_since = None
+                    idle_since = None
                     wait_until = now + self._wakeup_poll_seconds
                 else:
-                    if subagent_idle_since is None:
-                        subagent_idle_since = now
-                    wait_until = subagent_idle_since + self._subagent_idle_grace_seconds
+                    if idle_since is None:
+                        idle_since = now
+                    wait_until = idle_since + self._subagent_idle_grace_seconds
                     if now >= wait_until:
                         return tool_error
 
@@ -800,13 +806,14 @@ class AntigravityClient:
             if not isinstance(update, dict):
                 continue
 
-            subagent_idle_since = None
+            idle_since = None
             events, failure = _collect_update_events(
                 update, chunks, thoughts, started_tools, tool_names
             )
-            finished_pending, used_subagent = _track_async_tool(update, tool_names, pending_tools)
+            finished_pending, _, used_subagent = _track_async_tool(
+                update, tool_names, pending_tools
+            )
             if used_subagent:
-                subagent_used = True
                 subagent_marked_at = time.monotonic()
             if finished_pending:
                 awaiting_wakeup = True
@@ -1039,15 +1046,17 @@ def _is_daemon_tool(update: dict) -> bool:
 
 def _track_async_tool(
     update: dict, tool_names: dict[str, str], pending_tools: set[str]
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, bool]:
     """`tool_call` / `tool_call_update` から実行中の非同期ツールとサブエージェント利用を追跡する。"""
 
     if update.get("sessionUpdate") not in ("tool_call", "tool_call_update"):
-        return False, False
+        return False, False, False
     raw_id = update.get("toolCallId")
     call_id = raw_id if isinstance(raw_id, str) and raw_id else ""
     raw_name = update.get("name")
     name = raw_name if isinstance(raw_name, str) and raw_name else tool_names.get(call_id, "")
+    is_daemon = _is_daemon_tool(update)
+    used_async = name in ASYNC_TOOL_NAMES and not is_daemon
     used_subagent = name in SUBAGENT_TOOL_NAMES
     finished_pending = False
     if call_id:
@@ -1056,9 +1065,9 @@ def _track_async_tool(
             if call_id in pending_tools:
                 pending_tools.discard(call_id)
                 finished_pending = True
-        elif name in ASYNC_TOOL_NAMES and not _is_daemon_tool(update):
+        elif used_async:
             pending_tools.add(call_id)
-    return finished_pending, used_subagent
+    return finished_pending, used_async, used_subagent
 
 
 def _transcript_path(brain_dir: str | None, conversation_id: str) -> str:
@@ -1113,13 +1122,62 @@ def _is_fatal_error_step(entry: dict) -> bool:
     )
 
 
-def _has_pending_subagent(
+def _unquote_arg(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        try:
+            decoded = json.loads(text)
+            if isinstance(decoded, str):
+                return decoded.strip()
+        except json.JSONDecodeError:
+            pass
+    return text
+
+
+def _is_daemon_transcript_call(tool_call: object) -> bool:
+    if not isinstance(tool_call, dict):
+        return False
+    args = tool_call.get("args")
+    if not isinstance(args, dict):
+        return False
+    return _unquote_arg(args.get("IsDaemon")).lower() == "true"
+
+
+def _is_conditional_timer_call(tool_call: object) -> bool:
+    if not isinstance(tool_call, dict) or tool_call.get("name") != "schedule":
+        return False
+    args = tool_call.get("args")
+    if not isinstance(args, dict):
+        return False
+    condition = _unquote_arg(args.get("TimerCondition")).lower()
+    return bool(condition) and condition != "never"
+
+
+def _daemon_command_descriptions(tool_calls: list) -> set[str]:
+    descriptions: set[str] = set()
+    for call in tool_calls:
+        if not _is_daemon_transcript_call(call):
+            continue
+        args = call.get("args")
+        if not isinstance(args, dict):
+            continue
+        cmd = _unquote_arg(args.get("CommandLine"))
+        if cmd:
+            descriptions.add(cmd.splitlines()[0].strip())
+    return descriptions
+
+
+def _has_pending_transcript_work(
     brain_dir: str | None,
     session_id: str,
     initial_root_steps: int,
     subagent_marked_at: float,
 ) -> bool:
-    """このターンで起動・送信したサブエージェントが未完了、または親側が再開処理中か判定する。"""
+    """転記ログから未通知のバックグラウンドタスク・未完了サブエージェント・親の継続処理中を判定する。"""
 
     root_path = _transcript_path(brain_dir, session_id)
     if not root_path:
@@ -1128,30 +1186,70 @@ def _has_pending_subagent(
     if not root_entries:
         return False
 
-    dispatched: dict[str, tuple[int, str]] = {}
-    replied: dict[str, int] = {}
+    bg_tasks: dict[str, int] = {}
+    replied_tasks: dict[str, int] = {}
+    dispatched_subagents: dict[str, tuple[int, str]] = {}
+    replied_subagents: dict[str, int] = {}
+    last_tool_calls: list = []
+    daemon_descriptions: set[str] = set()
+    generic_offset = 0
+
     for offset, entry in enumerate(root_entries):
         step_index = entry.get("step_index")
         order = step_index if isinstance(step_index, int) else initial_root_steps + offset
+        entry_type = entry.get("type")
+        if entry_type == "PLANNER_RESPONSE":
+            raw_calls = entry.get("tool_calls")
+            last_tool_calls = raw_calls if isinstance(raw_calls, list) else []
+            daemon_descriptions = _daemon_command_descriptions(last_tool_calls)
+            generic_offset = 0
+            continue
+
         content = entry.get("content")
         if not isinstance(content, str) or not content:
+            if entry_type == "GENERIC":
+                generic_offset += 1
             continue
-        entry_type = entry.get("type")
+
         created_at = str(entry.get("created_at") or "")
         if entry_type == "GENERIC":
+            matched_call = (
+                last_tool_calls[generic_offset] if generic_offset < len(last_tool_calls) else None
+            )
+            generic_offset += 1
             for pattern in (_SUBAGENT_ID_RE, _SENT_TO_RE):
                 for match in pattern.finditer(content):
-                    dispatched[match.group(1)] = (order, created_at)
+                    dispatched_subagents[match.group(1)] = (order, created_at)
+            task_match = _BG_TASK_ID_RE.search(content)
+            if task_match:
+                skip = _is_daemon_transcript_call(matched_call) or _is_conditional_timer_call(
+                    matched_call
+                )
+                if not skip and daemon_descriptions:
+                    desc_match = _TASK_DESC_RE.search(content)
+                    if desc_match and desc_match.group(1).strip() in daemon_descriptions:
+                        skip = True
+                if not skip:
+                    bg_tasks[task_match.group(1)] = order
         elif entry_type == "SYSTEM_MESSAGE":
+            for match in _TASK_SENDER_RE.finditer(content):
+                replied_tasks[match.group(1)] = order
             for match in _SENDER_RE.finditer(content):
-                replied[match.group(1)] = order
+                replied_subagents[match.group(1)] = order
 
-    if not _is_idle_planner_step(root_entries[-1]):
+    last_root = root_entries[-1]
+    if _is_fatal_error_step(last_root):
+        return False
+    if not _is_idle_planner_step(last_root):
         return True
 
+    for task_id, launched_order in bg_tasks.items():
+        if replied_tasks.get(task_id, -1) <= launched_order:
+            return True
+
     now = time.monotonic()
-    for sub_id, (sent_order, sent_created_at) in dispatched.items():
-        if replied.get(sub_id, -1) > sent_order:
+    for sub_id, (sent_order, sent_created_at) in dispatched_subagents.items():
+        if replied_subagents.get(sub_id, -1) > sent_order:
             continue
         sub_path = _transcript_path(brain_dir, sub_id)
         sub_entries = _read_transcript_entries(sub_path)

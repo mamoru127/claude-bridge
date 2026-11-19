@@ -2108,6 +2108,276 @@ class AntigravityAsyncWakeupTest(unittest.TestCase):
         self.assertEqual(runner.processes[0].killed, 0)
         self.assertEqual(len(runner.requests_for("session/cancel")), 1)
 
+    def test_background_task_completing_during_progress_message_waits_for_wakeup_reply(self):
+        with tempfile.TemporaryDirectory() as brain_dir:
+            root_id = "conv-race"
+            task1 = f"{root_id}/task-2"
+            task2 = f"{root_id}/task-6"
+
+            def write_steps(steps: list[dict]) -> None:
+                self.write_transcript(brain_dir, root_id, steps)
+
+            base_steps = [
+                {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "content": "run"},
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": '"step1"'}}],
+                },
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "status": "RUNNING",
+                    "content": f"Tool is running as a background task with task id: {task1}\nTask Description: step1",
+                },
+                {
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "1段目待ち。",
+                },
+            ]
+
+            def on_after_end_turn(proc: FakeAcpProcess, sid: str) -> None:
+                time.sleep(0.02)
+                proc.emit(tool_update_notice("run_command", status="completed", call_id="bg1", session_id=sid))
+                steps = [
+                    *base_steps,
+                    {
+                        "step_index": 4,
+                        "type": "SYSTEM_MESSAGE",
+                        "status": "DONE",
+                        "content": f"[Message] timestamp=2026-11-20T00:00:10Z sender={task1} content=ok",
+                    },
+                    {
+                        "step_index": 5,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "tool_calls": [{"name": "run_command", "args": {"CommandLine": '"step2"'}}],
+                    },
+                    {
+                        "step_index": 6,
+                        "type": "GENERIC",
+                        "status": "RUNNING",
+                        "content": f"Tool is running as a background task with task id: {task2}\nTask Description: step2",
+                    },
+                ]
+                write_steps(steps)
+                proc.emit(usage_update(140, session_id=sid))
+                proc.emit(tool_call_notice("run_command", {"CommandLine": "step2"}, call_id="bg2", session_id=sid))
+                time.sleep(0.02)
+                # 途中経過メッセージの生成中に 2 段目コマンドが完了し、pending_tools が先に空になる。
+                proc.emit(tool_update_notice("run_command", status="completed", call_id="bg2", session_id=sid))
+                time.sleep(0.02)
+                proc.emit(message_chunk("\n2段目を撮影中です。", session_id=sid))
+                proc.emit(usage_update(160, session_id=sid))
+                steps = [
+                    *steps,
+                    {
+                        "step_index": 7,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "content": "2段目を撮影中です。",
+                    },
+                    {
+                        "step_index": 8,
+                        "type": "SYSTEM_MESSAGE",
+                        "status": "DONE",
+                        "content": f"[Message] timestamp=2026-11-20T00:00:15Z sender={task2} content=ok",
+                    },
+                ]
+                write_steps(steps)
+                # wakeup_settle_seconds (0.05s) より十分長く待ってから最終応答が届く。
+                time.sleep(0.18)
+                steps = [
+                    *steps,
+                    {
+                        "step_index": 9,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "content": "すべて完了しました。",
+                    },
+                ]
+                write_steps(steps)
+                proc.emit(message_chunk("\nすべて完了しました。", session_id=sid))
+                proc.emit(usage_update(200, session_id=sid))
+
+            runner = FakeAcpRunner(
+                [
+                    prompt_turn(
+                        "",
+                        tool_call_notice("run_command", {"CommandLine": "step1"}, call_id="bg1"),
+                        message_chunk("1段目待ち。"),
+                        usage_update(100),
+                        after_end_turn=on_after_end_turn,
+                    )
+                ],
+                session_ids=[root_id],
+            )
+            orig_handle = runner.handle
+
+            def handle_with_initial(proc, message):
+                if message.get("method") == "session/prompt":
+                    write_steps(base_steps)
+                orig_handle(proc, message)
+
+            runner.handle = handle_with_initial
+            client = self.make_client(runner, brain_dir=brain_dir)
+            events = list(client.stream(agy_config(), "2段実行", Session()))
+
+            self.assertEqual(
+                events[-1],
+                ("text", "1段目待ち。\n2段目を撮影中です。\nすべて完了しました。"),
+            )
+
+    def test_compaction_checkpoint_usage_update_does_not_end_turn_early(self):
+        with tempfile.TemporaryDirectory() as brain_dir:
+            root_id = "conv-compact"
+            task1 = f"{root_id}/task-2"
+
+            base_steps = [
+                {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "content": "run"},
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": '"capture"'}}],
+                },
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "status": "RUNNING",
+                    "content": f"Tool is running as a background task with task id: {task1}\nTask Description: capture",
+                },
+                {
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "撮影中です。",
+                },
+            ]
+
+            def on_after_end_turn(proc: FakeAcpProcess, sid: str) -> None:
+                time.sleep(0.02)
+                proc.emit(tool_update_notice("run_command", status="completed", call_id="bg1", session_id=sid))
+                steps = [
+                    *base_steps,
+                    {
+                        "step_index": 4,
+                        "type": "SYSTEM_MESSAGE",
+                        "status": "DONE",
+                        "content": f"[Message] timestamp=2026-11-20T00:00:10Z sender={task1} content=ok",
+                    },
+                    {
+                        "step_index": 5,
+                        "type": "CHECKPOINT",
+                        "status": "DONE",
+                        "content": "# Resuming from a compaction",
+                    },
+                ]
+                self.write_transcript(brain_dir, root_id, steps)
+                # compaction 完了時の usage_update が届き、次のツール呼び出しまで settle 時間より長く空く。
+                proc.emit(usage_update(80, session_id=sid))
+                time.sleep(0.18)
+                steps = [
+                    *steps,
+                    {
+                        "step_index": 6,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "content": "スクショを確認しました。",
+                    },
+                ]
+                self.write_transcript(brain_dir, root_id, steps)
+                proc.emit(message_chunk("\nスクショを確認しました。", session_id=sid))
+                proc.emit(usage_update(120, session_id=sid))
+
+            runner = FakeAcpRunner(
+                [
+                    prompt_turn(
+                        "",
+                        tool_call_notice("run_command", {"CommandLine": "capture"}, call_id="bg1"),
+                        message_chunk("撮影中です。"),
+                        usage_update(100),
+                        after_end_turn=on_after_end_turn,
+                    )
+                ],
+                session_ids=[root_id],
+            )
+            orig_handle = runner.handle
+
+            def handle_with_initial(proc, message):
+                if message.get("method") == "session/prompt":
+                    self.write_transcript(brain_dir, root_id, base_steps)
+                orig_handle(proc, message)
+
+            runner.handle = handle_with_initial
+            client = self.make_client(runner, brain_dir=brain_dir)
+            events = list(client.stream(agy_config(), "スクショくれ", Session()))
+
+            self.assertEqual(events[-1], ("text", "撮影中です。\nスクショを確認しました。"))
+
+    def test_daemon_background_task_in_transcript_does_not_block_completion(self):
+        with tempfile.TemporaryDirectory() as brain_dir:
+            root_id = "conv-daemon"
+            daemon_task = f"{root_id}/task-2"
+
+            steps = [
+                {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "content": "start"},
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {"CommandLine": '"sleep 60"', "IsDaemon": "true"},
+                        }
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "status": "RUNNING",
+                    "content": f"Tool is running as a background task with task id: {daemon_task}\nTask Description: sleep 60",
+                },
+                {
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "デーモンを起動しました。",
+                },
+            ]
+
+            runner = FakeAcpRunner(
+                [
+                    prompt_turn(
+                        "",
+                        tool_call_notice(
+                            "run_command",
+                            {"CommandLine": "sleep 60", "IsDaemon": True},
+                            call_id="d1",
+                        ),
+                        message_chunk("デーモンを起動しました。"),
+                        usage_update(100),
+                    )
+                ],
+                session_ids=[root_id],
+            )
+            orig_handle = runner.handle
+
+            def handle_with_initial(proc, message):
+                if message.get("method") == "session/prompt":
+                    self.write_transcript(brain_dir, root_id, steps)
+                orig_handle(proc, message)
+
+            runner.handle = handle_with_initial
+            client = self.make_client(runner, brain_dir=brain_dir)
+            events = list(client.stream(agy_config(timeout_seconds=1.0), "起動して", Session()))
+
+            self.assertEqual(events[-1], ("text", "デーモンを起動しました。"))
+
 
 class ClaudeRegressionTest(BridgeHTTPTestCase):
     """Antigravity を ACP 常駐に変えても Claude 側の経路が変わらないこと。"""
