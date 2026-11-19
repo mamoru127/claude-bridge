@@ -45,6 +45,7 @@ DEFAULT_ANTIGRAVITY_PATH = "agy"
 DEFAULT_ANTIGRAVITY_MODELS = (
     "gemini-4-argon-high",
     "gemini-4-argon-medium",
+    "gemini-4-neon-high",
     "gemini-4-hydrogen-high",
     "gemini-3.8-flash-high",
 )
@@ -63,6 +64,7 @@ LEGACY_MODEL_ALIASES = {
 ANTIGRAVITY_EFFORT_FAMILIES = {
     "gemini-4-argon": ("low", "medium", "high"),
     "gemini-4-carbon": ("low", "medium", "high"),
+    "gemini-4-neon": ("low", "medium", "high", "xhigh"),
     "gemini-4-hydrogen": ("low", "medium", "high", "xhigh"),
     "gemini-3.8-flash": ("low", "medium", "high"),
 }

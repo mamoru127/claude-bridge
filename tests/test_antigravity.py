@@ -1638,6 +1638,7 @@ class AntigravityConfigTest(unittest.TestCase):
             (
                 "gemini-4-argon-high",
                 "gemini-4-argon-medium",
+                "gemini-4-neon-high",
                 "gemini-4-hydrogen-high",
                 "gemini-3.8-flash-high",
             ),
