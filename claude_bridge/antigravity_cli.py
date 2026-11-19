@@ -32,6 +32,7 @@ import contextlib
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -53,6 +54,25 @@ PROTOCOL_VERSION = 1
 # `session/cancel` や `stdin` クローズに対して、プロセス強制終了へ切り替えるまでの猶予。
 # 正常な `agy acp` は数ミリ秒で応答するため、無応答で固まったときだけここを使い切る。
 CANCEL_GRACE_SECONDS = 0.2
+
+# `agy acp` はバックグラウンドタスクやサブエージェントの完了待ちへ入った時点で
+# `session/prompt` に `stopReason="end_turn"` を返すが、完了通知による自動再開の経過は
+# 同じ接続の `session/update` として後から届く。非同期タスクが残っている間はここで
+# 待機し、再開ステップの `usage_update` 後に後続の `tool_call` が来ないことを確かめて終える。
+ASYNC_TOOL_NAMES = frozenset({"run_command", "schedule", "run_workflow"})
+SUBAGENT_TOOL_NAMES = frozenset({"invoke_subagent", "send_message", "swarm"})
+TERMINAL_TOOL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+WAKEUP_SETTLE_SECONDS = 0.5
+WAKEUP_POLL_SECONDS = 0.5
+SUBAGENT_START_GRACE_SECONDS = 5.0
+SUBAGENT_IDLE_GRACE_SECONDS = 1.5
+DEFAULT_BRAIN_DIR = os.path.join(
+    os.path.expanduser("~"), ".gemini", "antigravity-cli", "brain"
+)
+
+_SUBAGENT_ID_RE = re.compile(r'"conversationId"\s*:\s*"([^"\s]+)"')
+_SENT_TO_RE = re.compile(r'Message sent to "([^"\s]+)"')
+_SENDER_RE = re.compile(r"\[Message\]\s+timestamp=\S+\s+sender=([^\s/]+)(?:\s|$)")
 
 # ツール進捗の 1 行説明に載せる引数の長さ。
 TOOL_DETAIL_CHARS = 200
@@ -124,18 +144,34 @@ class _Waiter:
             box.put(_CANCEL)
 
     def take(self, conn: "_AcpConnection", box: queue.Queue, deadline: float) -> dict:
+        item = self.take_optional(conn, box, deadline, deadline)
+        assert item is not None
+        return item
+
+    def take_optional(
+        self,
+        conn: "_AcpConnection",
+        box: queue.Queue,
+        wait_until: float,
+        hard_deadline: float,
+    ) -> dict | None:
         with self._lock:
             if self._cancelled:
                 raise _TurnCancelled()
             self._box = box
         try:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            now = time.monotonic()
+            if now >= hard_deadline:
                 raise _TurnTimeout()
+            remaining = min(wait_until, hard_deadline) - now
+            if remaining <= 0:
+                return None
             try:
                 item = box.get(timeout=remaining)
             except queue.Empty as error:
-                raise _TurnTimeout() from error
+                if time.monotonic() >= hard_deadline:
+                    raise _TurnTimeout() from error
+                return None
         finally:
             with self._lock:
                 if self._box is box:
@@ -370,9 +406,22 @@ class _AcpConnection:
 class AntigravityClient:
     """常駐する `agy acp` への接続を保持し、複数スレッドのターンを多重化する。"""
 
-    def __init__(self, config: BridgeConfig, runner=subprocess.Popen) -> None:
+    def __init__(
+        self,
+        config: BridgeConfig,
+        runner=subprocess.Popen,
+        *,
+        brain_dir: str | None = DEFAULT_BRAIN_DIR,
+        wakeup_settle_seconds: float = WAKEUP_SETTLE_SECONDS,
+        wakeup_poll_seconds: float = WAKEUP_POLL_SECONDS,
+        subagent_idle_grace_seconds: float = SUBAGENT_IDLE_GRACE_SECONDS,
+    ) -> None:
         self._default_config = config
         self._runner = runner
+        self._brain_dir = brain_dir
+        self._wakeup_settle_seconds = wakeup_settle_seconds
+        self._wakeup_poll_seconds = wakeup_poll_seconds
+        self._subagent_idle_grace_seconds = subagent_idle_grace_seconds
         self._conn: _AcpConnection | None = None
         self._lock = threading.RLock()
 
@@ -575,11 +624,16 @@ class AntigravityClient:
         turn_box = conn.begin_prompt(session_id)
         prompt_id: int | None = None
         prompt_done = False
+        waiting_wakeup = False
         confirmed = False
         chunks: list[str] = []
         thoughts: list[str] = []
         started_tools: set[str] = set()
         tool_names: dict[str, str] = {}
+        pending_tools: set[str] = set()
+        subagent_used = False
+        subagent_marked_at = 0.0
+        initial_root_steps = _count_transcript_lines(self._brain_dir, session_id)
         tool_error = ""
 
         try:
@@ -606,6 +660,10 @@ class AntigravityClient:
                     events, failure = _collect_update_events(
                         update, chunks, thoughts, started_tools, tool_names
                     )
+                    _, used_subagent = _track_async_tool(update, tool_names, pending_tools)
+                    if used_subagent:
+                        subagent_used = True
+                        subagent_marked_at = time.monotonic()
                     tool_error = failure or tool_error
                     yield from events
                     continue
@@ -627,6 +685,33 @@ class AntigravityClient:
                 if stop_reason == "cancelled":
                     raise _TurnCancelled()
 
+                if pending_tools or (
+                    subagent_used
+                    and _has_pending_subagent(
+                        self._brain_dir, session_id, initial_root_steps, subagent_marked_at
+                    )
+                ):
+                    waiting_wakeup = True
+                    tool_error = (
+                        yield from self._wait_for_async_wakeups(
+                            conn,
+                            turn_box,
+                            session_id,
+                            waiter,
+                            deadline,
+                            chunks,
+                            thoughts,
+                            started_tools,
+                            tool_names,
+                            pending_tools,
+                            subagent_used,
+                            subagent_marked_at,
+                            initial_root_steps,
+                            tool_error,
+                        )
+                    )
+                    waiting_wakeup = False
+
                 yield from _flush_thoughts(thoughts)
                 text = "".join(chunks)
                 if not text.strip() and tool_error:
@@ -645,7 +730,97 @@ class AntigravityClient:
                 )
                 if not prompt_done and conn.failure is None:
                     conn.kill()
+            elif waiting_wakeup and conn.failure is None:
+                conn.notify("session/cancel", {"sessionId": session_id})
             conn.end_prompt(session_id, prompt_id)
+
+    def _wait_for_async_wakeups(
+        self,
+        conn: _AcpConnection,
+        turn_box: queue.Queue,
+        session_id: str,
+        waiter: _Waiter,
+        deadline: float,
+        chunks: list[str],
+        thoughts: list[str],
+        started_tools: set[str],
+        tool_names: dict[str, str],
+        pending_tools: set[str],
+        subagent_used: bool,
+        subagent_marked_at: float,
+        initial_root_steps: int,
+        tool_error: str,
+    ) -> Iterator[tuple[str, str]]:
+        """`end_turn` 後に残っている非同期タスク・サブエージェントの完了と自動再開を待ち受ける。"""
+
+        awaiting_wakeup = False
+        settled_since: float | None = None
+        subagent_idle_since: float | None = None
+
+        while True:
+            now = time.monotonic()
+            if pending_tools:
+                settled_since = None
+                subagent_idle_since = None
+                wait_until = deadline
+            elif settled_since is not None:
+                wait_until = settled_since + self._wakeup_settle_seconds
+                if now >= wait_until:
+                    if subagent_used and _has_pending_subagent(
+                        self._brain_dir, session_id, initial_root_steps, subagent_marked_at
+                    ):
+                        settled_since = None
+                        subagent_idle_since = None
+                        continue
+                    return tool_error
+            elif awaiting_wakeup:
+                wait_until = deadline
+            else:
+                if subagent_used and _has_pending_subagent(
+                    self._brain_dir, session_id, initial_root_steps, subagent_marked_at
+                ):
+                    subagent_idle_since = None
+                    wait_until = now + self._wakeup_poll_seconds
+                else:
+                    if subagent_idle_since is None:
+                        subagent_idle_since = now
+                    wait_until = subagent_idle_since + self._subagent_idle_grace_seconds
+                    if now >= wait_until:
+                        return tool_error
+
+            item = waiter.take_optional(conn, turn_box, wait_until, deadline)
+            if item is None:
+                continue
+            if item.get("method") != "session/update":
+                continue
+            params = item.get("params")
+            if not isinstance(params, dict) or params.get("sessionId") != session_id:
+                continue
+            update = params.get("update")
+            if not isinstance(update, dict):
+                continue
+
+            subagent_idle_since = None
+            events, failure = _collect_update_events(
+                update, chunks, thoughts, started_tools, tool_names
+            )
+            finished_pending, used_subagent = _track_async_tool(update, tool_names, pending_tools)
+            if used_subagent:
+                subagent_used = True
+                subagent_marked_at = time.monotonic()
+            if finished_pending:
+                awaiting_wakeup = True
+                settled_since = None
+            tool_error = failure or tool_error
+            yield from events
+
+            kind = update.get("sessionUpdate")
+            if kind == "usage_update":
+                awaiting_wakeup = False
+                settled_since = None if pending_tools else time.monotonic()
+            elif kind in ("tool_call", "tool_call_update", "agent_thought_chunk", "agent_message_chunk"):
+                awaiting_wakeup = True
+                settled_since = None
 
 
 def stream_antigravity(
@@ -850,3 +1025,150 @@ def _error_text(error: object) -> str:
     if not isinstance(error, str):
         error = json.dumps(error, ensure_ascii=False)
     return error[:STDERR_SNIPPET_BYTES]
+
+
+def _is_daemon_tool(update: dict) -> bool:
+    """常駐デーモン起動（`IsDaemon=true`）かどうか。終了を待たない対象を除外する。"""
+
+    for key in ("args", "rawInput"):
+        mapping = update.get(key)
+        if isinstance(mapping, dict) and mapping.get("IsDaemon") is True:
+            return True
+    return False
+
+
+def _track_async_tool(
+    update: dict, tool_names: dict[str, str], pending_tools: set[str]
+) -> tuple[bool, bool]:
+    """`tool_call` / `tool_call_update` から実行中の非同期ツールとサブエージェント利用を追跡する。"""
+
+    if update.get("sessionUpdate") not in ("tool_call", "tool_call_update"):
+        return False, False
+    raw_id = update.get("toolCallId")
+    call_id = raw_id if isinstance(raw_id, str) and raw_id else ""
+    raw_name = update.get("name")
+    name = raw_name if isinstance(raw_name, str) and raw_name else tool_names.get(call_id, "")
+    used_subagent = name in SUBAGENT_TOOL_NAMES
+    finished_pending = False
+    if call_id:
+        status = update.get("status")
+        if status in TERMINAL_TOOL_STATUSES:
+            if call_id in pending_tools:
+                pending_tools.discard(call_id)
+                finished_pending = True
+        elif name in ASYNC_TOOL_NAMES and not _is_daemon_tool(update):
+            pending_tools.add(call_id)
+    return finished_pending, used_subagent
+
+
+def _transcript_path(brain_dir: str | None, conversation_id: str) -> str:
+    if not brain_dir or not conversation_id:
+        return ""
+    return os.path.join(
+        brain_dir, conversation_id, ".system_generated", "logs", "transcript.jsonl"
+    )
+
+
+def _count_transcript_lines(brain_dir: str | None, conversation_id: str) -> int:
+    path = _transcript_path(brain_dir, conversation_id)
+    if not path:
+        return 0
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return sum(1 for _ in handle)
+    except OSError:
+        return 0
+
+
+def _read_transcript_entries(path: str, start_line: int = 0) -> list[dict]:
+    entries: list[dict] = []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for index, line in enumerate(handle):
+                if index < start_line or not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    entries.append(item)
+    except OSError:
+        return []
+    return entries
+
+
+def _is_idle_planner_step(entry: dict) -> bool:
+    return (
+        entry.get("type") == "PLANNER_RESPONSE"
+        and entry.get("status") == "DONE"
+        and not entry.get("tool_calls")
+    )
+
+
+def _is_fatal_error_step(entry: dict) -> bool:
+    return (
+        entry.get("type") == "ERROR_MESSAGE"
+        and "attempt " not in str(entry.get("error", ""))
+    )
+
+
+def _has_pending_subagent(
+    brain_dir: str | None,
+    session_id: str,
+    initial_root_steps: int,
+    subagent_marked_at: float,
+) -> bool:
+    """このターンで起動・送信したサブエージェントが未完了、または親側が再開処理中か判定する。"""
+
+    root_path = _transcript_path(brain_dir, session_id)
+    if not root_path:
+        return False
+    root_entries = _read_transcript_entries(root_path, initial_root_steps)
+    if not root_entries:
+        return False
+
+    dispatched: dict[str, tuple[int, str]] = {}
+    replied: dict[str, int] = {}
+    for offset, entry in enumerate(root_entries):
+        step_index = entry.get("step_index")
+        order = step_index if isinstance(step_index, int) else initial_root_steps + offset
+        content = entry.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        entry_type = entry.get("type")
+        created_at = str(entry.get("created_at") or "")
+        if entry_type == "GENERIC":
+            for pattern in (_SUBAGENT_ID_RE, _SENT_TO_RE):
+                for match in pattern.finditer(content):
+                    dispatched[match.group(1)] = (order, created_at)
+        elif entry_type == "SYSTEM_MESSAGE":
+            for match in _SENDER_RE.finditer(content):
+                replied[match.group(1)] = order
+
+    if not _is_idle_planner_step(root_entries[-1]):
+        return True
+
+    now = time.monotonic()
+    for sub_id, (sent_order, sent_created_at) in dispatched.items():
+        if replied.get(sub_id, -1) > sent_order:
+            continue
+        sub_path = _transcript_path(brain_dir, sub_id)
+        sub_entries = _read_transcript_entries(sub_path)
+        if not sub_entries:
+            if now - subagent_marked_at < SUBAGENT_START_GRACE_SECONDS:
+                return True
+            continue
+        last_sub = sub_entries[-1]
+        last_created_at = str(last_sub.get("created_at") or "")
+        if (
+            sent_created_at
+            and last_created_at
+            and last_created_at < sent_created_at
+            and now - subagent_marked_at < SUBAGENT_START_GRACE_SECONDS
+        ):
+            return True
+        if _is_idle_planner_step(last_sub) or _is_fatal_error_step(last_sub):
+            continue
+        return True
+    return False

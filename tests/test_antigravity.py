@@ -8,8 +8,10 @@
 
 import io
 import json
+import os
 import queue
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -135,6 +137,7 @@ def prompt_turn(
     error: object = None,
     hold: bool = False,
     ignore_cancel: bool = False,
+    after_end_turn=None,
 ) -> dict:
     """FakeAcpRunner に積む 1 回分の `session/prompt` の振る舞い。"""
 
@@ -145,6 +148,7 @@ def prompt_turn(
         "error": error,
         "hold": hold,
         "ignore_cancel": ignore_cancel,
+        "after_end_turn": after_end_turn,
     }
 
 
@@ -379,6 +383,18 @@ class FakeAcpRunner:
                     "result": {"stopReason": turn["stop_reason"]},
                 }
             )
+            after = turn.get("after_end_turn")
+            if after is not None:
+                def run_after(proc=process, sid=session_id, hook=after):
+                    if callable(hook):
+                        hook(proc, sid)
+                        return
+                    for delay, raw_notice in hook:
+                        if delay:
+                            time.sleep(delay)
+                        proc.emit(_rebind_session(raw_notice, sid))
+
+                threading.Thread(target=run_after, daemon=True).start()
 
     def _resolve_resume(self, target: str) -> str | None:
         if isinstance(self._resumable, dict):
@@ -560,7 +576,13 @@ class AntigravityStreamTest(unittest.TestCase):
 
     def test_tool_detail_is_truncated(self):
         runner = FakeAcpRunner(
-            [prompt_turn("done", tool_call_notice("run_command", {"CommandLine": "x" * 5000}))]
+            [
+                prompt_turn(
+                    "done",
+                    tool_call_notice("run_command", {"CommandLine": "x" * 5000}, call_id="c1"),
+                    tool_update_notice("run_command", status="completed", call_id="c1"),
+                )
+            ]
         )
 
         self.assertLess(len(self.run_stream(runner)[0][1]), 300)
@@ -989,7 +1011,13 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
 
     def test_stream_shows_tool_progress_as_reasoning(self):
         runner = FakeAcpRunner(
-            [prompt_turn("完了", tool_call_notice("run_command", {"CommandLine": "ls -la"}))]
+            [
+                prompt_turn(
+                    "完了",
+                    tool_call_notice("run_command", {"CommandLine": "ls -la"}, call_id="c1"),
+                    tool_update_notice("run_command", status="completed", call_id="c1"),
+                )
+            ]
         )
         base_url = self.start_server(agy_config(), runner)
 
@@ -1693,6 +1721,392 @@ class AntigravityConfigTest(unittest.TestCase):
     def test_models_without_an_executable_path_are_rejected(self):
         with self.assertRaises(ValueError):
             build_config(["--antigravity-path", ""], env={})
+
+
+class AntigravityAsyncWakeupTest(unittest.TestCase):
+    """`agy acp` が非同期タスクやサブエージェント待ちで早期に `end_turn` を返しても完了まで追う。"""
+
+    def make_client(self, runner, brain_dir: str | None = None) -> AntigravityClient:
+        client = AntigravityClient(
+            agy_config(),
+            runner,
+            brain_dir=brain_dir,
+            wakeup_settle_seconds=0.05,
+            wakeup_poll_seconds=0.02,
+            subagent_idle_grace_seconds=0.08,
+        )
+        self.addCleanup(client.close)
+        return client
+
+    def write_transcript(self, brain_dir: str, conv_id: str, entries: list[dict]) -> None:
+        path = os.path.join(brain_dir, conv_id, ".system_generated", "logs", "transcript.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def test_background_run_command_waits_past_end_turn_and_follows_multistep_wakeup(self):
+        runner = FakeAcpRunner(
+            [
+                prompt_turn(
+                    "",
+                    tool_call_notice("run_command", {"CommandLine": "build.sh"}, call_id="bg1"),
+                    message_chunk("ビルド完了を待ちます。"),
+                    usage_update(100),
+                    after_end_turn=[
+                        (0.03, tool_update_notice("run_command", status="completed", call_id="bg1")),
+                        (0.02, usage_update(150)),
+                        (0.002, tool_call_notice("read_file", {"Path": "result.png"}, call_id="r1")),
+                        (0.01, tool_update_notice("read_file", status="completed", call_id="r1")),
+                        (0.08, message_chunk("\n\nビルドと画像確認が完了しました。")),
+                        (0.01, usage_update(200)),
+                    ],
+                )
+            ]
+        )
+        client = self.make_client(runner)
+        events = list(client.stream(agy_config(), "ビルドして", Session()))
+
+        self.assertEqual(
+            events,
+            [
+                ("reasoning", "**run_command を実行中**\nbuild.sh"),
+                ("delta", "ビルド完了を待ちます。"),
+                ("reasoning", "**read_file を実行中**\nresult.png"),
+                ("delta", "\n\nビルドと画像確認が完了しました。"),
+                ("text", "ビルド完了を待ちます。\n\nビルドと画像確認が完了しました。"),
+            ],
+        )
+
+    def test_chained_background_tasks_wait_until_all_finish(self):
+        runner = FakeAcpRunner(
+            [
+                prompt_turn(
+                    "",
+                    tool_call_notice("run_command", {"CommandLine": "step1"}, call_id="bg1"),
+                    message_chunk("1段目待ち。"),
+                    usage_update(100),
+                    after_end_turn=[
+                        (0.02, tool_update_notice("run_command", status="completed", call_id="bg1")),
+                        (0.02, usage_update(140)),
+                        (0.002, tool_call_notice("run_command", {"CommandLine": "step2"}, call_id="bg2")),
+                        (0.02, message_chunk("\n2段目待ち。")),
+                        (0.01, usage_update(160)),
+                        (0.08, tool_update_notice("run_command", status="completed", call_id="bg2")),
+                        (0.02, message_chunk("\n全完了。")),
+                        (0.01, usage_update(200)),
+                    ],
+                )
+            ]
+        )
+        client = self.make_client(runner)
+        events = list(client.stream(agy_config(), "2段実行", Session()))
+
+        self.assertEqual(events[-1], ("text", "1段目待ち。\n2段目待ち。\n全完了。"))
+
+    def test_daemon_run_command_does_not_wait_after_end_turn(self):
+        runner = FakeAcpRunner(
+            [
+                prompt_turn(
+                    "",
+                    tool_call_notice(
+                        "run_command",
+                        {"CommandLine": "dev-server", "IsDaemon": True},
+                        call_id="d1",
+                    ),
+                    message_chunk("起動しました。"),
+                    usage_update(100),
+                )
+            ]
+        )
+        client = self.make_client(runner)
+        events = list(client.stream(agy_config(timeout_seconds=1.0), "起動して", Session()))
+
+        self.assertEqual(events[-1], ("text", "起動しました。"))
+
+    def test_schedule_timer_waits_past_end_turn(self):
+        runner = FakeAcpRunner(
+            [
+                prompt_turn(
+                    "",
+                    tool_call_notice("schedule", {"DurationSeconds": 5, "Prompt": "check"}, call_id="t1"),
+                    message_chunk("タイマー待ち。"),
+                    usage_update(100),
+                    after_end_turn=[
+                        (0.03, tool_update_notice("schedule", status="completed", call_id="t1")),
+                        (0.02, message_chunk("\nタイマー完了。")),
+                        (0.01, usage_update(130)),
+                    ],
+                )
+            ]
+        )
+        client = self.make_client(runner)
+        events = list(client.stream(agy_config(), "待って", Session()))
+
+        self.assertEqual(events[-1], ("text", "タイマー待ち。\nタイマー完了。"))
+
+    def test_send_message_to_subagent_waits_until_subagent_replies_and_wakeup_finishes(self):
+        with tempfile.TemporaryDirectory() as brain_dir:
+            root_id = "conv-root"
+            sub_id = "sub-image-1"
+            self.write_transcript(
+                brain_dir,
+                root_id,
+                [
+                    {
+                        "step_index": 0,
+                        "type": "GENERIC",
+                        "status": "DONE",
+                        "created_at": "2026-11-19T14:00:00Z",
+                        "content": f'Message sent to "{sub_id}".',
+                    },
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-19T14:00:01Z",
+                        "content": "3素材の完了を待ちます。",
+                    },
+                ],
+            )
+            self.write_transcript(
+                brain_dir,
+                sub_id,
+                [
+                    {
+                        "step_index": 0,
+                        "type": "SYSTEM_MESSAGE",
+                        "status": "DONE",
+                        "created_at": "2026-11-19T14:00:01Z",
+                        "content": "generate",
+                    },
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-19T14:00:02Z",
+                        "tool_calls": [{"name": "generate_image"}],
+                    },
+                ],
+            )
+
+            def on_after_end_turn(proc: FakeAcpProcess, sid: str) -> None:
+                time.sleep(0.06)
+                self.write_transcript(
+                    brain_dir,
+                    sub_id,
+                    [
+                        {
+                            "step_index": 0,
+                            "type": "SYSTEM_MESSAGE",
+                            "status": "DONE",
+                            "created_at": "2026-11-19T14:00:01Z",
+                            "content": "generate",
+                        },
+                        {
+                            "step_index": 2,
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": "2026-11-19T14:00:10Z",
+                            "content": "done",
+                        },
+                    ],
+                )
+                self.write_transcript(
+                    brain_dir,
+                    root_id,
+                    [
+                        {
+                            "step_index": 0,
+                            "type": "GENERIC",
+                            "status": "DONE",
+                            "created_at": "2026-11-19T14:00:00Z",
+                            "content": f'Message sent to "{sub_id}".',
+                        },
+                        {
+                            "step_index": 1,
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": "2026-11-19T14:00:01Z",
+                            "content": "3素材の完了を待ちます。",
+                        },
+                        {
+                            "step_index": 2,
+                            "type": "SYSTEM_MESSAGE",
+                            "status": "DONE",
+                            "created_at": "2026-11-19T14:00:10Z",
+                            "content": f"[Message] timestamp=2026-11-19T14:00:10Z sender={sub_id} content=done",
+                        },
+                    ],
+                )
+                time.sleep(0.05)
+                self.write_transcript(
+                    brain_dir,
+                    root_id,
+                    [
+                        {
+                            "step_index": 0,
+                            "type": "GENERIC",
+                            "status": "DONE",
+                            "created_at": "2026-11-19T14:00:00Z",
+                            "content": f'Message sent to "{sub_id}".',
+                        },
+                        {
+                            "step_index": 1,
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": "2026-11-19T14:00:01Z",
+                            "content": "3素材の完了を待ちます。",
+                        },
+                        {
+                            "step_index": 2,
+                            "type": "SYSTEM_MESSAGE",
+                            "status": "DONE",
+                            "created_at": "2026-11-19T14:00:10Z",
+                            "content": f"[Message] timestamp=2026-11-19T14:00:10Z sender={sub_id} content=done",
+                        },
+                        {
+                            "step_index": 3,
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "created_at": "2026-11-19T14:00:12Z",
+                            "content": "3素材を取り込みました。",
+                        },
+                    ],
+                )
+                proc.emit(message_chunk("\n\n3素材を取り込みました。", session_id=sid))
+                proc.emit(usage_update(220, session_id=sid))
+
+            runner = FakeAcpRunner(
+                [
+                    prompt_turn(
+                        "",
+                        tool_call_notice("send_message", {"Recipient": sub_id}, call_id="s1"),
+                        tool_update_notice("send_message", status="completed", call_id="s1"),
+                        message_chunk("3素材の完了を待ちます。"),
+                        usage_update(100),
+                        after_end_turn=on_after_end_turn,
+                    )
+                ],
+                session_ids=[root_id],
+            )
+            client = self.make_client(runner, brain_dir=brain_dir)
+            # 事前書き込みを「このターンで増えた行」として読ませるため、ターン開始前には空にしておく。
+            os.remove(
+                os.path.join(brain_dir, root_id, ".system_generated", "logs", "transcript.jsonl")
+            )
+            orig_handle = runner.handle
+
+            def handle_with_root_write(proc, message):
+                if message.get("method") == "session/prompt":
+                    self.write_transcript(
+                        brain_dir,
+                        root_id,
+                        [
+                            {
+                                "step_index": 0,
+                                "type": "GENERIC",
+                                "status": "DONE",
+                                "created_at": "2026-11-19T14:00:00Z",
+                                "content": f'Message sent to "{sub_id}".',
+                            },
+                            {
+                                "step_index": 1,
+                                "type": "PLANNER_RESPONSE",
+                                "status": "DONE",
+                                "created_at": "2026-11-19T14:00:01Z",
+                                "content": "3素材の完了を待ちます。",
+                            },
+                        ],
+                    )
+                orig_handle(proc, message)
+
+            runner.handle = handle_with_root_write
+            events = list(client.stream(agy_config(), "素材作って", Session()))
+
+            self.assertEqual(events[-1], ("text", "3素材の完了を待ちます。\n\n3素材を取り込みました。"))
+
+    def test_subagent_that_already_replied_before_end_turn_does_not_wait(self):
+        with tempfile.TemporaryDirectory() as brain_dir:
+            root_id = "conv-fast"
+            sub_id = "sub-fast-1"
+            runner = FakeAcpRunner(
+                [
+                    prompt_turn(
+                        "",
+                        tool_call_notice("invoke_subagent", {"Role": "Fast"}, call_id="s1"),
+                        tool_update_notice("invoke_subagent", status="completed", call_id="s1"),
+                        message_chunk("完了済み。"),
+                        usage_update(100),
+                    )
+                ],
+                session_ids=[root_id],
+            )
+            orig_handle = runner.handle
+
+            def handle_with_reply(proc, message):
+                if message.get("method") == "session/prompt":
+                    self.write_transcript(
+                        brain_dir,
+                        root_id,
+                        [
+                            {
+                                "step_index": 0,
+                                "type": "GENERIC",
+                                "status": "DONE",
+                                "created_at": "2026-11-19T14:00:00Z",
+                                "content": f'{{"conversationId": "{sub_id}"}}',
+                            },
+                            {
+                                "step_index": 1,
+                                "type": "SYSTEM_MESSAGE",
+                                "status": "DONE",
+                                "created_at": "2026-11-19T14:00:02Z",
+                                "content": f"[Message] timestamp=2026-11-19T14:00:02Z sender={sub_id} content=ok",
+                            },
+                            {
+                                "step_index": 2,
+                                "type": "PLANNER_RESPONSE",
+                                "status": "DONE",
+                                "created_at": "2026-11-19T14:00:03Z",
+                                "content": "完了済み。",
+                            },
+                        ],
+                    )
+                orig_handle(proc, message)
+
+            runner.handle = handle_with_reply
+            client = self.make_client(runner, brain_dir=brain_dir)
+            events = list(client.stream(agy_config(), "調べて", Session()))
+
+            self.assertEqual(events[-1], ("text", "完了済み。"))
+
+    def test_cancel_during_wakeup_wait_notifies_session_cancel_without_killing_acp(self):
+        started_wait = threading.Event()
+        runner = FakeAcpRunner(
+            [
+                prompt_turn(
+                    "",
+                    tool_call_notice("run_command", {"CommandLine": "sleep 60"}, call_id="bg1"),
+                    message_chunk("待ちます。"),
+                    usage_update(100),
+                    after_end_turn=lambda proc, sid: started_wait.set(),
+                )
+            ]
+        )
+        client = self.make_client(runner)
+        session = Session()
+        gen = client.stream(agy_config(), "待って", session)
+        self.assertEqual(next(gen), ("reasoning", "**run_command を実行中**\nsleep 60"))
+        self.assertEqual(next(gen), ("delta", "待ちます。"))
+        self.assertTrue(started_wait.wait(5))
+        threading.Thread(target=lambda: (time.sleep(0.02), session.abort()), daemon=True).start()
+        with self.assertRaises(BridgeError) as raised:
+            list(gen)
+
+        self.assertEqual(raised.exception.code, "antigravity_cli_cancelled")
+        self.assertEqual(runner.processes[0].killed, 0)
+        self.assertEqual(len(runner.requests_for("session/cancel")), 1)
 
 
 class ClaudeRegressionTest(BridgeHTTPTestCase):
