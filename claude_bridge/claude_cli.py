@@ -98,7 +98,18 @@ def build_mcp_servers(
     # 追加定義を先に置き、ブリッジが用意するサーバーを後から重ねる。逆にすると
     # 同名の追加定義が token 付きのアダプタを差し替え、受け渡しが動かなくなる。
     servers: dict = dict(config.extra_mcp_servers)
-    if config.codex_mcp:
+    app_thread_tools = bool(token) and any(
+        tool.get("passthrough_type") == "tool_search"
+        or (tool.get("name") == "create_thread"
+         and tool.get("namespace") in {"codex_app", "mcp__codex_app"})
+        or tool.get("name") == "mcp__codex_app__create_thread"
+        or ((tool.get("name") == "create_thread"
+             and tool.get("namespace") in {"codex_app_server", "mcp__codex_app_server"}
+             or tool.get("name") == "mcp__codex_app_server__create_thread")
+            and "target" in tool.get("parameters", {}).get("properties", {}))
+        for tool in tools
+    )
+    if config.codex_mcp and not app_thread_tools:
         servers[MCP_SERVER_NAME] = {
             "command": sys.executable,
             "args": ["-m", "claude_bridge.mcp_adapter"],

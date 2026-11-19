@@ -32,6 +32,56 @@ EOF = object()
 SOCKET = "/tmp/claude-bridge-test/app-server-control.sock"
 
 
+class NativeAppRelayTest(unittest.TestCase):
+    def test_app_executor_replaces_adapter_with_standard_launcher(self):
+        server = {"command": "/app/launcher", "args": ["./server.mjs"], "cwd": "/app/plugin",
+                  "env": {"CODEX_APP_TOOLS_DEFERRED": "1"}}
+        env = {"CLAUDE_BRIDGE_APP_TOOLS_SERVER": json.dumps(server),
+               "CODEX_APP_TOOLS_PIPE_PATH": "/app/tools.sock", "CODEX_MCP_NODE_PATH": "/app/node"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(os, "chdir") as chdir, \
+                mock.patch.object(os, "execvpe") as execute, \
+                mock.patch.object(mcp_adapter, "BridgeRpcClient") as shared:
+            self.assertEqual(mcp_adapter.main([]), 0)
+        chdir.assert_called_once_with("/app/plugin")
+        execute.assert_called_once_with("/app/launcher", ["/app/launcher", "./server.mjs"], {
+            **env, "CODEX_APP_TOOLS_DEFERRED": "1",
+        })
+        shared.assert_not_called()
+
+    def test_shared_executor_keeps_existing_rpc_transport(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_BRIDGE_APP_TOOLS_SERVER": "{}"}, clear=True), \
+                mock.patch.object(mcp_adapter, "BridgeRpcClient") as shared, \
+                mock.patch.object(mcp_adapter, "serve") as serve:
+            self.assertEqual(mcp_adapter.main([]), 0)
+        shared.assert_called_once()
+        serve.assert_called_once()
+
+    def test_shared_app_server_flag_uses_bridge_in_app_executor(self):
+        with mock.patch.dict(os.environ, {
+            "CLAUDE_BRIDGE_APP_TOOLS_SERVER": "{}",
+            "CODEX_APP_TOOLS_PIPE_PATH": "/app/tools.sock",
+        }, clear=True), mock.patch.object(os, "execvpe") as execute, \
+                mock.patch.object(mcp_adapter, "BridgeRpcClient") as shared, \
+                mock.patch.object(mcp_adapter, "serve") as serve:
+            self.assertEqual(mcp_adapter.main(["--shared-app-server"]), 0)
+        execute.assert_not_called()
+        shared.assert_called_once()
+        serve.assert_called_once()
+
+    def test_native_launch_failure_is_reported_without_starting_shared_rpc(self):
+        server = {"command": "/missing/launcher", "cwd": "/app/plugin"}
+        with mock.patch.dict(os.environ, {
+                "CLAUDE_BRIDGE_APP_TOOLS_SERVER": json.dumps(server),
+                "CODEX_APP_TOOLS_PIPE_PATH": "/app/tools.sock",
+        }, clear=True), mock.patch.object(os, "chdir"), \
+                mock.patch.object(os, "execvpe", side_effect=FileNotFoundError("launcher")), \
+                mock.patch.object(mcp_adapter, "BridgeRpcClient") as shared:
+            with self.assertRaises(FileNotFoundError):
+                mcp_adapter.main([])
+        shared.assert_not_called()
+
+
 def make_config(**overrides) -> BridgeConfig:
     defaults = {"host": "127.0.0.1", "port": 0, "model": "opus", "working_dir": "."}
     return BridgeConfig(**{**defaults, **overrides})
@@ -296,6 +346,36 @@ class McpToolCallTest(unittest.TestCase):
             {"threadId": "th_new", "turn": {"id": "tn_new"}},
         )
         self.assertFalse(response["result"]["isError"])
+
+    def test_create_thread_passes_explicit_full_access_to_thread_and_turn(self):
+        client = mock.Mock()
+        client.call.side_effect = [{"thread": {"id": "th_new"}}, {}, {"turn": {"id": "tn_new"}}]
+
+        response = call_tool(client, "create_thread", {
+            "cwd": "/tmp/project", "title": "調査", "prompt": "調べて", "fullAccess": True,
+        })
+
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(client.call.call_args_list, [
+            mock.call("thread/start", {
+                "cwd": "/tmp/project", "sandbox": "danger-full-access", "approvalPolicy": "never",
+            }),
+            mock.call("thread/name/set", {"threadId": "th_new", "name": "調査"}),
+            mock.call("turn/start", {
+                "threadId": "th_new", "input": [{"type": "text", "text": "調べて"}],
+                "sandboxPolicy": {"type": "dangerFullAccess"}, "approvalPolicy": "never",
+            }, wait=False),
+        ])
+
+    def test_create_thread_rejects_invalid_full_access_before_start(self):
+        client = FakeClient()
+
+        response = call_tool(client, "create_thread", {
+            "cwd": "/tmp/project", "title": "調査", "prompt": "調べて", "fullAccess": "false",
+        })
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(client.calls, [])
 
     def test_create_thread_rejects_missing_thread_id(self):
         client = FakeClient(result={"thread": {}})
@@ -1371,6 +1451,45 @@ class ClaudeCliMcpArgumentTest(unittest.TestCase):
         package_parent = servers[MCP_SERVER_NAME]["env"]["PYTHONPATH"]
 
         self.assertEqual(package_parent, os.path.dirname(claude_bridge.__path__[0]))
+
+    def test_app_task_creation_uses_forwarded_tools(self):
+        for namespace in ("codex_app", "mcp__codex_app"):
+            with self.subTest(namespace=namespace):
+                tools = ({"name": "create_thread", "namespace": namespace, "parameters": {}},)
+                servers = build_mcp_servers(make_config(codex_mcp=True), tools, "test-token")
+                self.assertNotIn(MCP_SERVER_NAME, servers)
+                self.assertIn("codex_native", servers)
+
+    def test_unrelated_create_thread_preserves_shared_server(self):
+        tools = ({"name": "create_thread", "namespace": "another_service", "parameters": {}},)
+        servers = build_mcp_servers(make_config(codex_mcp=True), tools, "test-token")
+        self.assertIn(MCP_SERVER_NAME, servers)
+
+    def test_app_owned_shared_namespace_uses_forwarded_tools(self):
+        for namespace in ("codex_app_server", "mcp__codex_app_server"):
+            with self.subTest(namespace=namespace):
+                tools = ({"name": "create_thread", "namespace": namespace,
+                          "parameters": {"properties": {"target": {"type": "object"}}}},)
+                servers = build_mcp_servers(make_config(codex_mcp=True), tools, "test-token")
+                self.assertNotIn(MCP_SERVER_NAME, servers)
+                self.assertIn("codex_native", servers)
+
+    def test_legacy_shared_creation_schema_keeps_its_existing_route(self):
+        tools = ({"name": "create_thread", "namespace": "codex_app_server",
+                  "parameters": {"properties": {"cwd": {"type": "string"}}}},)
+        servers = build_mcp_servers(make_config(codex_mcp=True), tools, "test-token")
+        self.assertIn(MCP_SERVER_NAME, servers)
+
+    def test_deferred_app_catalog_is_discovered_through_parent_executor(self):
+        tools = ({"name": "tool_search", "passthrough_type": "tool_search"},)
+        servers = build_mcp_servers(make_config(codex_mcp=True), tools, "test-token")
+        self.assertNotIn(MCP_SERVER_NAME, servers)
+        self.assertIn("codex_native", servers)
+
+    def test_unforwardable_app_tools_preserve_shared_server(self):
+        tools = ({"name": "create_thread", "namespace": "codex_app", "parameters": {}},)
+        servers = build_mcp_servers(make_config(codex_mcp=True), tools)
+        self.assertIn(MCP_SERVER_NAME, servers)
 
 
 class CodexMcpConfigTest(unittest.TestCase):

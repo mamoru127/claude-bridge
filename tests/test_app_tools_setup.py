@@ -1,4 +1,5 @@
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -95,6 +96,70 @@ class NativeRemoteTests(unittest.TestCase):
 
 
 class NativeAppToolsTests(unittest.TestCase):
+    def test_routes_shared_mcp_entry_to_app_preserving_permissions(self):
+        home = Path("/tmp/codex-native-test")
+        client = Mock()
+        client.call.return_value = {"layers": [{
+            "name": {"type": "user", "file": str(home / "config.toml"), "profile": None},
+            "version": "before", "config": {"mcp_servers": {
+                "codex_app_server": {
+                    "command": "/bridge/python", "args": ["-m", "claude_bridge.mcp_adapter"],
+                    "disabled_tools": ["another_tool", "create_thread"],
+                    "tools": {"create_thread": {"approval_mode": "prompt"}},
+                },
+            }},
+        }]}
+        native = {"command": "/app/launcher", "args": ["/app/server.mjs"],
+                  "env_vars": ["CODEX_APP_TOOLS_PIPE_PATH"], "enabled": True}
+        shared = client.call.return_value["layers"][0]["config"]["mcp_servers"]["codex_app_server"]
+        expected = {**shared, "env_vars": ["CODEX_APP_TOOLS_PIPE_PATH"],
+                    "env": {"CLAUDE_BRIDGE_APP_TOOLS_SERVER": json.dumps(native, sort_keys=True)},
+                    "disabled_tools": ["another_tool"]}
+        with patch.object(setup, "native_app_tools_server", return_value=native):
+            self.assertTrue(setup.configure_native_tools(client, home))
+        edits = client.call.call_args_list[1].args[1]["edits"]
+        self.assertEqual(edits, [{
+            "keyPath": "mcp_servers.codex_app_server",
+            "value": expected,
+            "mergeStrategy": "replace",
+        }])
+
+    def test_app_routing_is_idempotent(self):
+        home = Path("/tmp/codex-native-test")
+        native = {"command": "/app/launcher", "args": ["/app/server.mjs"], "enabled": True}
+        routed = {"command": "/bridge/python", "env_vars": [], "tools": {},
+                  "env": {"CLAUDE_BRIDGE_APP_TOOLS_SERVER": json.dumps(native, sort_keys=True)}}
+        client = Mock()
+        client.call.return_value = {"layers": [{
+            "name": {"type": "user", "file": str(home / "config.toml"), "profile": None},
+            "version": "before", "config": {"mcp_servers": {"codex_app_server": routed}},
+        }]}
+        with patch.object(setup, "native_app_tools_server", return_value=dict(native)):
+            self.assertFalse(setup.configure_native_tools(client, home))
+        client.call.assert_called_once_with("config/read", {"includeLayers": True})
+
+    def test_reads_launcher_from_installed_plugin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = {"command": "/app/launcher", "args": ["./server.mjs"], "enabled": False,
+                        "env_vars": ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH"]}
+            (root / ".mcp.json").write_text(json.dumps({"mcpServers": {"codex_app": original}}))
+            client = Mock()
+            client.call.return_value = {"marketplaces": [{"plugins": [{
+                "id": "codex-app-tools@openai-bundled", "installed": True,
+                "source": {"type": "local", "path": str(root)},
+            }]}]}
+            self.assertEqual(setup.native_app_tools_server(client), {
+                **original, "cwd": str(root), "enabled": True,
+            })
+            client.call.assert_called_once_with("plugin/list", {})
+
+    def test_missing_app_plugin_does_not_choose_shared_server(self):
+        client = Mock()
+        client.call.return_value = {"marketplaces": []}
+        with self.assertRaisesRegex(RuntimeError, "codex-app-tools"):
+            setup.native_app_tools_server(client)
+
     def test_moves_permissions_without_reusing_legacy_launcher(self):
         home = Path("/tmp/codex-native-test")
         plugin_name = "codex-app-tools@openai-bundled"

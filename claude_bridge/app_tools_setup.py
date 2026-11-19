@@ -4,15 +4,41 @@ ChatGPT only accepts app tools connections whose parent or grandparent process i
 the app itself (`dynamic_app_tools_peer_rejected reason=untrusted-process-ancestry`).
 The shared app-server is started by launchd, so its explicit codex_app entry is
 disabled in shared mode. In native mode, move that entry's tool permissions to
-the bundled plugin, which ChatGPT enables on its own app-server. Thread creation
-and messaging can also use the bridge's codex_app_server MCP.
+the bundled plugin, which ChatGPT enables on its own app-server. In native mode,
+the codex_app_server MCP adapter also relays to that app-owned tool server.
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
 
 from .app_server import AppServerClient
+
+
+def native_app_tools_server(client) -> dict:
+    """Use the installed app tool launcher and its executor-provided connection.
+
+    The app verifies the launcher's process identity and ancestry. Reusing its
+    standard launcher also preserves thread metadata and app approval handling.
+    """
+    plugins = client.call("plugin/list", {})
+    plugin = next((
+        plugin
+        for marketplace in plugins["marketplaces"]
+        for plugin in marketplace["plugins"]
+        if plugin["id"] == "codex-app-tools@openai-bundled" and plugin["installed"]
+    ), None)
+    if plugin is None:
+        raise RuntimeError("The installed codex-app-tools plugin could not be found")
+    root = Path(plugin["source"]["path"])
+    manifest = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
+    server = manifest["mcpServers"]["codex_app"]
+    return {
+        **server,
+        "cwd": str(root),
+        "enabled": True,
+    }
 
 
 def disable_tools(client, codex_home: Path) -> bool:
@@ -47,22 +73,49 @@ def configure_native_tools(client, codex_home: Path) -> bool:
     config = layer["config"]
     servers = config.get("mcp_servers", {})
     legacy = servers.get("codex_app")
-    if legacy is None:
+    edits = []
+    if legacy is not None:
+        plugin_name = "codex-app-tools@openai-bundled"
+        plugin = config.get("plugins", {}).get(plugin_name, {})
+        override = dict(plugin.get("mcp_servers", {}).get("codex_app", {}))
+        for key in ("default_tools_approval_mode", "enabled_tools", "disabled_tools", "omit_tools_from"):
+            if key in legacy and key not in override:
+                override[key] = legacy[key]
+        override["tools"] = {**legacy.get("tools", {}), **override.get("tools", {})}
+        edits.extend([{
+            "keyPath": "mcp_servers",
+            "value": {key: value for key, value in servers.items() if key != "codex_app"},
+            "mergeStrategy": "replace",
+        }, {
+            "keyPath": f'plugins."{plugin_name}".mcp_servers.codex_app',
+            "value": override, "mergeStrategy": "replace",
+        }])
+    shared = servers.get("codex_app_server")
+    if shared is not None:
+        app_server = native_app_tools_server(client)
+        native = dict(shared)
+        native["env"] = {
+            **shared.get("env", {}),
+            "CLAUDE_BRIDGE_APP_TOOLS_SERVER": json.dumps(app_server, sort_keys=True),
+        }
+        native["env_vars"] = sorted(set(shared.get("env_vars", []) + app_server.get("env_vars", [])))
+        # The same adapter uses the native app connection when its executor
+        # supplies one, and the shared RPC transport in shared-server sessions.
+        # Keep the user's approval and filtering choices on this MCP entry.
+        # create_thread was disabled by our earlier native-mode migration.
+        native["tools"] = {**app_server.get("tools", {}), **shared.get("tools", {})}
+        disabled = [name for name in shared.get("disabled_tools", []) if name != "create_thread"]
+        if disabled:
+            native["disabled_tools"] = disabled
+        else:
+            native.pop("disabled_tools", None)
+        if native != shared:
+            edits.append({
+                "keyPath": "mcp_servers.codex_app_server",
+                "value": native, "mergeStrategy": "replace",
+            })
+    if not edits:
         return False
-    plugin_name = "codex-app-tools@openai-bundled"
-    plugin = config.get("plugins", {}).get(plugin_name, {})
-    override = dict(plugin.get("mcp_servers", {}).get("codex_app", {}))
-    for key in ("default_tools_approval_mode", "enabled_tools", "disabled_tools", "omit_tools_from"):
-        if key in legacy and key not in override:
-            override[key] = legacy[key]
-    override["tools"] = {**legacy.get("tools", {}), **override.get("tools", {})}
-    edits = [{
-        "keyPath": "mcp_servers", "value": {key: value for key, value in servers.items() if key != "codex_app"},
-        "mergeStrategy": "replace",
-    }, {
-        "keyPath": f'plugins."{plugin_name}".mcp_servers.codex_app',
-        "value": override, "mergeStrategy": "replace",
-    }]
     client.call("config/batchWrite", {
         "filePath": config_path, "expectedVersion": layer["version"], "edits": edits,
     })

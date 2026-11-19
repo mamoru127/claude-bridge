@@ -112,7 +112,7 @@ python3 launchd/install-app-connection.py --mode native
 
 共有 app-server 側の Remote 接続を無効にし、スマホ接続もアプリ管理の app-server に統一します。共有側が先に同じホストとして接続すると、アプリ側は `Remote app server already online`（HTTP 409）で拒否され、PC とスマホが別々のタスク書き込み権を持ってしまいます。共有側の実行中タスクやスマホのペアリングは削除しません。既存の Remote 登録が有効なら、アプリ側が再接続します。切り替え前から共有側で実行中のタスクは、終了まで書き込み権が残る場合があります。
 
-アプリを標準の stdio 接続で起動し、アプリ用ツールの旧 MCP 登録を標準プラグインへ移します。各ツールの承認設定も移します。選択は `~/.config/claude-bridge/app-connection-mode` に保存され、再インストールと次回ログインでも使われます。bridge のモデル接続と、RPC 用の共有 app-server は継続します。PC アプリでは新しい会話から確認してください。共有サーバーで実行中のスレッドをアプリ側で開くと、実行プロセスが異なるため `already has an active writer` になることがあります。スマホ Remote から既存の共有サーバーへ接続した会話でのツール提供は別途確認が必要です。共有接続へ戻す場合は `--mode shared` を指定します。
+アプリを標準の stdio 接続で起動し、アプリ用ツールの旧 MCP 登録を標準プラグインへ移します。各ツールの承認設定も移します。`codex_app_server` の MCP 登録も、インストール済みのアプリ標準ツールの起動コマンドへ接続します。この入口からのタスク作成・読み取り・追加指示はアプリ側で処理され、作成時からアプリ側が書き込み権を持ちます。引数はアプリ標準ツールの形式となり、タスク作成には `list_projects` で取得した `projectId` と `target` を使います。選択は `~/.config/claude-bridge/app-connection-mode` に保存され、再インストールと次回ログインでも使われます。bridge のモデル接続と、直接 RPC 用の共有 app-server は継続します。設定反映後は新しい会話から確認してください。
 
 このマシンだけの設定（Claude に触らせる追加ディレクトリ、追加の MCP サーバーなど）は、リポジトリではなく `~/.config/claude-bridge/bridge.env` に `NAME=value` の形で書きます。`install.sh` が plist の環境変数へ足します。変えたら `install.sh` を実行し直してください。
 

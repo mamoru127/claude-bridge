@@ -52,15 +52,20 @@ TOOLS = (
         "name": "create_thread",
         "create": True,
         "description": (
-            "Codex app-server へスレッド作成、表示名設定、最初のターン開始を順に送り、"
-            "Codex アプリの別タスクを作成する。ターンの完了は待たない。cwd が保存済み"
-            "プロジェクトと一致すれば、そのプロジェクト配下にタスクが表示される。"
+            "bridge の共有 app-server にスレッドを作成して最初のターンを開始する。"
+            "ChatGPT アプリの一覧への反映とプロジェクト所属には追加の連携が必要。"
+            "アプリに表示するタスクの作成には codex_app の create_thread を使う。"
+            "この共有サーバー用ツールは、アプリ標準ツールを使えない呼び出し元向け。"
         ),
         "required": ["cwd", "title", "prompt"],
         "properties": {
             **_THREAD_START_PROPERTIES,
             "title": {"type": "string", "description": "タスク一覧に表示する名前"},
             "prompt": {"type": "string", "description": "最初に送るユーザーメッセージ"},
+            "fullAccess": {
+                "type": "boolean",
+                "description": "ユーザーが明示した場合だけ、フルアクセス・承認不要で開始する。",
+            },
         },
     },
     {
@@ -280,6 +285,12 @@ def _create_thread(client: BridgeRpcClient, arguments: dict) -> dict:
     start_params = {
         key: value for key, value in arguments.items() if key in _THREAD_START_PROPERTIES
     }
+    full_access = arguments.get("fullAccess", False)
+    if not isinstance(full_access, bool):
+        raise AppServerError("fullAccess は真偽値で指定してください")
+    if full_access:
+        start_params.update(sandbox="danger-full-access", approvalPolicy="never")
+
     started = client.call("thread/start", start_params)
     thread = started.get("thread") if isinstance(started, dict) else None
     thread_id = thread.get("id") if isinstance(thread, dict) else None
@@ -287,11 +298,10 @@ def _create_thread(client: BridgeRpcClient, arguments: dict) -> dict:
         raise AppServerError("thread/start の応答に thread.id がありません")
 
     client.call("thread/name/set", {"threadId": thread_id, "name": arguments.get("title")})
-    turn = client.call(
-        "turn/start",
-        _turn_params({"threadId": thread_id, "text": arguments.get("prompt")}),
-        wait=False,
-    )
+    turn_params = _turn_params({"threadId": thread_id, "text": arguments.get("prompt")})
+    if full_access:
+        turn_params.update(sandboxPolicy={"type": "dangerFullAccess"}, approvalPolicy="never")
+    turn = client.call("turn/start", turn_params, wait=False)
     return {"threadId": thread_id, "turn": turn.get("turn") if isinstance(turn, dict) else turn}
 
 
@@ -354,7 +364,25 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("CLAUDE_BRIDGE_URL") or DEFAULT_BRIDGE_URL,
         help="接続するブリッジ本体の URL",
     )
+    parser.add_argument(
+        "--shared-app-server",
+        action="store_true",
+        help="ブリッジが接続する共有 app-server の MCP ツールを起動する",
+    )
     args = parser.parse_args(argv)
+
+    # App-owned executors supply this pipe. Run the bundled MCP launcher in
+    # this process so its code identity, parentage and thread metadata remain
+    # those expected by the app. All task operations then execute in the app.
+    app_server = os.environ.get("CLAUDE_BRIDGE_APP_TOOLS_SERVER")
+    if not args.shared_app_server and app_server and os.environ.get("CODEX_APP_TOOLS_PIPE_PATH"):
+        server = json.loads(app_server)
+        os.chdir(server["cwd"])
+        command = server["command"]
+        os.execvpe(command, [command, *server.get("args", [])], {
+            **os.environ, **server.get("env", {}),
+        })
+        return 0
 
     client = BridgeRpcClient(base_url=args.bridge_url)
     serve(sys.stdin.buffer, sys.stdout.buffer, client)
