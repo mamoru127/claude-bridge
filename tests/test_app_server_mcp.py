@@ -230,6 +230,7 @@ class McpProtocolTest(unittest.TestCase):
             [tool["name"] for tool in tools],
             [
                 "create_thread",
+                "prepare_mobile_thread",
                 "thread_start",
                 "thread_name_set",
                 "turn_start",
@@ -376,6 +377,55 @@ class McpToolCallTest(unittest.TestCase):
 
         self.assertTrue(response["result"]["isError"])
         self.assertEqual(client.calls, [])
+
+    def test_mobile_preparation_releases_before_reporting_ready(self):
+        client = mock.Mock()
+        client.call.side_effect = [
+            {"thread": {"id": "child"}}, {}, {"turn": {"status": "completed"}},
+            {"status": "unsubscribed"}, {"thread": {"status": {"type": "idle"}}},
+            {"thread": {"status": {"type": "notLoaded"}}},
+        ]
+        with mock.patch.object(mcp_adapter.time, "sleep"):
+            response = call_tool(client, "prepare_mobile_thread", {"cwd": "/repo", "title": "スマホ"})
+        self.assertEqual(json.loads(response["result"]["content"][0]["text"]),
+                         {"threadId": "child", "status": "ready"})
+        calls = client.call.call_args_list
+        self.assertEqual([c.args[0] for c in calls], [
+            "thread/start", "thread/name/set", "turn/start", "thread/unsubscribe",
+            "thread/read", "thread/read",
+        ])
+        self.assertEqual(calls[0].args[1], {
+            "cwd": "/repo", "sandbox": "workspace-write", "approvalPolicy": "on-request",
+        })
+        self.assertEqual(calls[2].kwargs, {"wait": True})
+
+    def test_mobile_preparation_keeps_other_subscribers_and_existing_thread(self):
+        client = mock.Mock()
+        client.call.side_effect = [
+            {"thread": {"id": "child"}}, {}, {"turn": {"status": "completed"}},
+            {"status": "unsubscribed"}, {"thread": {"status": {"type": "active"}}},
+        ]
+        with mock.patch.object(mcp_adapter.time, "monotonic", side_effect=[0, 76]):
+            response = call_tool(client, "prepare_mobile_thread", {"cwd": "/repo", "title": "スマホ"})
+        self.assertEqual(json.loads(response["result"]["content"][0]["text"]),
+                         {"threadId": "child", "status": "awaitingUnload"})
+
+    def test_mobile_preparation_reports_id_and_unsubscribes_on_failure(self):
+        client = mock.Mock()
+        client.call.side_effect = [
+            {"thread": {"id": "child"}}, {}, {"turn": {"status": "failed"}}, {"status": "unsubscribed"},
+        ]
+        response = call_tool(client, "prepare_mobile_thread", {"cwd": "/repo", "title": "スマホ"})
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("child", response["result"]["content"][0]["text"])
+        client.call.assert_called_with("thread/unsubscribe", {"threadId": "child"})
+
+    def test_mobile_preparation_rejects_work_or_permission_overrides(self):
+        client = mock.Mock()
+        for extra in ({"prompt": "実作業"}, {"fullAccess": True}):
+            response = call_tool(client, "prepare_mobile_thread", {"cwd": "/repo", "title": "スマホ", **extra})
+            self.assertTrue(response["result"]["isError"])
+        client.call.assert_not_called()
 
     def test_create_thread_rejects_missing_thread_id(self):
         client = FakeClient(result={"thread": {}})

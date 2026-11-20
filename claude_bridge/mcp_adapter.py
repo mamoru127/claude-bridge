@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -66,6 +67,20 @@ TOOLS = (
                 "type": "boolean",
                 "description": "ユーザーが明示した場合だけ、フルアクセス・承認不要で開始する。",
             },
+        },
+    },
+    {
+        "name": "prepare_mobile_thread",
+        "description": (
+            "スマホから次の指示を送るためのタスクを準備する。"
+            "準備ターンの完了後にBridgeの購読を終了し、共有サーバーの保持状態を返す。"
+            "準備は workspace-write / on-request。本題はスマホから同じタスクへ送る。"
+        ),
+        "required": ["cwd", "title"],
+        "properties": {
+            "cwd": _THREAD_START_PROPERTIES["cwd"],
+            "title": {"type": "string", "description": "タスク一覧に表示する名前"},
+            "model": _THREAD_START_PROPERTIES["model"],
         },
     },
     {
@@ -269,6 +284,8 @@ def _call_tool(request_id: object, params: object, client: BridgeRpcClient) -> d
     try:
         if tool.get("create"):
             result = _create_thread(client, arguments)
+        elif tool["name"] == "prepare_mobile_thread":
+            result = _prepare_mobile_thread(client, arguments)
         elif tool.get("turn"):
             result = client.call(tool["method"], _turn_params(arguments), wait=tool["wait"])
         else:
@@ -291,18 +308,59 @@ def _create_thread(client: BridgeRpcClient, arguments: dict) -> dict:
     if full_access:
         start_params.update(sandbox="danger-full-access", approvalPolicy="never")
 
-    started = client.call("thread/start", start_params)
-    thread = started.get("thread") if isinstance(started, dict) else None
-    thread_id = thread.get("id") if isinstance(thread, dict) else None
-    if not isinstance(thread_id, str) or not thread_id:
-        raise AppServerError("thread/start の応答に thread.id がありません")
-
+    thread_id = _start_thread(client, start_params)
     client.call("thread/name/set", {"threadId": thread_id, "name": arguments.get("title")})
     turn_params = _turn_params({"threadId": thread_id, "text": arguments.get("prompt")})
     if full_access:
         turn_params.update(sandboxPolicy={"type": "dangerFullAccess"}, approvalPolicy="never")
     turn = client.call("turn/start", turn_params, wait=False)
     return {"threadId": thread_id, "turn": turn.get("turn") if isinstance(turn, dict) else turn}
+
+
+def _start_thread(client: BridgeRpcClient, params: dict) -> str:
+    started = client.call("thread/start", params)
+    thread = started.get("thread") if isinstance(started, dict) else None
+    thread_id = thread.get("id") if isinstance(thread, dict) else None
+    if not isinstance(thread_id, str) or not thread_id:
+        raise AppServerError("thread/start の応答に thread.id がありません")
+
+    return thread_id
+
+
+def _prepare_mobile_thread(client: BridgeRpcClient, arguments: dict) -> dict:
+    allowed = {"cwd", "title", "model"}
+    if arguments.keys() - allowed or not all(
+        isinstance(arguments.get(k), str) and arguments[k].strip() for k in ("cwd", "title")
+    ):
+        raise AppServerError("cwd と title を指定してください。追加できる引数は model だけです")
+    params = {k: v for k, v in arguments.items() if k != "title"}
+    # スマホで確認した引き継ぎ手順の準備ターン。「OK」のために広い権限は要らない。
+    # 引き継ぎ後の実作業には、受け取ったアプリが選ぶターンの設定が適用される。
+    thread_id = _start_thread(client, {**params, "sandbox": "workspace-write", "approvalPolicy": "on-request"})
+    target = {"threadId": thread_id}
+    try:
+        try:
+            client.call("thread/name/set", {**target, "name": arguments["title"]})
+            turn = client.call("turn/start", _turn_params({
+                **target, "text": "スマホから次の指示を受ける準備です。ツールを使わず「OK」とだけ返してください。",
+            }), wait=True)
+            if (turn.get("turn") or {}).get("status") != "completed":
+                raise AppServerError("準備ターンが正常に完了しませんでした")
+        finally:
+            client.call("thread/unsubscribe", target)
+
+        # 最後の購読者が離れてから既定60秒でアンロードされる。通知処理の余裕を取り、
+        # 保持時間が長い環境や他の購読者がいる場合は、同じIDで待機中と返す。
+        deadline = time.monotonic() + 75
+        while True:
+            thread = client.call("thread/read", target)["thread"]
+            if thread["status"]["type"] == "notLoaded":
+                return {**target, "status": "ready"}
+            if time.monotonic() >= deadline:
+                return {**target, "status": "awaitingUnload"}
+            time.sleep(1)
+    except AppServerError as error:
+        raise AppServerError(f"作成済みタスク {thread_id}: {error}") from error
 
 
 def _turn_params(arguments: dict) -> dict:

@@ -23,6 +23,8 @@
     <string>__CODEX_APP_SERVER_PARENT_WRAPPER__</string>
     <string>__CODEX_BUNDLED_CLI__</string>
     <string>app-server</string>
+    <string>-c</string>
+    <string>thread_unload_delay_secs=0</string>
     <string>--listen</string>
     <string>unix://</string>
   </array>

@@ -113,8 +113,7 @@ class NativeAppToolsTests(unittest.TestCase):
                   "env_vars": ["CODEX_APP_TOOLS_PIPE_PATH"], "enabled": True}
         shared = client.call.return_value["layers"][0]["config"]["mcp_servers"]["codex_app_server"]
         expected = {**shared, "env_vars": ["CODEX_APP_TOOLS_PIPE_PATH"],
-                    "env": {"CLAUDE_BRIDGE_APP_TOOLS_SERVER": json.dumps(native, sort_keys=True)},
-                    "disabled_tools": ["another_tool"]}
+                    "env": {"CLAUDE_BRIDGE_APP_TOOLS_SERVER": json.dumps(native, sort_keys=True)}}
         with patch.object(setup, "native_app_tools_server", return_value=native):
             self.assertTrue(setup.configure_native_tools(client, home))
         edits = client.call.call_args_list[1].args[1]["edits"]

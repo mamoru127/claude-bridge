@@ -102,13 +102,7 @@ def configure_native_tools(client, codex_home: Path) -> bool:
         # The same adapter uses the native app connection when its executor
         # supplies one, and the shared RPC transport in shared-server sessions.
         # Keep the user's approval and filtering choices on this MCP entry.
-        # create_thread was disabled by our earlier native-mode migration.
         native["tools"] = {**app_server.get("tools", {}), **shared.get("tools", {})}
-        disabled = [name for name in shared.get("disabled_tools", []) if name != "create_thread"]
-        if disabled:
-            native["disabled_tools"] = disabled
-        else:
-            native.pop("disabled_tools", None)
         if native != shared:
             edits.append({
                 "keyPath": "mcp_servers.codex_app_server",
