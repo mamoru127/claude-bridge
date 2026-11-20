@@ -1,3 +1,4 @@
+import base64
 import errno
 import io
 import json
@@ -2055,7 +2056,35 @@ class UpstreamRoutingTest(BridgeHTTPTestCase):
         self.assertIn("id", message)
         self.assertEqual(runner.calls, [])
 
+    def test_upstream_subagent_unwraps_plain_agent_message_payload(self):
+        upstream_url, received = self.start_upstream()
+        runner = FakeRunner()
+        base_url = self.start_server(make_config(upstream_base_url=upstream_url), runner)
+        header = {"type": "input_text", "text": "Message Type: NEW_TASK\nTask name: /root/a\nSender: /root\nPayload:\n"}
+        task = {
+            "type": "agent_message",
+            "id": "amsg_01a1f8d9-5f2e-7e71-a831-ff3cb9e33c26",
+            "author": "/root",
+            "recipient": "/root/a",
+            "content": [header, {"type": "encrypted_content", "encrypted_content": "疎通確認です"}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_metadata": [{"provenance": {"type": "tool"}}, {"provenance": {"type": "tool"}}],
+            },
+        }
+        payload = {"model": "gpt-6.2-astra", "store": False, "input": [task]}
+
+        status, _ = self.post(base_url, payload)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            received[0]["body"]["input"],
+            [{**task, "content": [header, {"type": "input_text", "text": "疎通確認です"}]}],
+        )
+        self.assertEqual(task["content"][1]["type"], "encrypted_content")
+        self.assertEqual(runner.calls, [])
+
     def test_native_history_is_relayed_byte_for_byte(self):
+        fernet = base64.urlsafe_b64encode(b"\x80" + b"\x00" * 72).decode("ascii")
         for payload in (
             {"model": "gpt-5.6-sol", "input": "hello", "store": False},
             {"model": "gpt-5.6-sol", "input": [
@@ -2064,6 +2093,23 @@ class UpstreamRoutingTest(BridgeHTTPTestCase):
                 {"type": "item_reference", "id": "rs_native"},
                 {"type": "item_reference", "id": "rs_1df8e19e9e87435197014a32736fece7"},
                 {"type": "message", "id": "msg_native", "role": "assistant", "content": []},
+                {
+                    "type": "agent_message",
+                    "id": "amsg_native",
+                    "author": "/root",
+                    "recipient": "/root/worker",
+                    "content": [
+                        {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
+                        {"type": "encrypted_content", "encrypted_content": fernet},
+                    ],
+                },
+                {
+                    "type": "agent_message",
+                    "id": "amsg_opaque",
+                    "author": "/root",
+                    "recipient": "/root/worker",
+                    "content": [{"type": "encrypted_content", "encrypted_content": "plain without header"}],
+                },
             ]},
             {"input": [None, "invalid", {"id": 1}, {"type": "unknown", "id": "rs_1df8e19e9e87435197014a32736fece7"}]},
             [],

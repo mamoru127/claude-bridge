@@ -4,6 +4,8 @@ Codex は `requires_openai_auth = true` のプロバイダへ ChatGPT の認証�
 その認証をそのまま転送するため、ブリッジ自身は資格情報を持たない。
 """
 
+import base64
+import binascii
 import http.client
 import json
 import re
@@ -37,15 +39,20 @@ BRIDGE_ITEM_ID = re.compile(r"(?:rs|msg|fc|tsc)_(?:bridge_)?[0-9a-f]{12}4[0-9a-f
 
 
 def responses_body(payload: object, original: bytes) -> bytes:
-    """ローカル生成の項目を、上流の保存済み ID として参照させない。"""
+    """ローカル生成の項目を、上流の保存済み ID や未暗号化トークンとして参照させない。"""
 
     if not isinstance(payload, dict) or not isinstance(payload.get("input"), list):
         return original
     items = []
     for item in payload["input"]:
+        if not isinstance(item, dict):
+            items.append(item)
+            continue
+        if item.get("type") == "agent_message":
+            items.append(_unwrap_agent_message(item))
+            continue
         if (
-            not isinstance(item, dict)
-            or not isinstance(item.get("id"), str)
+            not isinstance(item.get("id"), str)
             or not BRIDGE_ITEM_ID.fullmatch(item["id"])
             or item.get("encrypted_content")
         ):
@@ -61,6 +68,56 @@ def responses_body(payload: object, original: bytes) -> bytes:
     if items == payload["input"]:
         return original
     return json.dumps({**payload, "input": items}, ensure_ascii=False).encode("utf-8")
+
+
+def _unwrap_agent_message(item: dict) -> dict:
+    """ローカル CLI が渡した平文の依頼本文を、上流が読める input_text に戻す。"""
+
+    content = item.get("content")
+    if not isinstance(content, list):
+        return item
+    parts = []
+    changed = False
+    for index, part in enumerate(content):
+        if _is_plain_agent_payload(content, index, part):
+            parts.append({"type": "input_text", "text": part["encrypted_content"]})
+            changed = True
+        else:
+            parts.append(part)
+    if not changed:
+        return item
+    return {**item, "content": parts}
+
+
+def _is_plain_agent_payload(content: list, index: int, part: object) -> bool:
+    """Payload ヘッダー直後の encrypted_content が平文の依頼本文かどうか。"""
+
+    if index == 0 or not isinstance(part, dict) or part.get("type") != "encrypted_content":
+        return False
+    text = part.get("encrypted_content")
+    if not isinstance(text, str) or _is_fernet_token(text):
+        return False
+    previous = content[index - 1]
+    if not isinstance(previous, dict) or previous.get("type") != "input_text":
+        return False
+    header = previous.get("text")
+    return (
+        isinstance(header, str)
+        and header.startswith("Message Type:")
+        and header.rstrip().endswith("Payload:")
+    )
+
+
+def _is_fernet_token(value: str) -> bool:
+    """上流の暗号化ペイロード（Fernet トークン）かどうかを判定する。"""
+
+    if len(value) < 76 or len(value) % 4 != 0:
+        return False
+    try:
+        raw = base64.b64decode(value.encode("ascii"), altchars=b"-_", validate=True)
+    except (UnicodeEncodeError, binascii.Error):
+        return False
+    return len(raw) >= 73 and raw[0] == 0x80 and (len(raw) - 57) % 16 == 0
 
 
 def request_headers(headers) -> dict[str, str]:
