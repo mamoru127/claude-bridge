@@ -35,6 +35,7 @@ from .responses import (
     build_models,
     build_prompt,
     ensure_text_only,
+    join_antigravity_system,
     parse_request,
     requested_model,
 )
@@ -404,7 +405,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         # ため、会話へまだ載せていない節だけを渡す。
         system_prompt = request.system_prompt
         if backend == ANTIGRAVITY_BACKEND:
-            system_prompt = "\n\n".join(session.unseen_system) or None
+            system_prompt = join_antigravity_system(session.unseen_system)
         # 上限は CLI へ渡す分にだけかける。続きのターンでは差分の発言しか渡さないため、
         # 履歴に積み上がった画像でリクエストが膨らんでも実行は妨げない。判定には渡す本体を
         # そのまま使う。別に見積もると、JSON の枠や system プロンプトが抜けて上限を

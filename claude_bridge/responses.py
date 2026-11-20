@@ -68,6 +68,14 @@ _CODEX_ONLY_SYSTEM_BLOCKS = re.compile(
     r"</(?P=tag)>[ \t]*\n?",
     re.MULTILINE | re.DOTALL,
 )
+# Antigravity CLI（agy）は 1 ターンの入力を <USER_REQUEST> 込み 192,000 バイトで末尾から
+# 切り捨てる。末尾の最新ユーザー発言が欠けないよう、余裕を残した上限へ収めてから渡す。
+ANTIGRAVITY_MAX_PROMPT_BYTES = 180_000
+_REPEATABLE_SYSTEM_TAGS = (
+    "skills_instructions",
+    "codex_apps_client_time_context",
+    "collaboration_mode",
+)
 
 SYSTEM_ROLES = ("system", "developer")
 MESSAGE_ROLES = ("user", "assistant")
@@ -570,7 +578,170 @@ def _normalize_antigravity_system(section: str) -> str:
     return section
 
 
-def build_prompt(messages: Sequence[Message], system_prompt: str | None) -> str:
+def join_antigravity_system(sections: Sequence[str]) -> str | None:
+    """Antigravity へ今回渡す system 節を重複排除して 1 本にまとめる。
+
+    `Session` の既読判定には元の節列をそのまま渡し、結合時だけ同一節と最新スナップショットで
+    置き換わるタグブロックの古い重複を除く。
+    """
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for section in reversed(sections):
+        if not section or section in seen:
+            continue
+        seen.add(section)
+        unique.append(section)
+    unique.reverse()
+    joined = "\n\n".join(unique)
+    for tag in _REPEATABLE_SYSTEM_TAGS:
+        joined = _keep_last_tagged_block(joined, tag)
+    return joined.strip() or None
+
+
+def _keep_last_tagged_block(text: str, tag: str) -> str:
+    pattern = re.compile(rf"<{tag}>.*?</{tag}>[ \t]*\n?", re.DOTALL)
+    matches = list(pattern.finditer(text))
+    if len(matches) <= 1:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for match in matches[:-1]:
+        pieces.append(text[cursor : match.start()])
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    return re.sub(r"\n{3,}", "\n\n", "".join(pieces)).strip()
+
+
+def _utf8_bytes(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _slice_utf8_head(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _slice_utf8_tail(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[-max_bytes:].decode("utf-8", errors="ignore")
+
+
+def _trim_middle_utf8(text: str, max_bytes: int, marker: str = "\n...[中略]...\n") -> str:
+    if _utf8_bytes(text) <= max_bytes:
+        return text
+    marker_bytes = _utf8_bytes(marker)
+    if max_bytes <= marker_bytes:
+        return _slice_utf8_tail(text, max_bytes)
+    budget = max_bytes - marker_bytes
+    head_budget = budget // 2
+    tail_budget = budget - head_budget
+    return _slice_utf8_head(text, head_budget) + marker + _slice_utf8_tail(text, tail_budget)
+
+
+def _is_workspace_bootstrap(message: Message) -> bool:
+    if message.role != "user":
+        return False
+    text = "".join(message.parts)
+    return text.startswith("# AGENTS.md instructions for ") or "<environment_context>" in text
+
+
+def _format_labelled(message: Message) -> str:
+    return f"[{message.role}]\n" + "".join(message.parts)
+
+
+def _fit_recent_messages(
+    messages: Sequence[Message], system_prompt: str | None, max_bytes: int
+) -> str | None:
+    """古い履歴を先頭側から省略して上限へ収める。末尾の最新発言は必ず残す。"""
+
+    if len(messages) <= 1:
+        return None
+    sys_prefix = f"[system]\n{system_prompt}\n\n" if system_prompt else ""
+    sys_bytes = _utf8_bytes(sys_prefix)
+
+    def try_window(keep_first: bool) -> str | None:
+        first_block = f"{_format_labelled(messages[0])}\n\n" if keep_first else ""
+        first_bytes = _utf8_bytes(first_block)
+        pool = messages[1:] if keep_first else messages
+        kept: list[str] = []
+        kept_bytes = 0
+        for index in range(len(pool) - 1, 0, -1):
+            formatted = _format_labelled(pool[index])
+            added = _utf8_bytes(formatted) + (2 if kept else 0)
+            notice = f"[以前の会話 {index} 件を上限のため省略しました]\n\n"
+            if sys_bytes + first_bytes + _utf8_bytes(notice) + kept_bytes + added > max_bytes:
+                break
+            kept.append(formatted)
+            kept_bytes += added
+        if not kept:
+            return None
+        omitted = len(pool) - len(kept)
+        notice = f"[以前の会話 {omitted} 件を上限のため省略しました]\n\n"
+        kept.reverse()
+        return sys_prefix + first_block + notice + "\n\n".join(kept)
+
+    if len(messages) > 2 and _is_workspace_bootstrap(messages[0]):
+        fitted = try_window(keep_first=True)
+        if fitted is not None:
+            return fitted
+    return try_window(keep_first=False)
+
+
+def _fit_latest_message(
+    messages: Sequence[Message], system_prompt: str | None, max_bytes: int
+) -> str:
+    """最新発言 1 件でも上限を超える場合、最新発言を優先して system や本文を中央省略する。"""
+
+    labelled = len(messages) > 1 or messages[-1].role != "user"
+    latest_text = _format_labelled(messages[-1]) if labelled else "".join(messages[-1].parts)
+    notice = (
+        f"[以前の会話 {len(messages) - 1} 件を上限のため省略しました]\n\n"
+        if len(messages) > 1
+        else ""
+    )
+    if not system_prompt:
+        body_budget = max_bytes - _utf8_bytes(notice)
+        if body_budget <= 0:
+            return _trim_middle_utf8(latest_text, max_bytes)
+        return notice + _trim_middle_utf8(latest_text, body_budget)
+
+    overhead = _utf8_bytes("[system]\n\n\n") + _utf8_bytes(notice)
+    available = max_bytes - overhead
+    if available <= 0:
+        return _trim_middle_utf8(latest_text, max_bytes)
+
+    latest_bytes = _utf8_bytes(latest_text)
+    if latest_bytes <= available:
+        sys_budget = available - latest_bytes
+        if sys_budget <= 0:
+            return notice + latest_text
+        trimmed_sys = _trim_middle_utf8(system_prompt, sys_budget)
+        return f"[system]\n{trimmed_sys}\n\n{notice}{latest_text}"
+
+    sys_budget = min(_utf8_bytes(system_prompt), available // 4)
+    if sys_budget <= 0:
+        return _trim_middle_utf8(notice + latest_text, max_bytes)
+    body_budget = available - sys_budget
+    trimmed_sys = _trim_middle_utf8(system_prompt, sys_budget)
+    trimmed_body = _trim_middle_utf8(latest_text, body_budget)
+    return f"[system]\n{trimmed_sys}\n\n{notice}{trimmed_body}"
+
+
+def build_prompt(
+    messages: Sequence[Message],
+    system_prompt: str | None,
+    *,
+    max_bytes: int | None = ANTIGRAVITY_MAX_PROMPT_BYTES,
+) -> str:
     """発言列を 1 本のプロンプト文字列にする。
 
     Antigravity CLI の headless 契約はユーザー発言の文字列だけで、system 指定の口も画像を
@@ -579,11 +750,27 @@ def build_prompt(messages: Sequence[Message], system_prompt: str | None) -> str:
     ここへ置いた節はユーザー発言として会話に残る。Claude CLI の `--append-system-prompt` と
     違って毎ターン渡すと同じ指示が会話へ積み上がるため、呼び出し側は会話へまだ載せていない
     分だけを system_prompt に渡す（`Session.unseen_system`）。
+
+    Antigravity CLI 側には 1 ターン 192,000 バイトで末尾を切り捨てる上限があるため、
+    `max_bytes` を超える場合は古い会話から省略して末尾の最新発言を必ず残す。
     """
 
     ensure_text_only(messages)
     body = "\n".join(block["text"] for block in build_content(messages))
-    return f"[system]\n{system_prompt}\n\n{body}" if system_prompt else body
+    prompt = f"[system]\n{system_prompt}\n\n{body}" if system_prompt else body
+    if max_bytes is None or _utf8_bytes(prompt) <= max_bytes:
+        return prompt
+    original_bytes = _utf8_bytes(prompt)
+    trimmed = _fit_recent_messages(messages, system_prompt, max_bytes)
+    if trimmed is None:
+        trimmed = _fit_latest_message(messages, system_prompt, max_bytes)
+    logger.info(
+        "antigravity prompt trimmed original_bytes=%d trimmed_bytes=%d limit_bytes=%d",
+        original_bytes,
+        _utf8_bytes(trimmed),
+        max_bytes,
+    )
+    return trimmed
 
 
 def build_response(model: str, text: str) -> dict:

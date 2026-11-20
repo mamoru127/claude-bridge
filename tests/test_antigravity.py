@@ -33,7 +33,13 @@ from claude_bridge.config import (
     build_config,
 )
 from claude_bridge.errors import BridgeError
-from claude_bridge.responses import Message, build_models, build_prompt
+from claude_bridge.responses import (
+    ANTIGRAVITY_MAX_PROMPT_BYTES,
+    Message,
+    build_models,
+    build_prompt,
+    join_antigravity_system,
+)
 from claude_bridge.server import BridgeServer
 from claude_bridge.sessions import Session
 
@@ -930,8 +936,127 @@ class AntigravityPromptTest(unittest.TestCase):
         self.assertEqual(raised.exception.status, 400)
         self.assertEqual(raised.exception.code, "unsupported_content_part")
 
+    def test_join_antigravity_system_keeps_only_latest_repeatable_blocks_and_deduplicates(self):
+        joined = join_antigravity_system(
+            (
+                "基本指示\n<skills_instructions>v1</skills_instructions>",
+                "<codex_apps_client_time_context>2026-11-19</codex_apps_client_time_context>",
+                "<codex_apps_client_time_context>2026-11-20</codex_apps_client_time_context>",
+                "<skills_instructions>v2</skills_instructions>",
+                "<skills_instructions>v3</skills_instructions>",
+                "共通ルール",
+                "共通ルール",
+            )
+        )
+
+        self.assertIsNotNone(joined)
+        assert joined is not None
+        self.assertIn("基本指示", joined)
+        self.assertNotIn("v1", joined)
+        self.assertNotIn("v2", joined)
+        self.assertIn("<skills_instructions>v3</skills_instructions>", joined)
+        self.assertNotIn("2026-11-19", joined)
+        self.assertIn("<codex_apps_client_time_context>2026-11-20</codex_apps_client_time_context>", joined)
+        self.assertEqual(joined.count("共通ルール"), 1)
+
+    def test_build_prompt_drops_oldest_history_while_preserving_bootstrap_and_latest_turn(self):
+        messages = conversation(
+            ("user", "# AGENTS.md instructions for /tmp/project\nルール"),
+            ("user", "古い依頼 " + "あ" * 120),
+            ("assistant", "古い回答 " + "い" * 120),
+            ("user", "最近の依頼"),
+            ("assistant", "最近の回答"),
+            ("user", "いまの依頼"),
+        )
+
+        prompt = build_prompt(messages, "システム指示", max_bytes=360)
+
+        self.assertLessEqual(len(prompt.encode("utf-8")), 360)
+        self.assertIn("[system]\nシステム指示", prompt)
+        self.assertIn("# AGENTS.md instructions for /tmp/project", prompt)
+        self.assertIn("省略しました", prompt)
+        self.assertNotIn("古い依頼", prompt)
+        self.assertIn("最近の依頼", prompt)
+        self.assertTrue(prompt.endswith("[user]\nいまの依頼"))
+
+    def test_build_prompt_trims_huge_system_to_keep_latest_user_message_intact(self):
+        messages = conversation(("user", "古い履歴"), ("user", "最新の質問"))
+        huge_system = "先頭ルール\n" + ("中間の説明\n" * 100) + "末尾ルール"
+
+        prompt = build_prompt(messages, huge_system, max_bytes=300)
+
+        self.assertLessEqual(len(prompt.encode("utf-8")), 300)
+        self.assertIn("先頭ルール", prompt)
+        self.assertIn("末尾ルール", prompt)
+        self.assertIn("...[中略]...", prompt)
+        self.assertTrue(prompt.endswith("[user]\n最新の質問"))
+
+    def test_build_prompt_trims_middle_of_oversized_single_multibyte_message(self):
+        body = "先頭です" + ("あ" * 200) + "末尾です"
+
+        prompt = build_prompt(conversation(("user", body)), None, max_bytes=120)
+
+        self.assertLessEqual(len(prompt.encode("utf-8")), 120)
+        self.assertTrue(prompt.startswith("先頭です"))
+        self.assertTrue(prompt.endswith("末尾です"))
+        self.assertIn("...[中略]...", prompt)
+
 
 class AntigravityEndpointTest(BridgeHTTPTestCase):
+    def test_oversized_history_and_duplicate_skills_are_trimmed_within_agy_limit_and_resume_works(self):
+        runner = FakeAcpRunner(
+            [prompt_turn("1回目完了"), prompt_turn("2回目完了")], session_ids=["conv-limit"]
+        )
+        base_url = self.start_server(agy_config(), runner)
+        instructions = "基本指示\n<skills_instructions>" + ("旧スキル" * 4000) + "</skills_instructions>"
+        latest_skills = "<skills_instructions>" + ("新スキル" * 4000) + "</skills_instructions>"
+        first_history = [
+            {"role": "developer", "content": "<skills_instructions>" + ("中間スキル" * 4000) + "</skills_instructions>"},
+            {"role": "developer", "content": latest_skills},
+            {"role": "user", "content": "# AGENTS.md instructions for /tmp/project\n規約"},
+            {"role": "user", "content": "一番古い発言" + ("古" * 40000)},
+            {"role": "assistant", "content": "一番古い回答" + ("答" * 40000)},
+            {"role": "user", "content": "直前の話題"},
+            {"role": "assistant", "content": "直前の返答"},
+            {"role": "user", "content": "最後のユーザー指示"},
+        ]
+
+        status1, body1 = self.post(
+            base_url,
+            {
+                "model": HIGH,
+                "instructions": instructions,
+                "input": first_history,
+                "prompt_cache_key": "thread-trim",
+            },
+        )
+        status2, body2 = self.post(
+            base_url,
+            {
+                "model": HIGH,
+                "instructions": instructions,
+                "input": [
+                    *first_history,
+                    {"role": "assistant", "content": "1回目完了"},
+                    {"role": "user", "content": "続きの質問"},
+                ],
+                "prompt_cache_key": "thread-trim",
+            },
+        )
+
+        self.assertEqual((status1, status2), (200, 200))
+        self.assertEqual(body1["output_text"], "1回目完了")
+        self.assertEqual(body2["output_text"], "2回目完了")
+        first_prompt = runner.prompt(0)
+        self.assertLessEqual(len(first_prompt.encode("utf-8")), ANTIGRAVITY_MAX_PROMPT_BYTES)
+        self.assertNotIn("旧スキル", first_prompt)
+        self.assertNotIn("中間スキル", first_prompt)
+        self.assertIn("新スキル", first_prompt)
+        self.assertIn("# AGENTS.md instructions for /tmp/project", first_prompt)
+        self.assertNotIn("一番古い発言", first_prompt)
+        self.assertIn("直前の話題", first_prompt)
+        self.assertTrue(first_prompt.endswith("[user]\n最後のユーザー指示"))
+        self.assertEqual(runner.prompt(1), "続きの質問")
     def test_argon_accepts_long_system_and_history_without_truncation(self):
         runner = FakeAcpRunner([prompt_turn("こんにちは"), prompt_turn("こんにちは")])
         base_url = self.start_server(
