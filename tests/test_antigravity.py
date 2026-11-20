@@ -23,7 +23,7 @@ from claude_bridge.antigravity_cli import (
     build_command,
     stream_antigravity,
 )
-from claude_bridge.antigravity_collaboration import AcpCollaboration
+from claude_bridge.antigravity_collaboration import AcpCollaboration, app_spawn_arguments
 from claude_bridge.claude_cli import transcript_id
 from claude_bridge.cli_process import final_text
 from claude_bridge.config import (
@@ -1153,6 +1153,59 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
         request["input"].append({"role": "user", "content": "次の質問"})
         self.assertEqual(self.post(url, request)[0], 200)
         self.assertEqual(runner.requests_for("session/new")[-1]["params"]["mcpServers"], [])
+
+    def test_cross_model_all_carries_parent_turns_and_tools(self):
+        spawn = {"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}
+        tools = {"type": "additional_tools", "tools": [
+            {"type": "namespace", "name": "collaboration", "tools": [spawn]},
+        ]}
+        mcp = AcpCollaboration((dict(spawn, namespace="collaboration"),))
+        name = f"mcp_{mcp.server_name}_spawn_agent"
+        arguments = {"fork_turns": "all", "model": "gpt-6.2-astra", "reasoning_effort": "low",
+                     "task_name": "child", "message": "合言葉は？"}
+        runner = FakeAcpRunner([prompt_turn("了解"), prompt_turn("",
+            tool_call_notice(name, arguments), tool_update_notice(status="completed"))])
+        url = self.start_server(agy_config(), runner)
+        request = {"model": HIGH, "prompt_cache_key": "parent", "input": [
+            tools, {"role": "developer", "content": "PRIVATE_INSTRUCTIONS"},
+            {"role": "user", "content": "合言葉は海ほたる"},
+        ]}
+        self.assertEqual(self.post(url, request)[0], 200)
+        request["input"].extend([
+            {"role": "assistant", "content": "了解"},
+            {"type": "function_call", "name": "list_agents", "namespace": "collaboration",
+             "call_id": "old", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "old", "output": "previous result"},
+            {"type": "reasoning", "encrypted_content": "PRIVATE_REASONING"},
+            {"role": "user", "content": "Astraに引き継いで"},
+        ])
+        status, result = self.post(url, request)
+        self.assertEqual(status, 200)
+        call, = result["output"]
+        child_args = json.loads(call["arguments"])
+        message = child_args.pop("message")
+        self.assertEqual(child_args, {"fork_turns": "none", "model": "gpt-6.2-astra",
+                                     "reasoning_effort": "low", "task_name": "child"})
+        self.assertTrue(message.endswith(arguments["message"]))
+        self.assertNotIn("PRIVATE_", message)
+        self.assertNotIn("海ほたる", runner.prompt(1))
+        for earlier, later in (("海ほたる", "了解"), ("了解", "list_agents"),
+                               ("list_agents", "previous result"), ("previous result", "Astraに引き継いで")):
+            self.assertLess(message.index(earlier), message.index(later))
+
+    def test_only_explicit_model_and_all_attach_history(self):
+        history = (Message("user", ("first turn",)),)
+        base = {"message": "task", "fork_turns": "all", "model": "gpt-6.2-astra"}
+        for args in ({"message": "task", "fork_turns": "all"}, {**base, "fork_turns": "none"},
+                     {"message": "task", "model": "gpt-6.2-astra"}):
+            self.assertEqual(app_spawn_arguments("spawn_agent", args, history), args)
+        self.assertEqual(app_spawn_arguments("send_message", base, history), base)
+        # 同じ親が何度も子を作っても、過去の依頼に添付した履歴を重ねない。
+        first = app_spawn_arguments("spawn_agent", base, history)
+        call = {"type": "function_call", "namespace": "collaboration", "name": "spawn_agent",
+                "arguments": json.dumps(first)}
+        next_call = app_spawn_arguments("spawn_agent", base, (*history, call))
+        self.assertEqual(next_call["message"].count("first turn"), 1)
 
     def test_codex_tools_are_not_offered(self):
         runner = FakeAcpRunner([prompt_turn("こんにちは")])

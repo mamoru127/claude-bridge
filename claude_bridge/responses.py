@@ -112,6 +112,8 @@ class ParsedRequest:
     system_sections: tuple[str, ...] = ()
     # Codex が送る `reasoning.effort`（low / medium / high / xhigh など）。未指定なら None。
     reasoning_effort: str | None = None
+    # ACP の別モデルへの依頼には、今回 CLI に送る差分ではなく親が提供した履歴を使う。
+    fork_history: tuple[Message | dict, ...] = ()
 
 
 def requested_model(payload: object, default_model: str) -> str:
@@ -170,15 +172,23 @@ def parse_request(
             system_sections.append(instructions)
 
     messages = []
+    capture_history = tool_namespace == "collaboration"
+    fork_history = []
     payload_input = payload.get("input")
     if isinstance(payload_input, str):
         if not payload_input.strip():
             raise _invalid("input が空です", param="input")
         messages.append(Message("user", (payload_input,)))
+        if capture_history:
+            fork_history.extend(messages)
     elif isinstance(payload_input, list):
         for index, item in enumerate(payload_input):
             parsed = _parse_input_item(item, index)
             if parsed is None:
+                if capture_history and item.get("type") in (
+                    "function_call", "custom_tool_call", "custom_tool_call_output",
+                ):
+                    fork_history.append(item)
                 continue
             role, parts = parsed
             # テキストが空白だけで画像もないメッセージは、送っても伝わる内容がないので捨てる。
@@ -187,7 +197,10 @@ def parse_request(
             if role in SYSTEM_ROLES:
                 system_sections.append(_system_text(parts, f"input[{index}].content"))
             else:
-                messages.append(Message(role, tuple(parts)))
+                message = Message(role, tuple(parts))
+                messages.append(message)
+                if capture_history:
+                    fork_history.append(message)
     else:
         raise _invalid("input は文字列または配列で指定してください", param="input")
 
@@ -209,6 +222,7 @@ def parse_request(
         tool_search_query=search_query,
         system_sections=tuple(system_sections),
         reasoning_effort=reasoning_effort,
+        fork_history=tuple(fork_history) if tools else (),
     )
 
 

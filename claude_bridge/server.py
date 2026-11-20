@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from .antigravity_cli import AntigravityClient
-from .antigravity_collaboration import AcpCollaboration
+from .antigravity_collaboration import AcpCollaboration, app_spawn_arguments
 from .app_server import TURN_METHOD, AppServerClient, AppServerError
 from .claude_cli import input_line, stream_claude
 from .cli_process import final_text
@@ -392,6 +392,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 sections += (
                     f"アプリのサブエージェント操作は MCP {collaboration.server_name} を使う。"
                     "サブエージェントを依頼されたらこの MCP の spawn_agent を使う。"
+                    "この MCP は、別モデルに親の会話履歴を渡す拡張にも対応する。"
+                    "ユーザーが別モデルと履歴継承の両方を指定したら、MCP の spawn_agent に"
+                    "指定の model と fork_turns=all を渡す。ブリッジが履歴を自動添付し、"
+                    "アプリ側の spawn_agent は fork_turns=none で実行する。"
                     "受付後はターンを終了し、次の Codex ツール結果や agent message で続ける。"
                     "agent message の author と recipient は Codex のスレッドを表す。",
                 )
@@ -411,6 +415,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             yield from self.server.antigravity.stream(config, payload, session, collaboration)
             if collaboration:
                 for name, arguments in collaboration.calls.values():
+                    arguments = app_spawn_arguments(name, arguments, request.fork_history)
                     self.server.pending.add(token, name, arguments, "collaboration")
         else:
             yield from stream_claude(
