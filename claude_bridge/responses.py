@@ -59,7 +59,7 @@ CODEX_APP_ANTIGRAVITY_INSTRUCTIONS = (
     "バッククォートで囲まない）で書く。\n"
     "- 見出しの直後と箇条書きの直前には空行を入れる。\n"
     "- ツール操作にはこのランタイム自身のツールを使い、Codex 専用の `functions.*`・"
-    "`exec_command`・`spawn_agent`・`tool_search` は呼ばない。"
+    "`exec_command`・`tool_search` は呼ばない。"
 )
 
 _CODEX_ONLY_SYSTEM_BLOCKS = re.compile(
@@ -127,6 +127,7 @@ def parse_request(
     default_model: str,
     passthrough_tools: Sequence[str] = (),
     tool_search_query: str = "",
+    tool_namespace: str | None = None,
 ) -> ParsedRequest:
     """Responses API のリクエストを検証し、プロンプトへ正規化する。"""
 
@@ -196,7 +197,7 @@ def parse_request(
         )
 
     tools, search_query = _passthrough_tools(
-        payload_input, passthrough_tools, tool_search_query
+        payload_input, passthrough_tools, tool_search_query, tool_namespace
     )
     return ParsedRequest(
         model=model or default_model,
@@ -212,7 +213,8 @@ def parse_request(
 
 
 def _passthrough_tools(
-    payload_input: object, allowed: Sequence[str], search_query: str = ""
+    payload_input: object, allowed: Sequence[str], search_query: str = "",
+    namespace: str | None = None,
 ) -> tuple[tuple[dict, ...], str | None]:
     """Codex が受け渡す名前で送ってきた function 定義と、必要なら投げる検索語を返す。
 
@@ -246,6 +248,11 @@ def _passthrough_tools(
         if kind not in ("additional_tools", "tool_search_output"):
             continue
         for tool in item.get("tools") or []:
+            if namespace and not (
+                isinstance(tool, dict) and tool.get("type") == "namespace"
+                and tool.get("name") == namespace
+            ):
+                continue
             if kind == "additional_tools":
                 offered.extend(_tool_names(tool))
                 searchable = searchable or _is_tool_search(tool)
@@ -361,7 +368,7 @@ def _parse_input_item(item: object, index: int) -> tuple[str, list] | None:
         for field in ("author", "recipient"):
             if not isinstance(item.get(field), str) or not item[field].strip():
                 raise _invalid(f"{field} は空でない文字列が必要です", param=f"{param}.{field}")
-        parts = _parse_content(item.get("content"), f"{param}.content")
+        parts = _parse_content(item.get("content"), f"{param}.content", agent_message=True)
         text = _system_text(parts, f"{param}.content")
         if not text.strip():
             raise _invalid("agent_message の本文が空です", param=f"{param}.content")
@@ -402,7 +409,7 @@ def _tool_output_text(item: dict) -> str:
     return f"[Codex ツール結果] call_id={item.get('call_id')}\n{output}"
 
 
-def _parse_content(content: object, param: str) -> list:
+def _parse_content(content: object, param: str, *, agent_message: bool = False) -> list:
     """content を、テキストは `str`、画像は Claude の image ブロックにした並びへ変換する。
 
     連続するテキストは 1 本にまとめる。ブロックが分かれるのは画像が挟まる位置だけになる。
@@ -419,6 +426,15 @@ def _parse_content(content: object, param: str) -> list:
         if not isinstance(part, dict):
             raise _invalid("content の要素はオブジェクトである必要があります", param=part_param)
         part_type = part.get("type")
+        # Codex は依頼のヘッダーに続けて、元の message 引数をこの型で運ぶ。
+        # ローカル CLI が渡した依頼文は平文のまま入る。
+        if (
+            agent_message and part_type == "encrypted_content" and parts
+            and isinstance(parts[-1], str) and parts[-1].startswith("Message Type:")
+            and parts[-1].rstrip().endswith("Payload:")
+        ):
+            part = {"text": part.get("encrypted_content")}
+            part_type = "input_text"
         if part_type in TEXT_PART_TYPES:
             text = part.get("text")
             if not isinstance(text, str):

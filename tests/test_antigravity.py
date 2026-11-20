@@ -23,6 +23,7 @@ from claude_bridge.antigravity_cli import (
     build_command,
     stream_antigravity,
 )
+from claude_bridge.antigravity_collaboration import AcpCollaboration
 from claude_bridge.claude_cli import transcript_id
 from claude_bridge.cli_process import final_text
 from claude_bridge.config import (
@@ -1106,6 +1107,52 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
         self.assertEqual(status, 400)
         self.assertEqual(len(claude_runner.calls), 2)
         self.assertIn("--resume", claude_runner.calls[1]["command"])
+
+    def test_app_spawn_returns_one_namespaced_call_and_resumes_with_child_reply(self):
+        spawn = {"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}
+        collab = {"type": "namespace", "name": "collaboration", "tools": [spawn]}
+        unrelated = {"type": "namespace", "name": "functions", "tools": [spawn]}
+        definitions = {"type": "additional_tools", "tools": [unrelated, collab]}
+        mcp = AcpCollaboration((dict(spawn, namespace="collaboration"),))
+        tool_name = f"mcp_{mcp.server_name}_spawn_agent"
+        arguments = {"task_name": "math", "message": "Calculate the product"}
+        updates = [
+            tool_call_notice(tool_name, {**arguments, "toolSummary": "delegate"}),
+            tool_update_notice(status="completed"),
+            tool_update_notice(tool_name, status="completed", args=arguments),
+            tool_call_notice(tool_name, arguments, call_id="failed"),
+            tool_update_notice(status="failed", call_id="failed"),
+        ]
+        runner = FakeAcpRunner([prompt_turn("受付完了", *updates), prompt_turn("5143")])
+        url = self.start_server(agy_config(), runner)
+        request = {"model": HIGH, "prompt_cache_key": "parent", "input": [
+            definitions, {"role": "user", "content": "子に計算を依頼して"},
+        ]}
+        _, events = self.post_stream(url, request)
+        response = next(data["response"] for event, data in events if event == "response.completed")
+        self.assertEqual(response["output_text"], "")
+        self.assertFalse(any(event == "response.output_text.delta" for event, _ in events))
+        call, = response["output"]
+        self.assertEqual((call["type"], call["namespace"], call["name"]),
+                         ("function_call", "collaboration", "spawn_agent"))
+        self.assertEqual(json.loads(call["arguments"]), arguments)
+        self.assertEqual(runner.requests_for("session/new")[0]["params"]["mcpServers"], mcp.servers)
+
+        request["input"].extend([call, {"type": "function_call_output", "call_id": call["call_id"],
+                                        "output": '{"task_name":"/root/math"}'},
+                                 {"type": "agent_message", "author": "/root/math", "recipient": "/root",
+                                  "content": "FINAL_ANSWER: 5143"}])
+        status, result = self.post(url, request)
+        self.assertEqual((status, result["output_text"]), (200, "5143"))
+        self.assertIn("FINAL_ANSWER: 5143", runner.prompt(1))
+        self.assertIn(call["call_id"], runner.prompt(1))
+        self.assertEqual(len(runner.requests_for("session/new")), 1)
+
+        # Revoking the tools on the next request starts a session without that MCP.
+        request["input"] = [item for item in request["input"] if item is not definitions]
+        request["input"].append({"role": "user", "content": "次の質問"})
+        self.assertEqual(self.post(url, request)[0], 200)
+        self.assertEqual(runner.requests_for("session/new")[-1]["params"]["mcpServers"], [])
 
     def test_codex_tools_are_not_offered(self):
         runner = FakeAcpRunner([prompt_turn("こんにちは")])

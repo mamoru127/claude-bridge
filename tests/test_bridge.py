@@ -1754,6 +1754,14 @@ class ParseRequestUnitTest(unittest.TestCase):
         self.assertEqual(build_content(parsed.messages)[0]["text"],
                          "[Codex agent message] author=/root/editor recipient=/root\n報告：\n添削完了。")
 
+    def test_agent_task_keeps_wrapped_local_message_argument(self):
+        parsed = parse_request({"input": [{
+            "type": "agent_message", "author": "/root", "recipient": "/root/math",
+            "content": [{"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
+                        {"type": "encrypted_content", "encrypted_content": "139 times 37"}],
+        }]}, "test-model")
+        self.assertTrue(build_content(parsed.messages)[0]["text"].endswith("139 times 37"))
+
     def test_invalid_agent_message_is_rejected_not_silently_dropped(self):
         task = {"type": "agent_message", "author": "/root", "recipient": "/root/editor",
                 "content": [{"type": "input_text", "text": "依頼"}]}

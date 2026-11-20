@@ -1,8 +1,7 @@
-"""Codex が送ってきたツールを、そのまま Claude へ見せる stdio MCP サーバー。
+"""Codex のツール定義を CLI に公開する stdio MCP サーバー。
 
-ツール定義は Codex のリクエスト由来なので、起動のたびに環境変数で受け取る。
-Claude が呼ぶと、実行はせずブリッジ本体へ預けるだけで、受理した旨を返す。実行するのは
-Codex 側で、結果は次のリクエストの function_call_output として会話へ戻ってくる。
+Claude の依頼は HTTP で預け、Antigravity の依頼は ACP 通知からブリッジが拾う。
+Codex がツールを実行し、結果が次のリクエストの function_call_output として届く。
 """
 
 import json
@@ -119,7 +118,7 @@ def _description(tool: dict) -> str:
     )
 
 
-def build_handler(tools: list[dict], client: PendingCallClient):
+def build_handler(tools: list[dict], client: PendingCallClient | None):
     """JSON-RPC メッセージ 1 件を処理する関数を作る。"""
 
     metadata = {
@@ -150,7 +149,7 @@ def build_handler(tools: list[dict], client: PendingCallClient):
 
 
 def _call(
-    request_id: object, params: object, metadata: dict, client: PendingCallClient
+    request_id: object, params: object, metadata: dict, client: PendingCallClient | None
 ) -> dict:
     if not isinstance(params, dict):
         return _result(request_id, _content("params はオブジェクトで指定してください", True))
@@ -160,6 +159,13 @@ def _call(
     arguments = params.get("arguments") or {}
     if not isinstance(arguments, dict):
         return _result(request_id, _content("arguments はオブジェクトで指定してください", True))
+    if client is None:
+        # ACP はセッション単位で MCP を保持する。現在のターンへの対応づけは
+        # ブリッジが session/update を受け取った時点で行う。
+        return _result(request_id, _content(
+            "Codex への依頼を受け付けました。このターンを終了してください。"
+            "実行結果は次のターンに届きます。"
+        ))
     try:
         namespace, passthrough_type = metadata[name]
         call_id = client.enqueue(name, arguments, namespace, passthrough_type)
@@ -187,7 +193,7 @@ def _error(request_id: object, code: int, message: str) -> dict:
 
 
 def main() -> int:
-    client = PendingCallClient(
+    client = None if sys.argv[1:] == ["--acp"] else PendingCallClient(
         token=os.environ.get(PASSTHROUGH_TOKEN_ENV, ""),
         base_url=os.environ.get("CLAUDE_BRIDGE_URL") or DEFAULT_BRIDGE_URL,
     )

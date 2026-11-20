@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from .antigravity_cli import AntigravityClient
+from .antigravity_collaboration import AcpCollaboration
 from .app_server import TURN_METHOD, AppServerClient, AppServerError
 from .claude_cli import input_line, stream_claude
 from .cli_process import final_text
@@ -207,14 +208,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if not backend:
                 self._relay(config, responses_body(payload, body))
                 return
-            # Antigravity の headless 契約にはリクエスト単位のツール登録の口がないため、
-            # Codex のツール受け渡しと tool_search は Claude のときだけ有効にする。
+            # Gemini ではアプリのサブエージェント操作だけを ACP に登録する。
             claude = backend == CLAUDE_BACKEND
             request = parse_request(
                 payload,
                 default_model,
-                config.passthrough_tools if claude else (),
+                config.passthrough_tools,
                 config.tool_search_query if claude else "",
+                tool_namespace=None if claude else "collaboration",
             )
             # アプリが選んだモデルで実行する。CLI へ届くのは一覧に載せた名前だけ。
             config = replace(config, model=config.cli_model(request.model, request.reasoning_effort))
@@ -381,9 +382,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
             # 実際に渡すのは全履歴の部分集合なので、ここで確かめれば組み立てでも通る。
             ensure_text_only(request.messages)
         sections = request.system_sections
+        collaboration = None
+        session_backend = backend
         if backend == ANTIGRAVITY_BACKEND:
             sections = antigravity_system_sections(sections)
-        messages = session.prepare(request.messages, backend, sections)
+            if request.tools:
+                collaboration = AcpCollaboration(request.tools)
+                session_backend = f"{backend}/{collaboration.server_name}"
+                sections += (
+                    f"アプリのサブエージェント操作は MCP {collaboration.server_name} を使う。"
+                    "サブエージェントを依頼されたらこの MCP の spawn_agent を使う。"
+                    "受付後はターンを終了し、次の Codex ツール結果や agent message で続ける。"
+                    "agent message の author と recipient は Codex のスレッドを表す。",
+                )
+        messages = session.prepare(request.messages, session_backend, sections)
         # Claude は system の口へ毎回渡し直す。Antigravity はユーザー発言として会話へ残る
         # ため、会話へまだ載せていない節だけを渡す。
         system_prompt = request.system_prompt
@@ -396,16 +408,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
         payload, size = self._cli_input(messages, system_prompt, backend)
         self._validate_body_size(size, config.max_request_bytes, "CLI へ渡す入力")
         if backend == ANTIGRAVITY_BACKEND:
-            return self.server.antigravity.stream(config, payload, session)
-        return stream_claude(
-            config,
-            payload,
-            request.system_prompt,
-            session,
-            self.server.runner,
-            request.tools,
-            token,
-        )
+            yield from self.server.antigravity.stream(config, payload, session, collaboration)
+            if collaboration:
+                for name, arguments in collaboration.calls.values():
+                    self.server.pending.add(token, name, arguments, "collaboration")
+        else:
+            yield from stream_claude(
+                config, payload, request.system_prompt, session, self.server.runner, request.tools, token
+            )
 
     def _cli_input(self, messages, system_prompt: str | None, backend: str):
         """CLI へ渡す入力と、その大きさ。上限の判定と実行で同じ組み立てを使う。"""
@@ -470,8 +480,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     return
                 text = None
             stream = ResponseStream(request.model)
-            stream.function_calls(self.server.pending.close(token))
-            if text is None:
+            calls = self.server.pending.close(token)
+            stream.function_calls(calls)
+            if text is None or (calls and not text):
                 self._send_json(200, stream.calls_response())
                 return
             self._log_completed(config, request, session, backend, text)
@@ -532,8 +543,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 else:
                     # 本文より先に出す。Codex は function_call を見てツールを実行し、
                     # 結果を次のリクエストへ載せてくる。
-                    alive.write(sse(stream.function_calls(self.server.pending.close(token))))
-                    alive.write(sse(stream.completed(text)))
+                    calls = self.server.pending.close(token)
+                    alive.write(sse(stream.function_calls(calls)))
+                    if calls and not text:
+                        alive.write(sse(stream.completed_calls()))
+                    else:
+                        alive.write(sse(stream.completed(text)))
                     self._log_completed(config, request, session, backend, text)
                 alive.write(SSE_DONE)
         except (BrokenPipeError, ConnectionResetError):

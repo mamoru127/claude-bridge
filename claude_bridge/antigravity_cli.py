@@ -38,6 +38,7 @@ import threading
 import time
 from collections.abc import Iterator, Mapping
 
+from .antigravity_collaboration import AcpCollaboration
 from .cli_process import STDERR_SNIPPET_BYTES, CliKind, StderrReader, kill_tree, launch, snippet
 from .config import BridgeConfig
 from .errors import BridgeError
@@ -435,10 +436,12 @@ class AntigravityClient:
             conn.close()
 
     def stream(
-        self, config: BridgeConfig, prompt: str, session
+        self, config: BridgeConfig, prompt: str, session,
+        collaboration: AcpCollaboration | None = None,
     ) -> Iterator[tuple[str, str]]:
         """1 ターンを実行し、`reasoning`・`delta`・最終 `text` を発生順に返す。"""
 
+        servers = collaboration.servers if collaboration else []
         waiter = _Waiter()
         deadline = time.monotonic() + config.timeout_seconds
         grace = min(CANCEL_GRACE_SECONDS, max(0.02, config.timeout_seconds))
@@ -447,7 +450,9 @@ class AntigravityClient:
         try:
             conn, reused = self._connect(config, waiter, deadline)
             try:
-                session_id = self._prepare_session(conn, config, session, waiter, deadline, grace)
+                session_id = self._prepare_session(
+                    conn, config, session, waiter, deadline, grace, servers
+                )
             except BridgeError as error:
                 # 長時間アイドル後に常駐プロセスが切れていた場合だけ、1 回だけ繋ぎ直す。
                 # session/prompt 送信前なので二重実行にはならない。
@@ -458,9 +463,11 @@ class AntigravityClient:
                 ):
                     raise
                 conn, _ = self._connect(config, waiter, deadline)
-                session_id = self._prepare_session(conn, config, session, waiter, deadline, grace)
+                session_id = self._prepare_session(
+                    conn, config, session, waiter, deadline, grace, servers
+                )
             yield from self._run_prompt(
-                conn, session_id, prompt, session, waiter, deadline, grace
+                conn, session_id, prompt, session, waiter, deadline, grace, collaboration
             )
         except _TurnTimeout as error:
             raise ANTIGRAVITY.error(
@@ -528,11 +535,12 @@ class AntigravityClient:
         waiter: _Waiter,
         deadline: float,
         grace: float,
+        servers: list[dict],
     ) -> str:
         if session.resume:
-            session_id = self._resume_session(conn, config, session, waiter, deadline, grace)
+            session_id = self._resume_session(conn, config, session, waiter, deadline, grace, servers)
         else:
-            session_id = self._new_session(conn, config, waiter, deadline, grace)
+            session_id = self._new_session(conn, config, waiter, deadline, grace, servers)
 
         if conn.model_of(session_id) != config.model:
             response = conn.call(
@@ -557,10 +565,11 @@ class AntigravityClient:
         waiter: _Waiter,
         deadline: float,
         grace: float,
+        servers: list[dict],
     ) -> str:
         response = conn.call(
             "session/new",
-            {"cwd": config.working_dir, "mcpServers": []},
+            {"cwd": config.working_dir, "mcpServers": servers},
             waiter,
             deadline,
             grace,
@@ -584,13 +593,14 @@ class AntigravityClient:
         waiter: _Waiter,
         deadline: float,
         grace: float,
+        servers: list[dict],
     ) -> str:
         target_id = session.handle
         if conn.has_session(target_id):
             return target_id
         response = conn.call(
             "session/resume",
-            {"sessionId": target_id, "cwd": config.working_dir, "mcpServers": []},
+            {"sessionId": target_id, "cwd": config.working_dir, "mcpServers": servers},
             waiter,
             deadline,
             grace,
@@ -623,6 +633,7 @@ class AntigravityClient:
         waiter: _Waiter,
         deadline: float,
         grace: float,
+        collaboration: AcpCollaboration | None,
     ) -> Iterator[tuple[str, str]]:
         turn_box = conn.begin_prompt(session_id)
         prompt_id: int | None = None
@@ -662,7 +673,7 @@ class AntigravityClient:
                         session.confirm(session_id)
                         confirmed = True
                     events, failure = _collect_update_events(
-                        update, chunks, thoughts, started_tools, tool_names
+                        update, chunks, thoughts, started_tools, tool_names, collaboration
                     )
                     _, used_async, used_subagent = _track_async_tool(
                         update, tool_names, pending_tools
@@ -715,13 +726,14 @@ class AntigravityClient:
                             subagent_marked_at,
                             initial_root_steps,
                             tool_error,
+                            collaboration,
                         )
                     )
                     waiting_wakeup = False
 
                 yield from _flush_thoughts(thoughts)
                 text = "".join(chunks)
-                if not text.strip() and tool_error:
+                if not text.strip() and tool_error and not (collaboration and collaboration.calls):
                     raise ANTIGRAVITY.error(
                         f"がツールを実行できず本文を返しませんでした: {tool_error}",
                         "tool_failed",
@@ -756,6 +768,7 @@ class AntigravityClient:
         subagent_marked_at: float,
         initial_root_steps: int,
         tool_error: str,
+        collaboration: AcpCollaboration | None,
     ) -> Iterator[tuple[str, str]]:
         """`end_turn` 後に残っている非同期タスク・サブエージェントの完了と自動再開を待ち受ける。"""
 
@@ -808,7 +821,7 @@ class AntigravityClient:
 
             idle_since = None
             events, failure = _collect_update_events(
-                update, chunks, thoughts, started_tools, tool_names
+                update, chunks, thoughts, started_tools, tool_names, collaboration
             )
             finished_pending, _, used_subagent = _track_async_tool(
                 update, tool_names, pending_tools
@@ -903,6 +916,7 @@ def _collect_update_events(
     thoughts: list[str],
     started_tools: set[str],
     tool_names: dict[str, str],
+    collaboration: AcpCollaboration | None,
 ) -> tuple[list[tuple[str, str]], str]:
     """`session/update` 1 件から、クライアントへ流すイベント列とツール失敗理由を作る。"""
 
@@ -920,7 +934,8 @@ def _collect_update_events(
     if kind == "agent_message_chunk":
         events = list(_flush_thoughts(thoughts))
         delta = _content_text(update.get("content"))
-        if delta:
+        # ツール受付後の agy の返事は、アプリが実行した結果より先に表示しない。
+        if delta and not (collaboration and collaboration.calls):
             chunks.append(delta)
             events.append(("delta", delta))
         return events, ""
@@ -928,6 +943,8 @@ def _collect_update_events(
     if kind not in ("tool_call", "tool_call_update"):
         return [], ""
 
+    if collaboration:
+        collaboration.observe(update)
     events = list(_flush_thoughts(thoughts))
     raw_id = update.get("toolCallId")
     call_id = raw_id if isinstance(raw_id, str) and raw_id else ""
