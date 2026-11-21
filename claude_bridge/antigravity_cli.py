@@ -36,7 +36,7 @@ import re
 import subprocess
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 
 from .antigravity_collaboration import AcpCollaboration
 from .cli_process import STDERR_SNIPPET_BYTES, CliKind, StderrReader, kill_tree, launch, snippet
@@ -436,7 +436,7 @@ class AntigravityClient:
             conn.close()
 
     def stream(
-        self, config: BridgeConfig, prompt: str, session,
+        self, config: BridgeConfig, prompt: str | Sequence[dict], session,
         collaboration: AcpCollaboration | None = None,
     ) -> Iterator[tuple[str, str]]:
         """1 ターンを実行し、`reasoning`・`delta`・最終 `text` を発生順に返す。"""
@@ -628,13 +628,16 @@ class AntigravityClient:
         self,
         conn: _AcpConnection,
         session_id: str,
-        prompt: str,
+        prompt: str | Sequence[dict],
         session,
         waiter: _Waiter,
         deadline: float,
         grace: float,
         collaboration: AcpCollaboration | None,
     ) -> Iterator[tuple[str, str]]:
+        prompt_blocks = (
+            [{"type": "text", "text": prompt}] if isinstance(prompt, str) else list(prompt)
+        )
         turn_box = conn.begin_prompt(session_id)
         prompt_id: int | None = None
         prompt_done = False
@@ -656,7 +659,7 @@ class AntigravityClient:
                 "session/prompt",
                 {
                     "sessionId": session_id,
-                    "prompt": [{"type": "text", "text": prompt}],
+                    "prompt": prompt_blocks,
                 },
                 turn_box,
             )
@@ -845,7 +848,7 @@ class AntigravityClient:
 
 def stream_antigravity(
     config: BridgeConfig,
-    prompt: str,
+    prompt: str | Sequence[dict],
     session,
     runner=subprocess.Popen,
 ) -> Iterator[tuple[str, str]]:

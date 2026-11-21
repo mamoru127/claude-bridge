@@ -54,8 +54,20 @@ _TASK_HEADER = "\nChild assignment:\n"
 
 def _history_record(item: Message | dict) -> dict:
     if isinstance(item, Message):
-        # Gemini の入力はここに来る前にテキストのみであることを検証済み。
-        return {"role": item.role, "text": "\n".join(item.parts)}
+        parts = []
+        image_count = 0
+        for part in item.parts:
+            if isinstance(part, str):
+                parts.append(part)
+            else:
+                image_count += 1
+                source = part.get("source") if isinstance(part, dict) else None
+                media_type = source.get("media_type") if isinstance(source, dict) else None
+                parts.append(f"[image: {media_type}]" if isinstance(media_type, str) and media_type else "[image]")
+        record: dict = {"role": item.role, "text": "\n".join(parts)}
+        if image_count:
+            record["image_count"] = image_count
+        return record
     keys = ("type", "namespace", "name", "call_id", "arguments", "input", "output")
     record = {key: item[key] for key in keys if key in item}
     # 先行する別モデル起動の依頼文には、その時点の履歴が既に添付されている。

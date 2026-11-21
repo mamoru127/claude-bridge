@@ -36,12 +36,10 @@ CLI_METADATA = {
         "owned_by": "google",
         "display_name": "Antigravity CLI ({slug})",
         "description": (
-            "claude-bridge 経由の Antigravity CLI（agy）。入力はテキストのみ、出力はテキスト。"
+            "claude-bridge 経由の Antigravity CLI（agy）。入力はテキストと画像、出力はテキスト。"
             "推論の強さ（low / medium / high）を切り替えられる。"
         ),
-        # agy の headless 契約に画像を渡す口がなく、画像付きリクエストは 400 で拒否する。
-        # 雛形が画像対応でも、その宣言は受け継がない。
-        "supports_vision": False,
+        "supports_vision": True,
         # headless の契約に文脈長の公表がないため、Claude と同じ控えめな値を暫定で置く。
         # 実際の上限が分かったらここを引き上げる。小さすぎる分には Codex が送る履歴が短く
         # なるだけで実行は失敗しない。
@@ -543,16 +541,44 @@ def _text_blocks(text: str) -> list[dict]:
 
 
 def ensure_text_only(messages: Sequence[Message]) -> None:
-    """画像を含む会話を弾く。Antigravity CLI の headless 契約はテキストしか受け取れない。"""
+    """画像を含む会話を弾く。文字列専用のプロンプト組み立てで使う。"""
 
     if any(not isinstance(part, str) for message in messages for part in message.parts):
         raise BridgeError(
-            "Antigravity CLI は画像入力に対応していません。テキストだけの会話で実行するか、"
-            "Claude のモデルを選んでください",
+            "画像を含む会話はテキスト専用プロンプトへ変換できません",
             status=400,
             error_type="invalid_request_error",
             code="unsupported_content_part",
         )
+
+
+def ensure_antigravity_images(messages: Sequence[Message]) -> None:
+    """Antigravity ACP へ渡せない形式の画像を弾く。
+
+    ACP の image ブロックは base64 の data と mimeType が必須で、URL だけの画像は
+    受け付けない。
+    """
+
+    for message in messages:
+        for part in message.parts:
+            if isinstance(part, str):
+                continue
+            source = part.get("source") if isinstance(part, dict) else None
+            if (
+                not isinstance(source, dict)
+                or source.get("type") != "base64"
+                or not isinstance(source.get("media_type"), str)
+                or not source["media_type"]
+                or not isinstance(source.get("data"), str)
+                or not source["data"]
+            ):
+                raise BridgeError(
+                    "Antigravity CLI の画像入力は base64 の data URL のみ対応しています。"
+                    "URL 形式の画像は Claude のモデルを選んでください",
+                    status=400,
+                    error_type="invalid_request_error",
+                    code="unsupported_content_part",
+                )
 
 
 def antigravity_system_sections(sections: Sequence[str]) -> tuple[str, ...]:
@@ -647,47 +673,95 @@ def _trim_middle_utf8(text: str, max_bytes: int, marker: str = "\n...[中略]...
     return _slice_utf8_head(text, head_budget) + marker + _slice_utf8_tail(text, tail_budget)
 
 
+def _acp_image_block(part: dict) -> dict:
+    source = part["source"]
+    return {
+        "type": "image",
+        "mimeType": source["media_type"],
+        "data": source["data"],
+    }
+
+
+def _messages_to_acp_blocks(
+    messages: Sequence[Message],
+    *,
+    prefix: str = "",
+    labelled: bool = False,
+) -> list[dict]:
+    blocks: list[dict] = []
+    text = prefix
+    for index, message in enumerate(messages):
+        if index:
+            text += "\n\n"
+        if labelled:
+            text += f"[{message.role}]\n"
+        for part in message.parts:
+            if isinstance(part, str):
+                text += part
+                continue
+            blocks += _text_blocks(text)
+            text = ""
+            blocks.append(_acp_image_block(part))
+    return blocks + _text_blocks(text)
+
+
+def _prompt_text_bytes(blocks: Sequence[dict]) -> int:
+    return sum(_utf8_bytes(block["text"]) for block in blocks if block.get("type") == "text")
+
+
 def _is_workspace_bootstrap(message: Message) -> bool:
-    if message.role != "user":
+    if message.role != "user" or any(not isinstance(part, str) for part in message.parts):
         return False
     text = "".join(message.parts)
     return text.startswith("# AGENTS.md instructions for ") or "<environment_context>" in text
 
 
 def _format_labelled(message: Message) -> str:
-    return f"[{message.role}]\n" + "".join(message.parts)
+    return f"[{message.role}]\n" + "".join(part for part in message.parts if isinstance(part, str))
 
 
-def _fit_recent_messages(
+def _message_text_bytes(message: Message, *, labelled: bool) -> int:
+    prefix_bytes = _utf8_bytes(f"[{message.role}]\n") if labelled else 0
+    return prefix_bytes + sum(
+        _utf8_bytes(part) for part in message.parts if isinstance(part, str)
+    )
+
+
+def _fit_recent_messages_blocks(
     messages: Sequence[Message], system_prompt: str | None, max_bytes: int
-) -> str | None:
-    """古い履歴を先頭側から省略して上限へ収める。末尾の最新発言は必ず残す。"""
+) -> tuple[dict, ...] | None:
+    """古い履歴を先頭側から省略してテキスト上限へ収める。末尾の最新発言は必ず残す。"""
 
     if len(messages) <= 1:
         return None
     sys_prefix = f"[system]\n{system_prompt}\n\n" if system_prompt else ""
     sys_bytes = _utf8_bytes(sys_prefix)
 
-    def try_window(keep_first: bool) -> str | None:
+    def try_window(keep_first: bool) -> tuple[dict, ...] | None:
         first_block = f"{_format_labelled(messages[0])}\n\n" if keep_first else ""
         first_bytes = _utf8_bytes(first_block)
         pool = messages[1:] if keep_first else messages
-        kept: list[str] = []
+        kept: list[Message] = []
         kept_bytes = 0
         for index in range(len(pool) - 1, 0, -1):
-            formatted = _format_labelled(pool[index])
-            added = _utf8_bytes(formatted) + (2 if kept else 0)
+            added = _message_text_bytes(pool[index], labelled=True) + (2 if kept else 0)
             notice = f"[以前の会話 {index} 件を上限のため省略しました]\n\n"
             if sys_bytes + first_bytes + _utf8_bytes(notice) + kept_bytes + added > max_bytes:
                 break
-            kept.append(formatted)
+            kept.append(pool[index])
             kept_bytes += added
         if not kept:
             return None
         omitted = len(pool) - len(kept)
         notice = f"[以前の会話 {omitted} 件を上限のため省略しました]\n\n"
         kept.reverse()
-        return sys_prefix + first_block + notice + "\n\n".join(kept)
+        return tuple(
+            _messages_to_acp_blocks(
+                kept,
+                prefix=sys_prefix + first_block + notice,
+                labelled=True,
+            )
+        )
 
     if len(messages) > 2 and _is_workspace_bootstrap(messages[0]):
         fitted = try_window(keep_first=True)
@@ -696,44 +770,92 @@ def _fit_recent_messages(
     return try_window(keep_first=False)
 
 
-def _fit_latest_message(
+def _fit_latest_message_blocks(
     messages: Sequence[Message], system_prompt: str | None, max_bytes: int
-) -> str:
-    """最新発言 1 件でも上限を超える場合、最新発言を優先して system や本文を中央省略する。"""
+) -> tuple[dict, ...]:
+    """最新発言 1 件でも上限を超える場合、最新発言と画像を優先して system や本文を中央省略する。"""
 
-    labelled = len(messages) > 1 or messages[-1].role != "user"
-    latest_text = _format_labelled(messages[-1]) if labelled else "".join(messages[-1].parts)
+    latest = messages[-1]
+    labelled = len(messages) > 1 or latest.role != "user"
     notice = (
         f"[以前の会話 {len(messages) - 1} 件を上限のため省略しました]\n\n"
         if len(messages) > 1
         else ""
     )
+    latest_images = [_acp_image_block(part) for part in latest.parts if not isinstance(part, str)]
+    latest_text_bytes = _message_text_bytes(latest, labelled=labelled)
+
+    if system_prompt:
+        overhead = _utf8_bytes("[system]\n\n\n") + _utf8_bytes(notice)
+        available = max_bytes - overhead
+        if available > 0 and latest_text_bytes <= available:
+            sys_budget = available - latest_text_bytes
+            if sys_budget <= 0:
+                prefix = notice
+            else:
+                trimmed_sys = _trim_middle_utf8(system_prompt, sys_budget)
+                prefix = f"[system]\n{trimmed_sys}\n\n{notice}"
+            return tuple(_messages_to_acp_blocks((latest,), prefix=prefix, labelled=labelled))
+
+    body = "\n".join(part for part in latest.parts if isinstance(part, str))
+    latest_text = f"[{latest.role}]\n{body}" if labelled else body
     if not system_prompt:
         body_budget = max_bytes - _utf8_bytes(notice)
         if body_budget <= 0:
-            return _trim_middle_utf8(latest_text, max_bytes)
-        return notice + _trim_middle_utf8(latest_text, body_budget)
+            trimmed = _trim_middle_utf8(latest_text, max_bytes)
+        else:
+            trimmed = notice + _trim_middle_utf8(latest_text, body_budget)
+        return tuple(_text_blocks(trimmed) + latest_images)
 
     overhead = _utf8_bytes("[system]\n\n\n") + _utf8_bytes(notice)
     available = max_bytes - overhead
     if available <= 0:
-        return _trim_middle_utf8(latest_text, max_bytes)
-
-    latest_bytes = _utf8_bytes(latest_text)
-    if latest_bytes <= available:
-        sys_budget = available - latest_bytes
-        if sys_budget <= 0:
-            return notice + latest_text
-        trimmed_sys = _trim_middle_utf8(system_prompt, sys_budget)
-        return f"[system]\n{trimmed_sys}\n\n{notice}{latest_text}"
+        trimmed = _trim_middle_utf8(latest_text, max_bytes)
+        return tuple(_text_blocks(trimmed) + latest_images)
 
     sys_budget = min(_utf8_bytes(system_prompt), available // 4)
     if sys_budget <= 0:
-        return _trim_middle_utf8(notice + latest_text, max_bytes)
+        trimmed = _trim_middle_utf8(notice + latest_text, max_bytes)
+        return tuple(_text_blocks(trimmed) + latest_images)
     body_budget = available - sys_budget
     trimmed_sys = _trim_middle_utf8(system_prompt, sys_budget)
     trimmed_body = _trim_middle_utf8(latest_text, body_budget)
-    return f"[system]\n{trimmed_sys}\n\n{notice}{trimmed_body}"
+    trimmed = f"[system]\n{trimmed_sys}\n\n{notice}{trimmed_body}"
+    return tuple(_text_blocks(trimmed) + latest_images)
+
+
+def build_antigravity_prompt(
+    messages: Sequence[Message],
+    system_prompt: str | None,
+    *,
+    max_bytes: int | None = ANTIGRAVITY_MAX_PROMPT_BYTES,
+) -> tuple[dict, ...]:
+    """発言列を Antigravity ACP の `session/prompt` ブロック列にする。
+
+    system / developer の内容は落とさず先頭のテキストへ `[system]` 節として置く。
+    画像は ACP の `image` ブロック（base64 `data` + `mimeType`）へ変換する。
+
+    Antigravity CLI 側にはテキスト入力を 192,000 バイトで末尾から切り捨てる上限があるため、
+    テキスト部分が `max_bytes` を超える場合は古い会話から省略して末尾の最新発言と画像を残す。
+    """
+
+    ensure_antigravity_images(messages)
+    labelled = len(messages) > 1 or messages[0].role != "user"
+    sys_prefix = f"[system]\n{system_prompt}\n\n" if system_prompt else ""
+    blocks = tuple(_messages_to_acp_blocks(messages, prefix=sys_prefix, labelled=labelled))
+    original_bytes = _prompt_text_bytes(blocks)
+    if max_bytes is None or original_bytes <= max_bytes:
+        return blocks
+    trimmed = _fit_recent_messages_blocks(messages, system_prompt, max_bytes)
+    if trimmed is None:
+        trimmed = _fit_latest_message_blocks(messages, system_prompt, max_bytes)
+    logger.info(
+        "antigravity prompt trimmed original_bytes=%d trimmed_bytes=%d limit_bytes=%d",
+        original_bytes,
+        _prompt_text_bytes(trimmed),
+        max_bytes,
+    )
+    return trimmed
 
 
 def build_prompt(
@@ -742,35 +864,11 @@ def build_prompt(
     *,
     max_bytes: int | None = ANTIGRAVITY_MAX_PROMPT_BYTES,
 ) -> str:
-    """発言列を 1 本のプロンプト文字列にする。
-
-    Antigravity CLI の headless 契約はユーザー発言の文字列だけで、system 指定の口も画像を
-    渡す口もない。system / developer の内容は落とさず `[system]` 節として先頭へ置く。
-
-    ここへ置いた節はユーザー発言として会話に残る。Claude CLI の `--append-system-prompt` と
-    違って毎ターン渡すと同じ指示が会話へ積み上がるため、呼び出し側は会話へまだ載せていない
-    分だけを system_prompt に渡す（`Session.unseen_system`）。
-
-    Antigravity CLI 側には 1 ターン 192,000 バイトで末尾を切り捨てる上限があるため、
-    `max_bytes` を超える場合は古い会話から省略して末尾の最新発言を必ず残す。
-    """
+    """テキストのみの発言列を 1 本のプロンプト文字列にする。"""
 
     ensure_text_only(messages)
-    body = "\n".join(block["text"] for block in build_content(messages))
-    prompt = f"[system]\n{system_prompt}\n\n{body}" if system_prompt else body
-    if max_bytes is None or _utf8_bytes(prompt) <= max_bytes:
-        return prompt
-    original_bytes = _utf8_bytes(prompt)
-    trimmed = _fit_recent_messages(messages, system_prompt, max_bytes)
-    if trimmed is None:
-        trimmed = _fit_latest_message(messages, system_prompt, max_bytes)
-    logger.info(
-        "antigravity prompt trimmed original_bytes=%d trimmed_bytes=%d limit_bytes=%d",
-        original_bytes,
-        _utf8_bytes(trimmed),
-        max_bytes,
-    )
-    return trimmed
+    blocks = build_antigravity_prompt(messages, system_prompt, max_bytes=max_bytes)
+    return "\n".join(block["text"] for block in blocks if block.get("type") == "text")
 
 
 def build_response(model: str, text: str) -> dict:
@@ -867,6 +965,7 @@ def _codex_model(config: BridgeConfig, slug: str, template: dict) -> dict:
         "description": metadata["description"],
         # 扱える入力は CLI で違う。雛形の宣言を受け継ぐと、実行できない入力を選ばせてしまう。
         "supports_vision": metadata["supports_vision"],
+        "input_modalities": ["text", "image"] if metadata["supports_vision"] else ["text"],
         "visibility": "list",
         "supported_in_api": True,
         "default_reasoning_level": "medium",

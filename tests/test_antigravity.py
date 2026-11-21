@@ -36,6 +36,7 @@ from claude_bridge.errors import BridgeError
 from claude_bridge.responses import (
     ANTIGRAVITY_MAX_PROMPT_BYTES,
     Message,
+    build_antigravity_prompt,
     build_models,
     build_prompt,
     join_antigravity_system,
@@ -302,9 +303,12 @@ class FakeAcpRunner:
         return [req for req in self.all_requests if req.get("method") == method]
 
     def prompt(self, index: int = 0) -> str:
-        prompts = self.requests_for("session/prompt")
-        blocks = prompts[index]["params"]["prompt"]
+        blocks = self.prompt_blocks(index)
         return "".join(block["text"] for block in blocks if block.get("type") == "text")
+
+    def prompt_blocks(self, index: int = 0) -> list[dict]:
+        prompts = self.requests_for("session/prompt")
+        return prompts[index]["params"]["prompt"]
 
     def models_set(self) -> list[str]:
         return [req["params"]["modelId"] for req in self.requests_for("session/set_model")]
@@ -936,6 +940,83 @@ class AntigravityPromptTest(unittest.TestCase):
         self.assertEqual(raised.exception.status, 400)
         self.assertEqual(raised.exception.code, "unsupported_content_part")
 
+    def test_build_antigravity_prompt_converts_base64_images_to_acp_blocks(self):
+        image = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": "QUJD"},
+        }
+        messages = (Message("user", ("これは何", image, "詳しく")),)
+
+        blocks = build_antigravity_prompt(messages, "あなたは助手です")
+
+        self.assertEqual(
+            blocks,
+            (
+                {"type": "text", "text": "[system]\nあなたは助手です\n\nこれは何"},
+                {"type": "image", "mimeType": "image/jpeg", "data": "QUJD"},
+                {"type": "text", "text": "詳しく"},
+            ),
+        )
+
+    def test_build_antigravity_prompt_accepts_image_only_message(self):
+        image = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"},
+        }
+
+        blocks = build_antigravity_prompt((Message("user", (image,)),), None)
+
+        self.assertEqual(blocks, ({"type": "image", "mimeType": "image/png", "data": "QUJD"},))
+
+    def test_build_antigravity_prompt_rejects_url_images(self):
+        image = {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}
+
+        with self.assertRaises(BridgeError) as raised:
+            build_antigravity_prompt((Message("user", ("見て", image)),), None)
+
+        self.assertEqual(raised.exception.status, 400)
+        self.assertEqual(raised.exception.code, "unsupported_content_part")
+
+    def test_build_antigravity_prompt_trims_text_history_while_keeping_latest_image(self):
+        old_image = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "T0xE"},
+        }
+        latest_image = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": "TkVX" * 500},
+        }
+        messages = (
+            Message("user", ("# AGENTS.md instructions for /tmp/project\n規約",)),
+            Message("user", ("古い依頼 " + "あ" * 120, old_image)),
+            Message("assistant", ("古い回答 " + "い" * 120,)),
+            Message("user", ("最新の依頼", latest_image)),
+        )
+
+        blocks = build_antigravity_prompt(messages, "システム指示", max_bytes=360)
+
+        text_bytes = sum(len(b["text"].encode("utf-8")) for b in blocks if b["type"] == "text")
+        images = [b for b in blocks if b["type"] == "image"]
+        self.assertLessEqual(text_bytes, 360)
+        self.assertEqual(images, [{"type": "image", "mimeType": "image/jpeg", "data": "TkVX" * 500}])
+
+    def test_build_antigravity_prompt_trims_oversized_single_message_text_while_keeping_image(self):
+        image = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/webp", "data": "V0VC" * 200},
+        }
+        messages = (Message("user", ("先頭です" + ("あ" * 200) + "末尾です", image)),)
+
+        blocks = build_antigravity_prompt(messages, None, max_bytes=120)
+
+        text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
+        images = [b for b in blocks if b["type"] == "image"]
+        self.assertEqual(len(text_blocks), 1)
+        self.assertLessEqual(len(text_blocks[0].encode("utf-8")), 120)
+        self.assertTrue(text_blocks[0].startswith("先頭です"))
+        self.assertTrue(text_blocks[0].endswith("末尾です"))
+        self.assertEqual(images, [{"type": "image", "mimeType": "image/webp", "data": "V0VC" * 200}])
+
     def test_join_antigravity_system_keeps_only_latest_repeatable_blocks_and_deduplicates(self):
         joined = join_antigravity_system(
             (
@@ -1176,7 +1257,100 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
 
         self.assertEqual(runner.prompt(), "[system]\nあなたは助手です\n\nやあ")
 
-    def test_image_input_is_rejected_with_400(self):
+    def test_base64_image_input_is_forwarded_as_acp_image_block(self):
+        runner = FakeAcpRunner([prompt_turn("赤い四角です")])
+        base_url = self.start_server(agy_config(), runner)
+
+        status, payload = self.post(
+            base_url,
+            {
+                "model": HIGH,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "これは何"},
+                            {**image_part(PNG_DATA_URL), "detail": "high"},
+                        ],
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["output_text"], "赤い四角です")
+        expected_data = PNG_DATA_URL.split(",", 1)[1]
+        self.assertEqual(
+            runner.prompt_blocks(0),
+            [
+                {"type": "text", "text": "これは何"},
+                {"type": "image", "mimeType": "image/png", "data": expected_data},
+            ],
+        )
+
+    def test_accumulated_history_images_do_not_block_next_antigravity_turn(self):
+        runner = FakeAcpRunner([prompt_turn("1枚目OK"), prompt_turn("2枚目OK")], session_ids=["conv-img"])
+        base_url = self.start_server(agy_config(max_request_bytes=12000), runner)
+
+        def jpeg(fill: str) -> dict:
+            return {
+                "type": "input_image",
+                "image_url": "data:image/jpeg;base64," + fill * 8192,
+                "detail": "high",
+            }
+
+        status1, _ = self.post(
+            base_url,
+            {
+                "model": HIGH,
+                "prompt_cache_key": "thread-img",
+                "input": [{"role": "user", "content": [jpeg("A"), {"type": "input_text", "text": "1枚目"}]}],
+            },
+        )
+        status2, _ = self.post(
+            base_url,
+            {
+                "model": HIGH,
+                "prompt_cache_key": "thread-img",
+                "input": [
+                    {"role": "user", "content": [jpeg("A"), {"type": "input_text", "text": "1枚目"}]},
+                    {"role": "assistant", "content": "1枚目OK"},
+                    {"role": "user", "content": [jpeg("B"), {"type": "input_text", "text": "2枚目"}]},
+                ],
+            },
+        )
+
+        self.assertEqual((status1, status2), (200, 200))
+        self.assertEqual(
+            runner.prompt_blocks(1),
+            [
+                {"type": "image", "mimeType": "image/jpeg", "data": "B" * 8192},
+                {"type": "text", "text": "2枚目"},
+            ],
+        )
+
+    def test_oversized_image_input_is_rejected_with_413(self):
+        runner = FakeAcpRunner()
+        base_url = self.start_server(agy_config(max_request_bytes=1024), runner)
+
+        status, payload = self.post(
+            base_url,
+            {
+                "model": HIGH,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [image_part("data:image/png;base64," + "A" * 2048)],
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(status, 413)
+        self.assertEqual(payload["error"]["code"], "request_too_large")
+        self.assertEqual(runner.calls, [])
+
+    def test_url_image_input_is_rejected_with_400(self):
         runner = FakeAcpRunner()
         base_url = self.start_server(agy_config(), runner)
 
@@ -1189,7 +1363,7 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
                         "role": "user",
                         "content": [
                             {"type": "input_text", "text": "これは何"},
-                            image_part(PNG_DATA_URL),
+                            image_part("https://example.com/photo.png"),
                         ],
                     }
                 ],
@@ -1213,7 +1387,7 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
             {
                 "model": HIGH,
                 "prompt_cache_key": "t1",
-                "input": [{"role": "user", "content": [image_part(PNG_DATA_URL)]}],
+                "input": [{"role": "user", "content": [image_part("https://example.com/a.png")]}],
             },
         )
         self.post(
@@ -1331,6 +1505,21 @@ class AntigravityEndpointTest(BridgeHTTPTestCase):
                 "arguments": json.dumps(first)}
         next_call = app_spawn_arguments("spawn_agent", base, (*history, call))
         self.assertEqual(next_call["message"].count("first turn"), 1)
+
+    def test_app_spawn_arguments_summarizes_images_in_parent_history(self):
+        image = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": "RAWBASE64DATA"},
+        }
+        history = (Message("user", ("添付を見て", image)),)
+        base = {"message": "task", "fork_turns": "all", "model": "gpt-6.2-astra"}
+
+        result = app_spawn_arguments("spawn_agent", base, history)
+
+        self.assertIn("添付を見て", result["message"])
+        self.assertIn("[image: image/jpeg]", result["message"])
+        self.assertIn('"image_count":1', result["message"])
+        self.assertNotIn("RAWBASE64DATA", result["message"])
 
     def test_codex_tools_are_not_offered(self):
         runner = FakeAcpRunner([prompt_turn("こんにちは")])
@@ -1861,7 +2050,7 @@ class AntigravityModelsTest(BridgeHTTPTestCase):
 
         self.assertEqual(entries[HIGH]["display_name"], f"Antigravity CLI ({HIGH})")
         self.assertIn("Antigravity", entries[HIGH]["description"])
-        self.assertIn("テキストのみ", entries[HIGH]["description"])
+        self.assertIn("画像", entries[HIGH]["description"])
         self.assertEqual(
             entries["claude-opus-5-5"]["display_name"], "Claude CLI (claude-opus-5-5)"
         )
@@ -1880,8 +2069,10 @@ class AntigravityModelsTest(BridgeHTTPTestCase):
         )
         entries = {item["slug"]: item for item in payload["models"]}
 
-        self.assertFalse(entries[HIGH]["supports_vision"])
+        self.assertTrue(entries[HIGH]["supports_vision"])
+        self.assertEqual(entries[HIGH]["input_modalities"], ["text", "image"])
         self.assertTrue(entries["claude-opus-5-5"]["supports_vision"])
+        self.assertEqual(entries["claude-opus-5-5"]["input_modalities"], ["text", "image"])
         self.assertFalse(entries[HIGH]["prefer_websockets"])
         self.assertIsNone(entries[HIGH]["tool_mode"])
         self.assertEqual([item["priority"] for item in payload["models"]], [1, 2, 3, 4])

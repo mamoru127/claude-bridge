@@ -31,10 +31,10 @@ from .responses import (
     ParsedRequest,
     ResponseStream,
     antigravity_system_sections,
+    build_antigravity_prompt,
     build_content,
     build_models,
-    build_prompt,
-    ensure_text_only,
+    ensure_antigravity_images,
     join_antigravity_system,
     parse_request,
     requested_model,
@@ -381,7 +381,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             # 実行できない入力は、会話の状態を触る前に弾く。prepare は続き具合を確定させる
             # ため、後から失敗すると同じスレッドの Claude 側の会話まで開始し直しになる。
             # 実際に渡すのは全履歴の部分集合なので、ここで確かめれば組み立てでも通る。
-            ensure_text_only(request.messages)
+            ensure_antigravity_images(request.messages)
         sections = request.system_sections
         collaboration = None
         session_backend = backend
@@ -427,8 +427,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         """CLI へ渡す入力と、その大きさ。上限の判定と実行で同じ組み立てを使う。"""
 
         if backend == ANTIGRAVITY_BACKEND:
-            prompt = build_prompt(messages, system_prompt)
-            return prompt, len(prompt.encode("utf-8"))
+            prompt = build_antigravity_prompt(messages, system_prompt)
+            size = len(json.dumps(list(prompt), ensure_ascii=False).encode("utf-8"))
+            return prompt, size
         content = build_content(messages)
         size = len(input_line(content)) + len((system_prompt or "").encode("utf-8"))
         return content, size
